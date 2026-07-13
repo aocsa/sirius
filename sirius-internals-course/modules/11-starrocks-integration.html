@@ -1,0 +1,621 @@
+<section class="module" id="module-11" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">11</span>
+      <h1 class="module-title">StarRocks &times; Sirius Integration</h1>
+      <p class="module-subtitle">Embed one GPU execution engine inside each shared-data compute node while StarRocks remains the distributed database.</p>
+    </header>
+
+    <div class="module-body">
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Lesson contract</h2>
+        <div class="callout callout-info">
+          <div class="callout-icon">SCOPE</div>
+          <div class="callout-content">
+            <strong class="callout-title">System integration, not another streaming-operator lesson</strong>
+            <p><strong>Prerequisites:</strong> Modules 1, 3, and 10. <strong>Time:</strong> 40&ndash;55 minutes including the local-workflow lab. Module 10 studies the proposed source/sink seam inside Sirius; this module follows a StarRocks fragment from FE dispatch through the Rust CN boundary and into that seam.</p>
+          </div>
+        </div>
+
+        <p>By the end, you should be able to:</p>
+        <div class="badge-list">
+          <div class="badge-item"><code class="badge-code">ownership</code><span class="badge-desc">State exactly what the StarRocks FE, Rust CN wrapper, and Sirius engine each own&mdash;and what they must not own.</span></div>
+          <div class="badge-item"><code class="badge-code">translation</code><span class="badge-desc">Trace <code>TExecPlanFragmentParams</code> &rarr; Substrait &rarr; DuckDB plan &rarr; Sirius physical plan without inventing a second optimizer.</span></div>
+          <div class="badge-item"><code class="badge-code">status</code><span class="badge-desc">Separate code that exists in the pinned course tree from the GPU-execution target and proposed cross-CN exchange.</span></div>
+          <div class="badge-item"><code class="badge-code">fragments</code><span class="badge-desc">Recognize when a fragment uses a normal scan, a streaming source, a streaming sink, or no exchange boundary at all.</span></div>
+          <div class="badge-item"><code class="badge-code">delivery</code><span class="badge-desc">Bring up the local FE/CN loop and explain why the streaming operators land as isolated, unwired PRs before FFI and session integration.</span></div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">STATUS</div>
+          <div class="callout-content">
+            <strong class="callout-title">Three maturity levels coexist in the same architecture</strong>
+            <p><strong>Pinned snapshot <code>834e27c2</code>:</strong> CN registration, heartbeat/reporting, BRPC-compatible dispatch, Thrift&ndash;Substrait translation, result buffering, and minimal context FFI exist. The CN brings up a real <code>SiriusContext</code>, but <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/src/fragment_executor.rs#L36-L66"><code>StubExecutor</code> still fabricates result rows &#8599;</a>. <strong>Integration target:</strong> hand Substrait bytes to the embedded engine for real GPU execution. <strong>Proposed frontier:</strong> stream sessions, boundary operators, nixl transport, and shared exchange-memory accounting. Do not report a later layer as implemented merely because an earlier layer exists.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-ownership">
+        <h2 class="screen-heading">One system, three owners</h2>
+
+        <p>The architecture works because the ownership lines are intentionally boring. StarRocks remains the distributed system; Sirius remains a single-fragment engine.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">FE</div>
+            <h4 class="pattern-title">StarRocks frontend</h4>
+            <p class="pattern-desc">Owns SQL parsing, catalog and metadata, optimization, query coordination, fragment creation, and partition&rarr;CN assignment. It sends each CN an already-routed fragment; Sirius does not renegotiate that plan.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">CN</div>
+            <h4 class="pattern-title">Rust compute-node wrapper</h4>
+            <p class="pattern-desc">Speaks StarRocks protocols upward, translates Thrift into Substrait, owns process and FFI lifetimes, and&mdash;in the target design&mdash;routes exchange data by stream id. It moves data; it does not implement GPU relational operators.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">GPU</div>
+            <h4 class="pattern-title">Sirius engine</h4>
+            <p class="pattern-desc">Owns one fragment&rsquo;s physical plan, pipelines, tasks, cuDF operators, cuCascade batches/repositories, reservations, and spill. It deliberately has no cluster topology or peer-CN awareness.</p>
+          </div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">THE DISTRIBUTED VIEW</span><pre><code><span class="code-line">SQL + metadata</span>
+<span class="code-line">  &darr; StarRocks FE</span>
+<span class="code-line">fragments + partition routes</span>
+<span class="code-line">  &darr; FE dispatch</span>
+<span class="code-line">Rust CN wrappers</span>
+<span class="code-line">  &harr; exchange between CNs</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">THE SIRIUS VIEW</span>
+            <div class="translation-lines">
+              <p class="tl">Receive one plan and zero or more input streams.</p>
+              <p class="tl">Build and execute local pipelines.</p>
+              <p class="tl">Publish zero or more output streams.</p>
+              <p class="tl">Never ask which machine owns the next partition.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">RULE</div>
+          <div class="callout-content">
+            <strong class="callout-title">This is not distributed Sirius and not a Theseus rebuild</strong>
+            <p>A bespoke cross-worker algorithm inside Sirius would duplicate or contradict the FE plan. Distributed-systems work belongs at the wrapper/session seam: exchange, sender-count EOS, backpressure, cancellation, and a safe shared GPU-memory budget.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-topology">
+        <h2 class="screen-heading">Two protocol planes, one CN process</h2>
+
+        <p>The Rust binary is an adapter around an in-process engine, not a remote proxy to a separate Sirius daemon.</p>
+
+        <div style="display: flex; flex-direction: column; gap: var(--space-3); margin: var(--space-6) 0;">
+          <div style="background: var(--color-bg); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-5); box-shadow: var(--shadow-sm);">
+            <strong>StarRocks FE &mdash; Java, unchanged</strong>
+            <p style="margin: var(--space-2) 0 0; color: var(--color-text-muted);">SQL clients enter here. The FE plans the query and treats the Rust service as a shared-data compute node.</p>
+          </div>
+
+          <div class="flow-steps" style="margin: 0;">
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-1);">1</div><p><strong>MySQL</strong><br>CN registration</p></div>
+            <div class="flow-arrow">+</div>
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-1);">2</div><p><strong>Thrift</strong><br>heartbeats + reports</p></div>
+            <div class="flow-arrow">+</div>
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-1);">3</div><p><strong>BRPC/PRPC</strong><br>dispatch + fetch</p></div>
+          </div>
+
+          <div style="background: var(--color-surface); border: 2px solid var(--color-actor-2); border-radius: var(--radius-lg); padding: var(--space-5); box-shadow: var(--shadow-md);">
+            <div style="font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-actor-2); text-transform: uppercase; letter-spacing: 0.08em;">one Rust process &middot; <code>sirius-starrocks-cn</code></div>
+            <div class="pattern-cards" style="margin: var(--space-4) 0 0;">
+              <div class="pattern-card"><h4 class="pattern-title">Control plane</h4><p class="pattern-desc">Registration, liveness, FE identity, graceful shutdown, error responses.</p></div>
+              <div class="pattern-card"><h4 class="pattern-title">Plan adapter</h4><p class="pattern-desc">Thrift decode, descriptor resolution, Substrait translation, result protocol encoding.</p></div>
+              <div class="pattern-card"><h4 class="pattern-title">Exchange plane</h4><p class="pattern-desc"><strong>Target:</strong> same-CN handles or cross-CN nixl transfers, mapped to session stream ids.</p></div>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; justify-content: center; gap: var(--space-3); color: var(--color-text-muted);">
+            <span>&darr;</span><code>cxx FFI &middot; sirius-sys &rarr; sirius</code><span>&darr;</span>
+          </div>
+
+          <div style="background: var(--color-accent-light); border: 1px solid var(--color-accent-muted); border-radius: var(--radius-md); padding: var(--space-5);">
+            <strong>Sirius context &mdash; DuckDB-based planning, cuDF execution, cuCascade data/memory</strong>
+            <p style="margin: var(--space-2) 0 0; color: var(--color-text-muted);">The context is constructed before RPC service and lives until every server stops. A bad config or GPU bring-up fails the CN before the FE can route work to it.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">WIRE</div>
+          <div class="callout-content">
+            <strong class="callout-title">BRPC compatibility does not mean a C++ BRPC runtime</strong>
+            <p>The wrapper implements the Baidu PRPC frame and generates a Tower service facade from StarRocks protobuf definitions. <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/src/brpc.rs">The transport</a> and <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/src/prpc.rs">frame parser</a> are protocol adapters, not query execution.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-translation">
+        <h2 class="screen-heading">The translation path preserves the FE&rsquo;s decision</h2>
+
+        <p>StarRocks has already optimized and fragmented the query. Translation changes representation; it must not quietly change distribution, partition routing, or expression meaning.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)"><div class="step-num" style="background: var(--color-actor-1)">1</div><div class="step-body"><strong><code>TExecPlanFragmentParams</code></strong><p>The FE places a binary-Thrift plan, descriptor table, query options, fragment-instance id, sinks, and scan ranges in the BRPC attachment.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)"><div class="step-num" style="background: var(--color-actor-2)">2</div><div class="step-body"><strong><code>PlanTranslator::translate_fragment()</code></strong><p>The Rust translator reconstructs flat preorder plan/expression lists using <code>num_children</code>, resolves slots through the descriptor table, and rejects under-run, trailing, or unsupported nodes explicitly.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)"><div class="step-num" style="background: var(--color-actor-2)">3</div><div class="step-body"><strong>Substrait <code>Plan</code></strong><p>Relations, expressions, output names, and extension-function anchors become a portable protobuf. <code>to_substrait_bytes()</code> is the intended FFI payload.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-5)"><div class="step-num" style="background: var(--color-actor-5)">4</div><div class="step-body"><strong>DuckDB logical plan &rarr; Sirius physical plan</strong><p><strong>Target handoff:</strong> Sirius uses its existing Substrait/DuckDB planning boundary, then lowers supported work into GPU operators and pipelines. DuckDB is an internal planning adapter here, not the cluster coordinator.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-5)"><div class="step-num" style="background: var(--color-actor-5)">5</div><div class="step-body"><strong>Per-fragment execution</strong><p>Existing scheduler, reservations, cuDF operators, repositories, and downgrade machinery run the fragment. Output returns through a result sink or a streaming exchange sink depending on fragment position.</p></div></div>
+        </div>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Pinned translator surface</th><th>Emitted Substrait</th><th>Failure discipline</th></tr></thead><tbody>
+          <tr><td><code>FILE_SCAN_NODE</code>, <code>HDFS_SCAN_NODE</code></td><td><code>ReadRel</code></td><td>Missing descriptors or unsupported scan details return a structured translation error.</td></tr>
+          <tr><td><code>SELECT_NODE</code></td><td><code>FilterRel</code></td><td>Expression shape and child counts must be consumed exactly.</td></tr>
+          <tr><td><code>PROJECT_NODE</code></td><td><code>ProjectRel</code></td><td>Output width, tuple layout, and unique names stay explicit.</td></tr>
+          <tr><td>slot refs, literals, predicates, casts, null tests</td><td>field refs, scalar functions, casts</td><td>Unknown nodes/types fail loudly; translation is not a silent CPU-fallback boundary.</td></tr>
+        </tbody></table></div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">DON&rsquo;T</div>
+          <div class="callout-content">
+            <strong class="callout-title">Do not put a second optimizer in the translator</strong>
+            <p>The translator may normalize representation and register Substrait extensions. It must preserve the FE&rsquo;s fragment shape and routing. If a plan feature is unsupported, add an explicit mapping and parity test or reject it&mdash;never silently invent a different distributed plan.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-fragments">
+        <h2 class="screen-heading">Fragment position decides the boundary operators</h2>
+
+        <p>The FE chooses the fragment graph. The CN translates each assigned fragment; the engine sees only the local shape.</p>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Fragment position</th><th>Local Sirius shape</th><th>Exchange behavior</th></tr></thead><tbody>
+          <tr><td><strong>Trivial single-CN query</strong></td><td>normal scan &rarr; compute &rarr; result collector</td><td>No streaming source or sink. Do not force the distributed path onto local queries.</td></tr>
+          <tr><td><strong>Leaf fragment</strong></td><td><code>GPU_PARQUET_SCAN</code> &rarr; local operators &rarr; streaming sink</td><td>Reads storage locally, then emits partitioned or gathered batches to downstream fragments.</td></tr>
+          <tr><td><strong>Intermediate fragment</strong></td><td>streaming source &rarr; local operators &rarr; streaming sink</td><td>Consumes exchange input and incrementally emits exchange output.</td></tr>
+          <tr><td><strong>Root fragment</strong></td><td>streaming source &rarr; final operators &rarr; single-destination streaming sink</td><td>The session&rsquo;s output channel is the query result: the wrapper drains it with <code>pull()</code>/<code>wait()</code> and serves rows through StarRocks <code>fetch_data</code>, with no nixl peer.</td></tr>
+        </tbody></table></div>
+
+        <div style="background: var(--color-surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-md); padding: var(--space-6); margin: var(--space-8) 0;">
+          <div class="flow-steps" style="margin: 0;">
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-5);">L</div><p><strong>Leaf CN</strong><br>scan + partial aggregate</p></div>
+            <div class="flow-arrow">&rarr;</div>
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-2);">X</div><p><strong>Exchange</strong><br>FE-specified route</p></div>
+            <div class="flow-arrow">&rarr;</div>
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-5);">R</div><p><strong>Root CN</strong><br>merge + result</p></div>
+          </div>
+          <p style="margin: var(--space-5) 0 0; text-align: center; color: var(--color-text-muted);"><code>HASH_GROUP_BY</code> partial &rarr; partitioned sink &rarr; source &rarr; <code>MERGE_AGGREGATE</code>. The sink performs the planned partition; nixl routes opaque payloads; Sirius never chooses the destination CN.</p>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">HASH</div>
+          <div class="callout-content">
+            <strong class="callout-title">Partition routing comes from the FE; partition correctness still belongs to the sink</strong>
+            <p>Destination ids are already in the plan, but the GPU sink must reproduce StarRocks&rsquo; partition semantics and hash version exactly. A hash mismatch does not merely slow a query&mdash;it can split equal keys across final aggregations or joins and return wrong results.</p>
+          </div>
+        </div>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>StarRocks partition mode</th><th>Required sink behavior</th><th>Why</th></tr></thead><tbody>
+          <tr><td><code>HASH_PARTITIONED</code></td><td><code>fnv_hash</code> for <code>exchange_hash_function_version=0</code> (default); <code>xxh3_hash</code> for version 1.</td><td>Mixed Sirius/native exchanges and StarRocks parity require the selected version. An all-Sirius topology could choose another consistent hash only if every sender agrees.</td></tr>
+          <tr><td><code>BUCKET_SHUFFLE_HASH_PARTITIONED</code><br>without bucket properties</td><td>CRC32, seed 0.</td><td>The query must match the table&rsquo;s ingest-time on-disk bucket distribution; an all-Sirius topology cannot redefine it.</td></tr>
+          <tr><td><code>BUCKET_SHUFFLE_HASH_PARTITIONED</code><br>with bucket properties</td><td>Reproduce StarRocks&rsquo; bucket-id mapping.</td><td>Destination selection is a bucket-layout contract, not merely a locally consistent shuffle hash.</td></tr>
+        </tbody></table></div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-current-runtime">
+        <h2 class="screen-heading">What the pinned CN actually does today</h2>
+
+        <p>Use this sequence when debugging the checked-out course snapshot. It is deliberately narrower than the target architecture.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-5)"><div class="step-num" style="background: var(--color-actor-5)">1</div><div class="step-body"><strong>Fail-fast engine bring-up</strong><p><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/src/main.rs#L58-L68"><code>Args::run()</code></a> constructs the real <code>sirius::SiriusContext</code> before opening RPC service. The handle is process-lifetime RAII.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)"><div class="step-num" style="background: var(--color-actor-1)">2</div><div class="step-body"><strong>Start services and register</strong><p>The CN opens heartbeat, backend-Thrift, and BRPC listeners, then sends <code>ALTER SYSTEM ADD COMPUTE NODE</code> over the FE&rsquo;s MySQL surface. Heartbeats establish identity; periodic reports keep the storage-less CN healthy.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)"><div class="step-num" style="background: var(--color-actor-2)">3</div><div class="step-body"><strong>Dispatch and translate</strong><p><code>exec_plan_fragment</code> validates the attachment protocol, deserializes <code>TExecPlanFragmentParams</code>, and calls the reusable translator. Batch dispatch merges common and per-instance parameters first.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-error)"><div class="step-num" style="background: var(--color-error)">4</div><div class="step-body"><strong>Stub execution&mdash;the critical limit</strong><p>Only a supported root <code>RESULT_SINK</code> is &ldquo;executed,&rdquo; and <code>StubExecutor</code> returns one string row per output column. Non-result sinks are translate-only. The separately created Sirius context is not passed into this executor yet.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)"><div class="step-num" style="background: var(--color-actor-1)">5</div><div class="step-body"><strong>Encode, buffer, fetch</strong><p>The CN converts Arrow batches to StarRocks MySQL text rows, stores them by fragment-instance id, and serves one or more <code>fetch_data</code> polls with packet sequence and EOS. An unknown id is an error, not an empty result.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-5)"><div class="step-num" style="background: var(--color-actor-5)">6</div><div class="step-body"><strong>Ordered teardown</strong><p>Shutdown stops RPC servers and background tasks before dropping the engine context, so no in-flight request can reach an already-destroyed GPU engine.</p></div></div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">IMPLEMENTED CONTROL PATH</span><pre><code><span class="code-line">FE dispatch</span>
+<span class="code-line">  &rarr; thrift decode</span>
+<span class="code-line">  &rarr; Substrait translation</span>
+<span class="code-line">  &rarr; StubExecutor</span>
+<span class="code-line">  &rarr; ResultStore</span>
+<span class="code-line">  &rarr; fetch_data</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">NEXT EXECUTION SEAM</span>
+            <div class="translation-lines">
+              <p class="tl">Thread the process-owned context into the fragment executor.</p>
+              <p class="tl">Pass <code>TranslatedPlan::to_substrait_bytes()</code> over the safe Rust/FFI boundary.</p>
+              <p class="tl">Import real Arrow results and preserve cancellation/lifetime semantics.</p>
+              <p class="tl">Then replace full materialization with sessions for multi-fragment queries.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-local-lab">
+        <h2 class="screen-heading">Local lab: prove each boundary before debugging the next</h2>
+
+        <p>The pairing session used a manual setup path. The checked-in <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/scripts/setup-dev-env.sh"><code>setup-dev-env.sh</code></a> now captures that workflow and the current <code>pixi.toml</code> is the command source of truth.</p>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Loop</th><th>Commands</th><th>What it proves</th></tr></thead><tbody>
+          <tr><td><strong>CPU-only / CI</strong></td><td><code>scripts/setup-dev-env.sh</code><br><code>pixi run -e cn cn-test-no-engine</code></td><td>Submodules, Rust formatting/lints, Thrift/protobuf generation, translator tests, protocol logic, and the stub result path&mdash;no GPU or Sirius build tree required.</td></tr>
+          <tr><td><strong>Engine-linked</strong></td><td><code>scripts/setup-dev-env.sh --with-engine</code><br><code>pixi run -e cn cn-test</code></td><td>Builds Sirius first, links <code>sirius-sys</code>/<code>sirius</code>, constructs the real context, and runs GPU-requiring tests.</td></tr>
+          <tr><td><strong>Full local cluster</strong></td><td><code>scripts/setup-dev-env.sh --full</code><br><code>pixi run -e cn cluster</code></td><td>Builds the Java FE and engine-linked CN, starts both in the foreground, registers the CN, and exposes real FE dispatch paths.</td></tr>
+        </tbody></table></div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">TERMINAL 1 &middot; FE + CN</span><pre><code><span class="code-line"><span class="code-comment"># from experimental/starrocks</span></span>
+<span class="code-line">pixi run -e cn cluster</span>
+<span class="code-line"></span>
+<span class="code-comment"># day-to-day split after first build:</span>
+<span class="code-line">pixi run -e fe fe-run</span>
+<span class="code-line">pixi run -e cn cn-run</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">TERMINAL 2 &middot; CLIENT</span>
+            <div class="translation-lines">
+              <p class="tl"><code>pixi run -e client client</code></p>
+              <p class="tl"><code>SHOW COMPUTE NODES;</code> proves registration and heartbeat.</p>
+              <p class="tl">A dispatch/translation test proves BRPC, Thrift decoding, and Substrait mapping.</p>
+              <p class="tl">A literal <code>stub</code> result proves the pinned result path, not GPU query execution.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">LINK</div>
+          <div class="callout-content">
+            <strong class="callout-title">The session&rsquo;s <code>LD_LIBRARY_PATH</code> workaround is a loader diagnostic, not project configuration</strong>
+            <p>If <code>cn-run</code> cannot find <code>libsirius.so</code>/<code>sirius.duckdb_extension</code>, set <code>LD_LIBRARY_PATH</code> to the <strong>absolute</strong> <code>build/release/extension/sirius</code> directory for that one invocation. Do not put it in a shell profile or commit it: <code>sirius-sys/build.rs</code> currently treats the extension-as-<code>libsirius</code> symlink as a stopgap until a dedicated library exists.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">SESSION</div>
+          <div class="callout-content">
+            <strong class="callout-title">The pairing notes&rsquo; GPU verification stack is historical context</strong>
+            <p>The session directed readers to the then-stacked <a href="https://github.com/sirius-db/sirius/pull/1024">#1024</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/1022">#1022</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/1021">#1021</a> branches for <code>FILES('path' = 'file:///absolute/path/to.parquet')</code> GPU execution. Re-check those PRs before following that checkout advice. It does not change this course snapshot&rsquo;s <code>StubExecutor</code> status.</p>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item"><code class="badge-code">no CN listed</code><span class="badge-desc">Start at process startup, MySQL registration, heartbeat identity, and FE reporting. The query engine is not the first suspect.</span></div>
+          <div class="badge-item"><code class="badge-code">dispatch fails</code><span class="badge-desc">Inspect BRPC framing, attachment protocol, Thrift decode, and fragment-instance identity.</span></div>
+          <div class="badge-item"><code class="badge-code">unsupported node</code><span class="badge-desc">The request reached the translator. Add an explicit mapping and parity tests; do not bypass it.</span></div>
+          <div class="badge-item"><code class="badge-code">stub row</code><span class="badge-desc">Control/result plumbing worked through <code>StubExecutor</code>. Real Substrait&rarr;GPU execution is still the missing seam in this snapshot.</span></div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-streaming-target">
+        <h2 class="screen-heading">The streaming target connects fragments without teaching Sirius distribution</h2>
+
+        <p><strong>PROPOSED:</strong> this is the system-level consumer of Module 10&rsquo;s channel, source, and sink contracts.</p>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Boundary</th><th>Same CN</th><th>Different CNs</th></tr></thead><tbody>
+          <tr><td><strong>Transport</strong></td><td>In-process repository handle hand-off; no serialization.</td><td>Rust wrapper sends device data through nixl and maps the receive to the destination stream id.</td></tr>
+          <tr><td><strong>Sirius API</strong></td><td colspan="2">One stream session owns source/sink channel and repository pairs; wrapper calls <code>push</code>, <code>close_input</code>, <code>pull</code>, and <code>wait</code> over FFI.</td></tr>
+          <tr><td><strong>Scheduling</strong></td><td colspan="2">Channel edges re-arm the existing task scheduler. No polling thread and no dedicated GPU-exchange worker pool inside Sirius.</td></tr>
+          <tr><td><strong>Completion</strong></td><td>Local sender close contributes to EOS.</td><td>Wrapper must carry sender-count EOS across transport; a fan-in source closes only after every expected sender finishes.</td></tr>
+          <tr><td><strong>Ordering</strong></td><td colspan="2">Incremental emission and coalescing do not preserve global order. v1 supports order-insensitive exchanges; merging exchange for <code>ORDER BY</code>/top-N needs coalescing disabled plus receiver-side merge, or stays on CPU/bRPC.</td></tr>
+          <tr><td><strong>Ownership</strong></td><td colspan="2">Channels carry repository batch-id handles, not owning <code>shared_ptr</code>s. The repository remains the owner of record so queued batches stay accounted and spillable.</td></tr>
+        </tbody></table></div>
+
+        <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: var(--space-10) 0 var(--space-4);">Backpressure propagates backward through ownership boundaries</h3>
+        <div class="flow-steps">
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-1);">1</div><p><strong>Slow receiver</strong><br>does not drain output</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-2);">2</div><p><strong>Bounded channel</strong><br>reaches admission limit</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-5);">3</div><p><strong>Sink hint</strong><br>creates no new task</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-5);">4</div><p><strong>Repositories fill</strong><br>idle batches can spill</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-2);">5</div><p><strong>Input throttles</strong><br>sender eventually slows</p></div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">MEM</div>
+          <div class="callout-content">
+            <strong class="callout-title">One GPU means one physical budget, even when software has two owners</strong>
+            <p>The wrapper&rsquo;s receive/staging buffers and Sirius compute allocations contend for the same device. The #840 design direction is a shared cuCascade reservation authority with exchange batches registered in repositories so downgrade can see them. It also needs receive-staging, copy-out, and send-copy credits to prevent &ldquo;free memory by sending, but sending needs memory&rdquo; deadlocks.</p>
+          </div>
+        </div>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>#840 budget model</th><th>Benefit</th><th>Cost / limitation</th></tr></thead><tbody>
+          <tr><td><strong>A. Shared cuCascade manager</strong><br><em>design recommendation</em></td><td>One budget; registered exchange and compute batches can enter the same downgrade flow.</td><td>Wrapper depends on cuCascade; borrow/lifetime, concurrent-query reentrancy, staging leases, and cross-stream synchronization need explicit contracts.</td></tr>
+          <tr><td><strong>B. Partitioned budget</strong></td><td>Simple isolation between wrapper and engine.</td><td>Neither side can borrow capacity or spill the other side&rsquo;s data; one partition can OOM while the other has free memory.</td></tr>
+          <tr><td><strong>C. Wrapper-provided RMM allocator</strong></td><td>Keeps the wrapper cuCascade-free.</td><td>Sirius cannot see wrapper buffers as spill candidates and loses unified reservation semantics.</td></tr>
+        </tbody></table></div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">V1</div>
+          <div class="callout-content">
+            <strong class="callout-title">Keep the first exchange queue inside Sirius</strong>
+            <p>The pairing/sync direction is to let registered Sirius repositories and the existing downgrade executor handle pressure, accepting temporary cuCascade-type leakage into the wrapper. A pluggable downgrade interface for externally owned repositories is a future extraction, not a v1 dependency. Likewise, exposing live resource information through the stream session for receive-side tier placement is useful future policy, not permission to create a StarRocks-specific context.</p>
+          </div>
+        </div>
+
+        <p>For operator-level races, byte admission, terminal EOS, callback lifetime, and test gaps, return to <a href="#module-10">Module 10</a>. This module&rsquo;s rule is simpler: the wrapper owns transport and stream routing; Sirius owns task admission and repository-visible memory.</p>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-nixl-lifecycle">
+        <h2 class="screen-heading">Cross-CN transfer is a metadata-and-lease protocol</h2>
+
+        <p><strong>PROPOSED, ADAPTED FROM DORIS PRIOR ART:</strong> nixl moves registered buffers; the Rust wrapper owns every transport step. The engine sees only repository batches and channel handles.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)"><div class="step-num" style="background: var(--color-actor-2)">1</div><div class="step-body"><strong>Initialize one agent per CN</strong><p>At startup the wrapper registers its staging arena and computes local agent metadata. The first transfer to a peer exchanges and caches agent metadata; a peer restart invalidates that cache.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)"><div class="step-num" style="background: var(--color-actor-2)">2</div><div class="step-body"><strong>Exchange per-batch metadata</strong><p>The sender announces the batch layout and sizes over the side channel. The receiver leases addresses from a pre-registered GPU staging arena, or a host arena when the deployment selects host staging.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)"><div class="step-num" style="background: var(--color-actor-1)">3</div><div class="step-body"><strong>Post and poll the transfer</strong><p>The sender uses nixl <code>create_xfer_req</code>/<code>post_xfer_req</code> and polls status. GPUDirect RDMA is the preferred cross-node path; host staging is a configured tier, not automatically an error fallback.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-5)"><div class="step-num" style="background: var(--color-actor-5)">4</div><div class="step-body"><strong>Complete, register, enqueue</strong><p>A <code>transfer_complete</code> handshake lets the receiver wrap the staged bytes as a repository-registered <code>data_batch</code>, then push only its handle onto the destination stream&rsquo;s input channel.</p></div></div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-error)"><div class="step-num" style="background: var(--color-error)">5</div><div class="step-body"><strong>Preserve progress on failure</strong><p>Same-CN exchange skips this protocol and hands off a handle in-process. For cross-CN failure, the proposal calls for a nixl retry, then bRPC/CPU fallback, and query failure only if both paths fail; the output batch remains owned across attempts.</p></div></div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">LEASE</div>
+          <div class="callout-content">
+            <strong class="callout-title">Spilling GPU bytes is not enough if the scarce object is a staging lease</strong>
+            <p>All-to-all exchange can deadlock even with an acyclic query plan. Forward progress requires lease-aware copy-out, a non-borrowable receive-staging floor, copy-out credit, send-copy credit, and a watchdog for &ldquo;no progress.&rdquo; Otherwise A can wait for B&rsquo;s lease while B waits for memory that only A&rsquo;s send would free.</p>
+          </div>
+        </div>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">N</div>
+            <h4 class="pattern-title">Why nixl instead of direct UCXX</h4>
+            <p class="pattern-desc">It matches FE-provided point-to-point routes, supplies the metadata side channel and registered-buffer abstraction, can choose among local/GPU/remote paths, and already uses UCX-class backends. The team avoids rebuilding peer discovery, path selection, and staging coordination directly on UCXX.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">OWN</div>
+            <h4 class="pattern-title">Sink-to-nixl ownership is unresolved</h4>
+            <p class="pattern-desc">The proposed <code>data_batch::release_or_copy_table()</code>&mdash;not present in the pinned tree&mdash;would steal the table only when the sink is sole owner; otherwise it deep-copies using reserved send-copy credit. Keeping the repository reference preserves spill eligibility but forces the copy. Dropping it enables a steal but leaves the in-flight transfer non-spillable until <code>transfer_complete</code>.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-delivery-sequence">
+        <h2 class="screen-heading">Delivery sequence: prove contracts before integration</h2>
+
+        <p>The pairing-session handoff deliberately separates operator design from Matthijs&rsquo;s CN plumbing. The streaming source and sink touch Sirius core and become public embedding contracts, so their first PRs must be small, standalone, and testable without a StarRocks cluster.</p>
+
+        <div class="flow-steps">
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-5);">1</div><p><strong>Source operator</strong><br>isolated class + unit tests</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-5);">2</div><p><strong>Sink operator</strong><br>isolated class + unit tests</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-2);">3</div><p><strong>FFI surface</strong><br>session lifecycle + batches</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-2);">4</div><p><strong>Rust API</strong><br><code>sirius-sys</code> + <code>sirius</code></p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-1);">5</div><p><strong>CN wiring</strong><br>translation + execution</p></div>
+        </div>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Work item</th><th>First acceptance boundary</th><th>Keep out of the first PR</th></tr></thead><tbody>
+          <tr><td><strong>Streaming source</strong><br>#836</td><td>Multi-shot input, repository-handle ownership, close-then-drain EOS, hint/task behavior, spill restoration, and unit coverage.</td><td>CN RPC, nixl, Rust FFI, plan translation, and end-to-end fragment execution.</td></tr>
+          <tr><td><strong>Streaming sink</strong><br>#837</td><td>Incremental output, non-blocking channel admission, repository visibility, final close contract, and unit coverage. The pinned design also places partitioning/coalescing in this sink.</td><td>Cross-node transport and FE-driven partition routing.</td></tr>
+          <tr><td><strong>Partitioning</strong><br>live #838; design &sect;4 under #837</td><td>Per-destination isolation, exact StarRocks hash parity, bounded coalescing, and no slow-receiver head-of-line blocking.</td><td>Generic distributed planning; the FE already owns routes.</td></tr>
+          <tr><td><strong>Backpressure policy</strong><br>design &sect;7 calls this #838</td><td>Choose channel bounds, blocking versus spill at full input, fair progress for a slow partition, and edge-triggered re-arm.</td><td>Do not resolve the numbering conflict by silently dropping either the partitioning or policy work.</td></tr>
+          <tr><td><strong>Stream session</strong><br>#839</td><td>Own channel/repository pairs, route stream ids, re-arm scheduling, aggregate sender EOS, and make cancellation lifetime-safe.</td><td>A second scheduler or StarRocks-specific Sirius context.</td></tr>
+          <tr><td><strong>Resources</strong><br>#840</td><td>One visible budget for exchange + compute, registered repositories, additive capacity config, and deadlock-safe copy/staging credits.</td><td>Early performance tuning without correctness and memory evidence.</td></tr>
+        </tbody></table></div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">SCOPE</div>
+          <div class="callout-content">
+            <strong class="callout-title">The pinned design and live tracker disagree about #838</strong>
+            <p><a href="https://github.com/mbrobbel/sirius/blob/c8593116000a5fab2228b25d9d937025e526adbe/experimental/starrocks/docs/exchange-design.md">Design commit <code>c8593116</code></a> puts partitioned/coalescing sink behavior in #837 and labels #838 the open backpressure policy. The live <a href="https://github.com/sirius-db/sirius/issues/838">#838 issue</a> is titled &ldquo;Streaming sink partitioning support&rdquo; and its body assigns per-destination partitioning there. Track the behaviors separately and reconcile the issue scope before planning PR boundaries.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">CONFIG</div>
+          <div class="callout-content">
+            <strong class="callout-title">Scope configuration early, but keep it additive</strong>
+            <p>The generic context needs session/operator settings such as item/byte channel capacity, exchange batch targets, coalescing size/time thresholds, staging-arena size, and copy credits. Defaults must leave the non-distributed path unchanged. Future receive-side resource visibility may guide GPU versus host/disk placement, but it belongs on the generic session API&mdash;not in a StarRocks-only context subclass.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">PR</div>
+          <div class="callout-content">
+            <strong class="callout-title">Standalone does not mean context-free</strong>
+            <p>Each operator PR must still explain the later caller: the Rust session will feed/drain it, FFI will expose lifecycle, the FE plan will determine placement, and the shared resource layer will account for queued data. Isolate code dependencies&mdash;not architectural assumptions.</p>
+          </div>
+        </div>
+
+        <p><strong>Review order:</strong> operator semantics &rarr; scheduling/completion &rarr; ownership/spill &rarr; error/cancel teardown &rarr; public API shape &rarr; integration. This keeps a wiring failure from hiding a broken core contract.</p>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-evolution">
+        <h2 class="screen-heading">Why StarRocks first, and why the path stays incremental</h2>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th></th><th>Doris prior art</th><th>StarRocks target</th></tr></thead><tbody>
+          <tr><td><strong>Stage boundary</strong></td><td>Run a fragment to completion, materialize an exchange artifact, then shuffle.</td><td>Receive batch N+1 while computing N and sending N&minus;1.</td></tr>
+          <tr><td><strong>Partition location</strong></td><td>Rust-side post-processing in the old integration.</td><td>GPU partition/coalesce inside the streaming sink, reusing Sirius operators and budget.</td></tr>
+          <tr><td><strong>Engine scope</strong></td><td>Useful prior art, now paused.</td><td>StarRocks-specific implementation first; do not pay a generic-abstraction tax before the contracts are proven.</td></tr>
+        </tbody></table></div>
+
+        <div style="background: var(--color-surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-md); padding: var(--space-6); margin: var(--space-8) 0;">
+          <div class="flow-steps" style="margin: 0;">
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-1);">1</div><p><strong>Walk</strong><br>StarRocks-specific CN works correctly</p></div>
+            <div class="flow-arrow">&rarr;</div>
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-2);">2</div><p><strong>Crawl</strong><br>extract Substrait, exchange, and public APIs</p></div>
+            <div class="flow-arrow">&rarr;</div>
+            <div class="flow-step"><div class="flow-step-num" style="background: var(--color-actor-5);">3</div><p><strong>Run</strong><br>Velox-like engine-pluggable layer</p></div>
+          </div>
+        </div>
+
+        <p>The generic end state is valuable, but it is an extraction result, not a v1 prerequisite. Keep configuration additive to the same generic <code>SiriusContext</code>; avoid a StarRocks-only engine fork; and let proven seams become the future embedding API.</p>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">GOAL</div>
+          <div class="callout-content">
+            <strong class="callout-title">Correct multi-fragment execution before performance claims</strong>
+            <p>The meaningful milestone is TPC-H across multiple CNs with FE-planned distribution, exact results, bounded memory, and clean cancellation. Only after that path is correct should the team compare it with CPU StarRocks and optimize transport or operator granularity.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in" id="starrocks-repository-map">
+        <h2 class="screen-heading">Repository map and reading order</h2>
+
+        <p>Start at the protocol edge and move inward. Jumping directly to the streaming operators hides which layer supplies their inputs.</p>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Read</th><th>Path</th><th>Question it answers</th></tr></thead><tbody>
+          <tr><td><strong>1</strong></td><td><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/docs/onboarding.md"><code>experimental/starrocks/docs/onboarding.md</code></a></td><td>What is implemented, proposed, and owned by each layer?</td></tr>
+          <tr><td><strong>2</strong></td><td><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/scripts/setup-dev-env.sh"><code>scripts/setup-dev-env.sh</code></a> + <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/pixi.toml"><code>pixi.toml</code></a></td><td>Which CPU, GPU, FE, CN, and client loop should I run?</td></tr>
+          <tr><td><strong>3</strong></td><td><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/src/main.rs"><code>experimental/starrocks/src/main.rs</code></a> + <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/src/lib.rs"><code>src/lib.rs</code></a></td><td>How does the CN start, register, heartbeat, report, and stop?</td></tr>
+          <tr><td><strong>4</strong></td><td><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/src/compute_node_service.rs"><code>compute_node_service.rs</code></a></td><td>Where do dispatch, translation, result buffering, and fetch meet?</td></tr>
+          <tr><td><strong>5</strong></td><td><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/crates/starrocks-plan-translator/src/lib.rs"><code>starrocks-plan-translator</code></a></td><td>How are flat Thrift trees rebuilt and mapped to Substrait?</td></tr>
+          <tr><td><strong>6</strong></td><td><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/rust/crates/sirius/src/lib.rs"><code>rust/crates/sirius</code></a> + <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/rust/crates/sirius-sys/src/lib.rs"><code>sirius-sys</code></a></td><td>What is the safe Rust API and how thin is the cxx bridge?</td></tr>
+          <tr><td><strong>7</strong></td><td><a href="https://github.com/mbrobbel/sirius/blob/c8593116000a5fab2228b25d9d937025e526adbe/experimental/starrocks/docs/exchange-design.md"><code>exchange-design.md @ c8593116</code></a></td><td>What is the proposed public session, data path, nixl protocol, backpressure chain, and #840 budget decision space?</td></tr>
+          <tr><td><strong>8</strong></td><td><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/docs/discoveries.md"><code>discoveries.md</code></a> + <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/docs/streaming-integration-follow-ups.md"><code>streaming-integration-follow-ups.md</code></a></td><td>Which operator contracts are load-bearing, and which session/wiring/EOS/resource decisions remain after comparing the proposal with current code?</td></tr>
+        </tbody></table></div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">DEBUG</div>
+          <div class="callout-content">
+            <strong class="callout-title">Locate the broken boundary before opening engine code</strong>
+            <p>No CN in the FE list points to registration/heartbeat. Dispatch failure points to BRPC/Thrift decode. A structured unsupported-node error points to translation. A returned <code>stub</code> row means the current executor seam was reached successfully but real GPU execution was not. A multi-fragment stall belongs to future session/exchange completion, not the single-fragment translator.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Review questions</h2>
+
+        <p>Answer from the pinned snapshot and the labeled target architecture. A correct answer must preserve both the ownership boundary and maturity level.</p>
+
+        <div class="quiz-container" id="quiz-module11">
+          <div class="quiz-question-block"
+               data-correct="q1-b"
+               data-explanation-right="Correct. The FE owns global planning and embeds partition-to-CN routing in fragments. The wrapper translates and transports; Sirius executes only the fragment it receives."
+               data-explanation-wrong="The integration deliberately keeps Sirius unaware of cluster topology. Moving routing into the engine or the transport would create a second distributed planner that can conflict with the FE.">
+            <h3 class="quiz-question">1. Who decides which CN receives each shuffle partition?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q1-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The Sirius partition operator after it measures peer GPU memory</span></button>
+              <button class="quiz-option" data-value="q1-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The StarRocks FE; the fragment already carries the routing decision</span></button>
+              <button class="quiz-option" data-value="q1-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The nixl agent after it selects a physical transport</span></button>
+              <button class="quiz-option" data-value="q1-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The Rust translator while it emits Substrait</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q2-c"
+               data-explanation-right="Correct. The real context is constructed for process-lifetime proof and fail-fast initialization, but SiriusComputeNodeService still instantiates StubExecutor. These are two separate milestones."
+               data-explanation-wrong="Context bring-up proves the FFI/lifetime seam, not query execution. In this snapshot the BRPC service does not receive that context and StubExecutor fabricates the result row.">
+            <h3 class="quiz-question">2. The pinned CN starts a real <code>SiriusContext</code> and a query returns a row containing <code>stub</code>. What does that prove?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q2-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The query executed on the GPU and <code>stub</code> came from parquet</span></button>
+              <button class="quiz-option" data-value="q2-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Sirius fell back to DuckDB CPU execution</span></button>
+              <button class="quiz-option" data-value="q2-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Context bring-up and FE&rarr;CN result plumbing work, but the fragment executor is still a stub</span></button>
+              <button class="quiz-option" data-value="q2-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Cross-CN exchange is working without nixl</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q3-a"
+               data-explanation-right="Correct. A leaf reads its storage input with Sirius's normal scan. Only a fragment whose input arrives over exchange needs the streaming source."
+               data-explanation-wrong="Streaming source is an exchange boundary, not a universal replacement for scan operators. Leaf fragments keep the normal scan and may add only an output streaming sink.">
+            <h3 class="quiz-question">3. Which source should a leaf fragment that reads parquet use?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q3-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The normal Sirius parquet/scan source</span></button>
+              <button class="quiz-option" data-value="q3-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>A streaming source fed by the FE</span></button>
+              <button class="quiz-option" data-value="q3-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>A nixl source even when no exchange exists</span></button>
+              <button class="quiz-option" data-value="q3-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>No source; the Rust wrapper performs the GPU scan</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q4-d"
+               data-explanation-right="Correct. Translation is a checked representation boundary. Unsupported nodes should produce actionable structured errors until an explicit, parity-tested mapping exists."
+               data-explanation-wrong="The translator must not silently alter distribution or hide missing semantics behind fallback. Preserve the FE decision, add a correct mapping, or reject the plan explicitly.">
+            <h3 class="quiz-question">4. The translator encounters a StarRocks plan node with no Substrait mapping. What is the safe behavior?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q4-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Drop the node and translate its child</span></button>
+              <button class="quiz-option" data-value="q4-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Ask nixl to execute the missing operator</span></button>
+              <button class="quiz-option" data-value="q4-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Repartition the query into a shape Sirius already supports</span></button>
+              <button class="quiz-option" data-value="q4-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Return a structured unsupported-node error until an explicit mapping is implemented</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q5-b"
+               data-explanation-right="Correct. A full output channel must stop sink task admission, leaving batches idle and repository-visible so normal barriers and spill can absorb pressure without parking a worker."
+               data-explanation-wrong="Engine workers must not block in network or channel I/O. Backpressure is represented as task-admission state and repository pressure, then an external channel edge re-arms the sink when capacity returns.">
+            <h3 class="quiz-question">5. In the target design, a downstream CN stops draining. How should Sirius react first?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q5-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Block a GPU worker inside <code>sink()</code> until the network recovers</span></button>
+              <button class="quiz-option" data-value="q5-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Stop admitting new sink tasks while queued repository batches remain spillable</span></button>
+              <button class="quiz-option" data-value="q5-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Ask the FE to re-optimize every outstanding fragment immediately</span></button>
+              <button class="quiz-option" data-value="q5-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Drop the oldest partition and continue</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q6-c"
+               data-explanation-right="Correct. The standalone operator PR proves the core scheduling, ownership, EOS, and test contract without coupling review to CN plumbing. FFI, Rust wrappers, translation placement, and execution wiring follow after both boundary operators are stable."
+               data-explanation-wrong="The pairing-session sequence is source, sink, FFI, Rust API, then translation/execution wiring and the stream session. Stacking the first operator on CN plumbing would make core failures harder to isolate and review.">
+            <h3 class="quiz-question">6. What is the correct first delivery for the streaming source?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q6-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>A CN-integrated PR stacked on the current FE/BRPC plumbing</span></button>
+              <button class="quiz-option" data-value="q6-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>A StarRocks-specific context with nixl and partition routing built in</span></button>
+              <button class="quiz-option" data-value="q6-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>An isolated <code>sirius_physical_operator</code> plus focused unit tests, with wiring deferred</span></button>
+              <button class="quiz-option" data-value="q6-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>A project-board update without an executable operator contract</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q7-d"
+               data-explanation-right="Correct. Transfer completion is a wrapper-side protocol edge: after the handshake, the receiver can wrap the staged bytes, register the data_batch in the authoritative repository, and enqueue only its handle for the streaming source."
+               data-explanation-wrong="Posting the transfer or receiving agent metadata does not make the batch consumable. The receiver needs transfer completion, repository registration, and then a channel-handle enqueue before Sirius can schedule work safely.">
+            <h3 class="quiz-question">7. In the proposed cross-CN path, when may the receiver expose a batch to the streaming source?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q7-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>As soon as peer agent metadata is cached</span></button>
+              <button class="quiz-option" data-value="q7-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Immediately after the sender calls <code>post_xfer_req</code></span></button>
+              <button class="quiz-option" data-value="q7-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>When the FE sends the downstream fragment again</span></button>
+              <button class="quiz-option" data-value="q7-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>After <code>transfer_complete</code>, wrapping and repository registration, then enqueueing the batch-id handle</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q8-b"
+               data-explanation-right="Correct. Keeping exchange queues in registered Sirius repositories lets the existing downgrade executor see idle exchange batches. The wrapper may temporarily depend on cuCascade; a pluggable external-repository interface is a later extraction."
+               data-explanation-wrong="The v1 direction favors one visible pressure path over early abstraction purity: queues stay inside Sirius, batches remain repository-visible, and the shared manager accounts exchange plus compute."
+          >
+            <h3 class="quiz-question">8. What is the intended first resource-management shape for exchange queues?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q8-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Keep raw buffers exclusively in the Rust wrapper and let each side manage an unrelated budget</span></button>
+              <button class="quiz-option" data-value="q8-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Keep queues in registered Sirius repositories under the shared cuCascade budget, accepting temporary dependency leakage</span></button>
+              <button class="quiz-option" data-value="q8-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Block implementation until a generic pluggable external-repository API exists</span></button>
+              <button class="quiz-option" data-value="q8-d" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Disable spill for exchange data so nixl always owns GPU memory directly</span></button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module11')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module11')">Try Again</button>
+        </div>
+
+        <p style="margin-top: var(--space-8)"><strong>Trace exercise:</strong> take a two-fragment distributed <code>GROUP BY</code> and annotate every transition with (a) owner, (b) representation, (c) memory owner, (d) EOS producer, and (e) implemented/target/proposed status. If any arrow has two owners or no completion edge, the design is incomplete.</p>
+        <p><strong>Takeaway:</strong> StarRocks owns the distributed query; the Rust wrapper owns compatibility and exchange; Sirius owns local GPU execution. Substrait and FFI keep those responsibilities connected without collapsing them.</p>
+      </section>
+
+    </div>
+  </div>
+
+  <div class="lesson-nav"><a href="#module-10"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Streaming Frontier</span></a><a class="ln-next" href="#module-1"><span class="ln-eyebrow">Course complete &#10003;</span><span class="ln-title">Back to the start</span></a></div>
+</section>

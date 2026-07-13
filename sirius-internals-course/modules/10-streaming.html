@@ -2,29 +2,29 @@
   <div class="module-content">
     <header class="module-header animate-in">
       <span class="module-number">10</span>
-      <h1 class="module-title">Streaming Frontier — Proposed Capstone</h1>
-      <p class="module-subtitle">Apply current execution contracts to proposed exchange-channel, streaming-source, and streaming-sink designs without mistaking design targets for callable APIs.</p>
+      <h1 class="module-title">Streaming Frontier — Feature-Branch KT Capstone</h1>
+      <p class="module-subtitle">Separate the implemented exchange-channel and streaming-source core from the plan wiring, wake-up session, transport, error, and production-policy work that still surrounds it.</p>
     </header>
 
     <div class="module-body">
 
       <section class="screen animate-in">
-        <h2 class="screen-heading">Proposed capstone contract</h2>
-        <div class="callout callout-warning"><div class="callout-icon">PROPOSED</div><div class="callout-content"><strong class="callout-title"><code>exchange_channel</code>, streaming source, and streaming sink do not exist in the pinned source tree</strong><p>Every type, method, state table, file path, and test tag in this module is a design target from <code>experimental/starrocks/docs/</code>. It is not a callable API. Current engine contracts used to evaluate the design are labeled separately.</p></div></div>
-        <p><strong>Prerequisites:</strong> Modules 1–9. <strong>Time:</strong> optional 30–40 minute capstone. Objectives: enumerate open design decisions before coding; test the proposal against hint, repository, reservation, completion, and teardown contracts; predict liveness failures; and produce standalone operator/test plans before compute-node integration.</p>
+        <h2 class="screen-heading">Capstone contract and source status</h2>
+        <div class="callout callout-warning"><div class="callout-icon">STATUS</div><div class="callout-content"><strong class="callout-title">Three snapshots are discussed; do not collapse them into one</strong><p>The pinned course tree at <code>834e27c2</code> has no exchange classes. <a href="https://github.com/sirius-db/sirius/pull/1094">Draft PR #1094</a>, inspected at head <code>07d3ae71</code>, is two commits over base <code>3e29a7d6</code>: nine changed files, <code>+1483/-1</code>. It implements <code>exchange_channel</code>, <code>sirius_physical_streaming_source</code>, documentation, and focused test sources; its PR test checklist is still unchecked. Session, wiring, sink, transport/error policy, and end-to-end fragment integration remain follow-up work.</p></div></div>
+        <p><strong>Prerequisites:</strong> Modules 1–9. <strong>Time:</strong> optional 45–60 minute capstone. Objectives: trace draft PR #1094; separate standalone code from F1/#839 session ownership, F2 plan/pipeline wiring, partitioned-sink/backpressure policy whose #837/#838 scope is inconsistent, and F4/#840 resource management; verify known defects; and leave the KT with named owners for every unresolved production decision.</p>
       </section>
 
       <!-- ── SCREEN 1: WHERE YOUR OPERATORS SIT ─────────────────── -->
       <section class="screen animate-in">
         <h2 class="screen-heading">Where your operators sit</h2>
 
-        <p><strong>PROPOSED:</strong> the operator shapes below are design targets; only the existing scan and task machinery used for comparison is current.</p>
+        <p><strong>DRAFT + PLANNED:</strong> the streaming source is implemented in draft PR #1094; plan wiring, the streaming sink, and the end-to-end fragment path do not exist yet.</p>
 
-        <p>Modules 1–9 describe the live engine. The proposed work in <a href="https://github.com/sirius-db/sirius/issues/836">#836</a>/<a href="https://github.com/sirius-db/sirius/issues/837">#837</a> would let batches enter and leave through another process so Sirius can participate as a StarRocks compute node inside a <span class="term" data-definition="StarRocks' unit of distributed execution: one slice of a query plan running on one compute node, connected to other fragments by exchanges.">fragment</span>.</p>
+        <p>Modules 1–9 describe the live engine. PR #1094 implements the standalone inbound boundary for <a href="https://github.com/sirius-db/sirius/issues/836">#836</a>; the proposed sink in <a href="https://github.com/sirius-db/sirius/issues/837">#837</a> supplies the outbound half. Together with later wiring, they let Sirius participate as a StarRocks compute node inside a <span class="term" data-definition="StarRocks' unit of distributed execution: one slice of a query plan running on one compute node, connected to other fragments by exchanges.">fragment</span>.</p>
 
         <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">the same trace, proposed new leaf</span><pre><code><span class="code-line"><span class="code-property">Module 4:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
-<span class="code-line"><span class="code-property">Your #836:</span>   STREAMING_SOURCE(channel) → FILTER → COUNT sink</span>
+          <span class="translation-label">the same trace, draft new leaf</span><pre><code><span class="code-line"><span class="code-property">Module 4:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
+<span class="code-line"><span class="code-property">Feature #836:</span> STREAMING_SOURCE(channel) → FILTER → COUNT sink</span>
 <span class="code-line"><span class="code-comment">└── everything downstream: untouched</span></span></code></pre>
         </div>
 
@@ -37,7 +37,7 @@
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
             <div class="pattern-icon" style="background: var(--color-actor-2)">📡</div>
             <h4 class="pattern-title">Your streaming source</h4>
-            <p class="pattern-desc">Would pop metadata from a <span class="term" data-definition="Proposed bounded channel of {batch_id, size_bytes} with close-then-drain end-of-stream. The named future path is not present in this source snapshot."><code>exchange_channel</code></span> fed by a remote producer. The hint machinery is current; this application is proposed, and a stream can legally produce zero tasks.</p>
+            <p class="pattern-desc">Pops metadata from PR #1094&rsquo;s <span class="term" data-definition="Bounded channel of {batch_id, size_bytes} with close-then-drain end-of-stream. Implemented in draft PR #1094, but not wired into the pinned plan path."><code>exchange_channel</code></span>. The remote producer, fragment wiring, and event-driven session around it remain integration work; a stream can legally produce zero tasks.</p>
           </div>
         </div>
 
@@ -120,19 +120,19 @@
 
         </div>
 
-        <p>The division of labor to keep in your head while reviewing your own PRs: <strong>StarRocks FE</strong> owns distributed planning and routing; the <strong>Rust wrapper</strong> owns the exchange; <strong>Sirius</strong> owns per-fragment execution and nothing else. Your #836/#837 operators are the seam where the last two meet.</p>
+        <p>The division of labor to keep in your head while reviewing your own PRs: <strong>StarRocks FE</strong> owns distributed planning and routing; the <strong>stream session/Rust wrapper</strong> owns channel/repository pairs and the exchange; <strong>Sirius</strong> owns per-fragment execution. Same-CN exchange is deliberately an in-process handle hand-off first; nixl belongs to the later cross-CN transport step. Your #836/#837 operators are the seam where the last two meet.</p>
       </section>
 
       <!-- ── SCREEN 2: THE CHANNEL CONTRACT ─────────────────────── -->
       <section class="screen animate-in">
         <h2 class="screen-heading">The channel contract</h2>
 
-        <p><strong>PROPOSED:</strong> this bounded, close-then-drain channel is a design target. No source file in the current tree provides this API.</p>
+        <p><strong>DRAFT PR:</strong> this API is implemented in <a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-95cbaa641fb4a40e50851ddd147abcc9af1c8ca4de760e9f868ba2b9e62337f5"><code>src/include/exec/exchange_channel.hpp</code> in PR #1094 &#8599;</a>, but it is absent from the pinned course tree, unmerged, and has no production wiring there.</p>
 
-        <p>Both operators stand on one primitive. Its contract fits on a card — read it as the spec your unit tests will assert:</p>
+        <p>Both boundary designs stand on one primitive. Its contract fits on a card — read it as the spec the PR&rsquo;s unit tests assert:</p>
 
         <div style="border: 2px dashed var(--color-actor-2); border-radius: var(--radius-md); padding: var(--space-6); background: var(--color-surface); box-shadow: var(--shadow-sm); margin: var(--space-6) 0;">
-          <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: var(--space-1) var(--space-3); margin-bottom: var(--space-4);">Planned API — from the design notes, not yet in tree</span>
+          <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: var(--space-1) var(--space-3); margin-bottom: var(--space-4);">Implemented core — draft PR only</span>
           <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: 0 0 var(--space-4);"><code>exchange_channel</code> — bounded, close-then-drain</h3>
           <div class="badge-list">
             <div class="badge-item">
@@ -158,7 +158,7 @@
           </div>
         </div>
 
-        <p>Why IDs? Module 6 separates ownership, lock state, residency, and discoverability. The proposal keeps the repository as the authoritative lookup so a queued item remains visible to current downgrade discovery:</p>
+        <p>Why IDs? Module 6 separates ownership, lock state, residency, and discoverability. The implementation keeps the repository as the authoritative lookup so a queued item remains visible to current downgrade discovery:</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
@@ -188,7 +188,90 @@
           <div class="callout-icon">⚖️</div>
           <div class="callout-content">
             <strong class="callout-title">The channel must never own memory</strong>
-            <p>A <code>shared_ptr&lt;data_batch&gt;</code> would keep the object alive but would not itself lock it. The problem is a private channel becoming an unregistered owner outside repository and inspectable-queue discovery. The proposed ID preserves one authoritative repository lookup until a task claims the batch.</p>
+            <p>A <code>shared_ptr&lt;data_batch&gt;</code> would keep the object alive but would not itself lock it. The problem is a private channel becoming an unregistered owner outside repository and inspectable-queue discovery. The handle preserves one authoritative repository lookup until a task claims the batch.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 2B: KT DEEP DIVE ─────────────────────────────── -->
+      <section class="screen animate-in" id="streaming-kt-deep-dive">
+        <h2 class="screen-heading">KT deep dive: implemented core, missing integration</h2>
+
+        <p>This is the handoff map for the draft implementation. Read each row as <em>evidence first, unresolved contract second</em>. Test source in a draft PR is not proof of a green validation run, and a standalone operator is not yet a runnable distributed exchange.</p>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Layer</th><th>What exists</th><th>What is still open</th></tr></thead><tbody>
+          <tr><td><strong>Pinned course tree</strong><br><code>834e27c2</code></td><td>Task creator, pipelines, repositories, reservations, base ports/sink, StarRocks design notes.</td><td>No exchange channel or streaming operators. This remains the baseline for Modules 1&ndash;9.</td></tr>
+          <tr><td><strong>Draft implementation</strong><br><a href="https://github.com/sirius-db/sirius/pull/1094">PR #1094</a><br><code>07d3ae71</code></td><td><a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-95cbaa641fb4a40e50851ddd147abcc9af1c8ca4de760e9f868ba2b9e62337f5">Channel</a>, <a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-884a4ae2fdbfba5a6bac689c9d250a5ffa0f8ee94312247fc6a9d1cb7c365629">source implementation</a>, <a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-493cd6eb734f33dd60724ff0ac978f527164d85d3ff956d1db3cc965d198dc7b">CH-1&ndash;11</a>, and <a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-cffc1bf88733604a96a42e3ac1d86da593de9aeb391c69423134987a448a9cb8">SRC-1&ndash;21</a>.</td><td>The nine-file PR is focused and directly testable, but it is draft/unmerged, its test checklist is unchecked, and no query plan constructs or drives the source end to end.</td></tr>
+          <tr><td><strong>F1 — stream session</strong><br><a href="https://github.com/sirius-db/sirius/issues/839">#839</a></td><td>Owns channel/repository pairs and stream-id routing; <code>on_push</code> re-schedules the source, <code>on_pop</code> re-arms the sink; also owns close, cancellation, capacity configuration, and callback lifetime.</td><td>This is the producer on the other side of the source for the first in-process integration path.</td></tr>
+          <tr><td><strong>F2 — plan/pipeline wiring</strong></td><td>Separate follow-up, owner split still to confirm. It must insert streaming boundaries and decide terminal-sink finalization and barrier shape.</td><td>Do not call wiring #838. The live <a href="https://github.com/sirius-db/sirius/issues/838">#838 issue</a> tracks sink partitioning, while design commit <code>c8593116</code> labels #838 backpressure policy and puts partitioning under #837. <a href="https://github.com/sirius-db/sirius/issues/840">#840</a> remains resource/accounting design.</td></tr>
+        </tbody></table></div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">SCOPE</div>
+          <div class="callout-content">
+            <strong class="callout-title">Use behavior names until #837/#838 is reconciled</strong>
+            <p>The pinned <a href="https://github.com/mbrobbel/sirius/blob/c8593116000a5fab2228b25d9d937025e526adbe/experimental/starrocks/docs/exchange-design.md"><code>exchange-design.md</code></a> assigns partitioning/coalescing to #837 and calls #838 the unresolved channel/backpressure policy. The live #838 title/body assigns per-destination partitioning there. This course keeps both facts visible rather than treating either mapping as silently authoritative.</p>
+          </div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-884a4ae2fdbfba5a6bac689c9d250a5ffa0f8ee94312247fc6a9d1cb7c365629" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 3px;">PR #1094 &middot; streaming source &#8599;</a></span><pre><code><span class="code-line"><span class="code-keyword">if</span> (channel-&gt;<span class="code-function">drained</span>()) <span class="code-keyword">return</span> std::nullopt;</span>
+<span class="code-line"><span class="code-keyword">if</span> (!channel-&gt;<span class="code-function">empty</span>())</span>
+<span class="code-line">  <span class="code-keyword">return</span> {READY, <span class="code-keyword">this</span>};</span>
+<span class="code-line"><span class="code-keyword">return</span> {WAITING_FOR_INPUT_DATA, <span class="code-keyword">nullptr</span>};</span>
+<span class="code-line"></span>
+<span class="code-line"><span class="code-keyword">auto</span> h = channel-&gt;<span class="code-function">try_pop</span>();</span>
+<span class="code-line"><span class="code-keyword">auto</span> batch = repo-&gt;<span class="code-function">pop_data_batch_by_id</span>(h-&gt;batch_id);</span>
+<span class="code-line"><span class="code-keyword">return</span> pipelineable_operator_data(batch);</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">WHAT THE LINKED DIFF ACTUALLY IMPLEMENTS</span>
+            <div class="translation-lines">
+              <p class="tl">Closed and empty is terminal; closed with queued handles is still ready.</p>
+              <p class="tl">Open with data creates a source task. Open without data deliberately drops this scheduling request.</p>
+              <p class="tl">Input claiming never blocks: pop one handle, remove the authoritative batch from the repository, and give it to one task.</p>
+              <p class="tl"><code>execute()</code> is pass-through, while the no-history estimate returns <code>stats.bytes</code> instead of the default 2&times; estimate.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>The intended ownership and execution path is:</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">draft PR + missing seams</span><pre><code><span class="code-line"><span class="code-comment">remote / Rust producer                          [planned]</span></span>
+<span class="code-line">  &rarr; repository.<span class="code-function">add_data_batch</span>(batch)              <span class="code-comment">// owner of record</span></span>
+<span class="code-line">  &rarr; channel.<span class="code-function">push</span>({batch_id, size_bytes})           <span class="code-comment">// handle only</span></span>
+<span class="code-line">  &rarr; session callback &rarr; task_creator.<span class="code-function">schedule</span>(source) <span class="code-comment">// #839 missing</span></span>
+<span class="code-line">  &rarr; source.<span class="code-function">try_pop</span>() &rarr; repo.<span class="code-function">pop_data_batch_by_id</span>()</span>
+<span class="code-line">  &rarr; gpu_pipeline_task::<span class="code-function">prepare_for_processing</span>()</span>
+<span class="code-line">  &rarr; source.<span class="code-function">execute</span>() &rarr; base <span class="code-function">sink</span>() &rarr; downstream repo</span></code></pre>
+        </div>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>KT topic</th><th>What the code says</th><th>Question the integration must answer</th></tr></thead><tbody>
+          <tr><td><strong>1. Bigger picture</strong></td><td>A StarRocks fragment is the distributed plan slice; Sirius executes one slice. The source is only the bottom boundary of an <em>intermediate</em> fragment. Leaf fragments keep <code>GPU_SCAN</code>; trivial single-node queries have no streaming operators.</td><td>F1/#839 owns the channel/repository pair and same-CN in-process hand-off. Partitioned sinks add per-destination channels (#837 in the design, live #838 in the tracker); nixl is later. Confirm stream-id mapping and sender cardinality in F2/F8.</td></tr>
+          <tr><td><strong>2. Scheduling model</strong></td><td><code>WAITING_FOR_INPUT_DATA{nullptr}</code> reaches <code>get_operator_for_next_task(nullptr)</code> and ends that request. There is <strong>no periodic retry</strong>. SRC-20 polls manually; <code>on_push</code>/<code>on_pop</code> are otherwise unconsumed.</td><td>F1/#839 explicitly wires <code>on_push &rarr; schedule(source)</code> and <code>on_pop &rarr; sink flush + schedule(sink)</code>. The open decision is wake coalescing and lifetime safety during cancellation/error drain.</td></tr>
+          <tr><td><strong>3. Ownership and memory</strong></td><td>The channel carries <code>{batch_id, size_bytes}</code>; the repository owns the batch until the task claims it. SRC-14 covers HOST downgrade while queued, then restoration. In production, <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/pipeline/gpu_pipeline_task.cpp#L412"><code>gpu_pipeline_task::execute()</code> calls <code>prepare_for_processing()</code> before operator execution &#8599;</a>.</td><td>The session must register the repository with the context manager. Wrapper-pushed batches arrive outside a pipeline task and remain unaccounted in v1; #840 is expected to close that gap. Disk restoration and cancellation still need streaming integration coverage.</td></tr>
+          <tr><td><strong>4. Backpressure</strong></td><td>Capacity is bounded by item count and optional byte occupancy. The intended escape hatch admits one oversized handle only when empty. Engine paths use non-blocking <code>try_*</code>; blocking methods serve wrapper/test callers.</td><td>#839 must implement session re-arm and push/pull behavior; design &sect;7 labels the unresolved block-versus-spill, bound sizing, and slow-partition fairness policy as #838. Constructor capacity is enough for PR #1094; later configuration belongs under <code>operator_params</code>.</td></tr>
+          <tr><td><strong>5. EOS and errors</strong></td><td><code>close()</code> rejects new pushes but preserves queued handles; only <code>drained() == closed() &amp;&amp; empty()</code> means EOS. Close wakes condition-variable waiters, but the channel has no error payload and does not fire a session callback.</td><td>Who closes after the final sender, how does close trigger status evaluation with zero tasks, and how do cancellation/remote errors wake both sides while preserving the first error?</td></tr>
+          <tr><td><strong>6. Ports and downstream wiring</strong></td><td>SRC-18 relies on the base <code>add_next_port_after_sink</code>/<code>sink()</code> loop. The streaming source customizes only source hint, input claim, drained state, pass-through execution, and memory estimate.</td><td>F2 must materialize every destination port correctly and resolve the non-default-port TODO. Partitioned-sink behavior is downstream work (#837 in the design, live #838 in the tracker), not general plan wiring.</td></tr>
+          <tr><td><strong>7. Concurrency conventions</strong></td><td>The net-new channel is deliberate: <code>channel&lt;T&gt;</code> and <code>inspectable_mpsc</code> are unbounded; <code>interruptible_mpmc</code> closes by aborting rather than draining and exposes only approximate size. Exact fullness is required for task admission. CH-11 covers callbacks outside the mutex.</td><td>Preserve that rationale beside the implementation. Hooks are single-slot, so #839 must clear them before the callee dies and define replacement/coalescing behavior.</td></tr>
+          <tr><td><strong>8. Null waiting hint</strong></td><td>This is a legitimate external-input sentinel, unlike ordinary WAITING hints that point upstream. The task creator&rsquo;s null guard makes its recursive walk safe.</td><td>Audit every other hint consumer&mdash;metrics, deadlock detection, pipeline completion, and diagnostics&mdash;before treating the null producer as a system-wide convention.</td></tr>
+        </tbody></table></div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">OPEN</div>
+          <div class="callout-content">
+            <strong class="callout-title">Three plan caveats are outside PR #1094</strong>
+            <p><strong>Accounting:</strong> externally pushed batches are not charged to a pipeline task until #840 provides the shared manager path. <strong>Ordering:</strong> distributed exchange does not promise global order, so the inherited <code>INSERTION_ORDER</code> declaration still needs review. <strong>Device affinity:</strong> the plan assumes one compute-node process per GPU; if one process spans GPUs, the producer chooses the incoming memory space while the task reservation remains execution authority.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">KT</div>
+          <div class="callout-content">
+            <strong class="callout-title">Leave the session with explicit answers, not assumptions</strong>
+            <p>Route decisions to the right owner: F1/#839 for sessions, re-arm, close/error/cancel and capacity; F2 for boundary insertion, ports and sink finalization; partitioned-sink behavior under the unresolved #837/#838 scope; backpressure-policy decisions explicitly named in design &sect;7; and F4/#840 for shared resource accounting. Do not silently bake follow-up policy into the standalone operator.</p>
           </div>
         </div>
       </section>
@@ -197,9 +280,9 @@
       <section class="screen animate-in">
         <h2 class="screen-heading">Your source&rsquo;s hint table</h2>
 
-        <p><strong>PROPOSED:</strong> the table derives a future operator contract from current task-creator behavior; it has not been validated by an implemented streaming source.</p>
+        <p><strong>DRAFT PR:</strong> SRC-1&ndash;5 encode this state table directly, but PR #1094&rsquo;s test checklist is not marked complete. Production re-scheduling and end-to-end completion are still blocked on the missing session/wiring layer.</p>
 
-        <p>Module 4's hint outcomes, re-derived for a proposed channel instead of the current <code>split_connector</code>:</p>
+        <p>Module 4's hint outcomes, implemented for PR #1094&rsquo;s channel instead of the current <code>split_connector</code>:</p>
 
         <div class="pattern-cards stagger-children">
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
@@ -222,7 +305,11 @@
         <div class="badge-list" style="margin-top: var(--space-6)">
           <div class="badge-item">
             <code class="badge-code">all_ports_empty()</code>
-            <span class="badge-desc">Overridden to <code>channel-&gt;drained()</code>. A zero-port source inherits a base that returns true unconditionally — forget this override and your operator&rsquo;s body silently never runs.</span>
+            <span class="badge-desc">Overridden to <code>channel-&gt;drained()</code>. It gates the creator&rsquo;s <code>while (!all_ports_empty())</code> loop; a zero-port source that forgets this override silently creates no tasks.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code">update_pipeline_status()</code>
+            <span class="badge-desc">The same drained predicate is load-bearing again in completion: source exhausted + source pipelines finished + first-node ports empty + <code>tasks_created == tasks_completed</code>. Correct state is insufficient unless some event invokes the check.</span>
           </div>
         </div>
 
@@ -230,27 +317,77 @@
           <div class="callout-icon">⚠️</div>
           <div class="callout-content">
             <strong class="callout-title">The hint is not <span class="term" data-definition="Deciding whether work may consume resources at the moment it starts — here, gating each individual pull at task-creation time, not just once per hint round.">admission control</span></strong>
-            <p>The current task creator can build multiple tasks after one readiness decision. The proposal therefore requires per-claim gating in <code>get_next_task_input_data()</code>: <code>try_pop()</code> and <code>nullptr</code> when the channel is dry.</p>
+            <p>The current task creator can build multiple tasks after one readiness decision. PR #1094 therefore gates every claim in <code>get_next_task_input_data()</code>: <code>try_pop()</code> and <code>nullptr</code> when the channel is dry.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 3B: VERIFIED DRAFT DEFECTS ───────────────────── -->
+      <section class="screen animate-in" id="streaming-verified-defects">
+        <h2 class="screen-heading">Two verified defects still present in PR #1094</h2>
+
+        <p><strong>CONFIRMED AT <code>07d3ae71</code>:</strong> these are not hypothetical review questions. The current channel and baseline task-creator control flow contain both gaps; the proposed fixes are not part of the two committed PR changes.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">B1</div>
+            <h4 class="pattern-title">Byte admission checks the past, not the candidate</h4>
+            <p class="pattern-desc"><code>try_push(h)</code> asks <code>full_unlocked()</code> before adding <code>h</code>, but that helper sees only current <code>_total_bytes</code>. With a 50-byte limit and 40 bytes queued, a second 40-byte handle is accepted and the queue reaches 80. A 200-byte handle is also accepted into any non-full queue, not only an empty one.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">B2</div>
+            <h4 class="pattern-title">Terminal EOS can become true without an engine edge</h4>
+            <p class="pattern-desc"><code>close()</code> notifies condition-variable waiters but fires no scheduling callback. If a hint resolves to null, <code>manager_loop()</code> continues before dispatching its lambda; the lambda&rsquo;s final <code>update_pipeline_status(false)</code> therefore never runs. Empty streams and late close can hang forever.</p>
+          </div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-95cbaa641fb4a40e50851ddd147abcc9af1c8ca4de760e9f868ba2b9e62337f5" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 3px;">current byte gate &#8599;</a></span><pre><code><span class="code-line"><span class="code-keyword">if</span> (_closed || <span class="code-function">full_unlocked</span>())</span>
+<span class="code-line">  <span class="code-keyword">return false</span>;</span>
+<span class="code-line">_queue.<span class="code-function">push_back</span>(h);</span>
+<span class="code-line">_total_bytes += h.size_bytes;</span>
+<span class="code-line"></span>
+<span class="code-comment">// capacity = 50</span>
+<span class="code-line"><span class="code-function">push</span>(40); <span class="code-comment">// true, total 40</span></span>
+<span class="code-line"><span class="code-function">push</span>(40); <span class="code-comment">// true, total 80 — BUG</span></span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">INTENDED ADMISSION RULE</span>
+            <div class="translation-lines">
+              <p class="tl">Reject when item capacity is already reached.</p>
+              <p class="tl">For byte capacity, evaluate <code>current_bytes + candidate_bytes</code>.</p>
+              <p class="tl">Keep exactly one escape hatch: if the queue is empty, admit a single oversized handle so the stream cannot wedge permanently.</p>
+              <p class="tl">Add crossing-boundary tests; CH-3 covers only &ldquo;already at bound,&rdquo; and CH-4 covers only oversized-into-empty.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">FIX</div>
+          <div class="callout-content">
+            <strong class="callout-title">The EOS fix location is still a KT decision</strong>
+            <p>One candidate is a narrow STREAMING_SOURCE branch in <code>task_creator</code> that evaluates pipeline status when a request produces zero tasks. Another is to make F1/#839 own both the close wake and completion evaluation. Before choosing, verify how an empty <code>GPU_SCAN</code> completes today; the hole may deserve a generic source fix rather than a streaming-only exception.</p>
           </div>
         </div>
       </section>
 
       <!-- ── SCREEN 4: THE WAR STORY (HERO) ─────────────────────── -->
       <section class="screen animate-in">
-        <h2 class="screen-heading">Predicted liveness failures: two hangs, zero crashes</h2>
+        <h2 class="screen-heading">Terminal EOS control flow: two hangs, zero crashes</h2>
 
-        <p><strong>PROPOSED:</strong> these are design-time failure analyses until reproduced by implemented code and tests.</p>
+        <p><strong>STATICALLY CONFIRMED, NOT YET REPRODUCED END TO END:</strong> the standalone tests do not drive the real scheduler/session boundary. The branch control flow nevertheless drops both required edges.</p>
 
         <p>Picture a mailroom lit by a motion-sensor: the light (the completion check) only switches on when somebody walks <em>out</em> — a task completes. Sirius is <span class="term" data-definition="Edge-triggered: re-evaluate only when an event fires (here: a task completion). Level-triggered: keep re-checking while a condition holds. Sirius completion is edge-triggered — a condition that becomes true without an event is never noticed. That asymmetry is this entire module.">edge-triggered, not level-triggered</span> — and a courier who delivers <em>nothing</em> never trips the sensor. Step through the first hang found while prototyping your source, then its fix:</p>
 
         <div class="flow-animation" data-steps='[
           {"highlight":"flow-actor-m7-producer","label":"BUG 1 — the empty stream. The remote producer connects, has zero rows for this fragment, and immediately calls close() on the channel.","packet":true,"from":"actor-m7-producer","to":"actor-m7-channel"},
           {"highlight":"flow-actor-m7-channel","label":"The channel is now closed AND empty — drained(). End of stream, before it ever began."},
-          {"highlight":"flow-actor-m7-creator","label":"The task creator polls your source once: get_next_task_hint() sees drained() and answers nullopt — exhausted forever. A correct answer. Zero tasks created.","packet":true,"from":"actor-m7-creator","to":"actor-m7-source"},
+          {"highlight":"flow-actor-m7-creator","label":"The task creator evaluates your source once: get_next_task_hint() sees drained() and answers nullopt — exhausted forever. A correct answer. Zero tasks created.","packet":true,"from":"actor-m7-creator","to":"actor-m7-source"},
           {"highlight":"flow-actor-m7-status","label":"Nothing was created, so nothing ever completes — and update_pipeline_status() only runs on a completion edge. The check never fires. Not once. The room stays dark."},
           {"highlight":"flow-actor-m7-future","label":"The future never resolves. No error, no crash, no log line. Nothing was wrong — nobody re-checked. The query waits forever."},
-          {"highlight":"flow-actor-m7-channel","label":"THE FIX, part 1: close() fires a wake, so the task creator re-polls the source instead of waiting for a completion edge that will never come.","packet":true,"from":"actor-m7-channel","to":"actor-m7-creator"},
-          {"highlight":"flow-actor-m7-source","label":"THE FIX, part 2: in the task-creation path, the drained-source-with-no-task case explicitly calls update_pipeline_status() itself.","packet":true,"from":"actor-m7-source","to":"actor-m7-status"},
+          {"highlight":"flow-actor-m7-channel","label":"CANDIDATE FIX, part 1: close_input() emits a session wake, so the task creator re-evaluates the source instead of waiting for a completion edge that will never come.","packet":true,"from":"actor-m7-channel","to":"actor-m7-creator"},
+          {"highlight":"flow-actor-m7-source","label":"CANDIDATE FIX, part 2: either task creation or the session explicitly evaluates pipeline status when drained EOS produces no task. Placement still needs agreement.","packet":true,"from":"actor-m7-source","to":"actor-m7-status"},
           {"highlight":"flow-actor-m7-status","label":"The check finally runs: source finished, ports empty, created == completed. Pipeline finished; operators finalize; downstream is notified."},
           {"highlight":"flow-actor-m7-future","label":"The terminal executor path marks the completion handler after status evaluation; the query can return its empty materialized result.","packet":true,"from":"actor-m7-status","to":"actor-m7-future"}
         ]'>
@@ -318,12 +455,18 @@
           </div>
         </div>
 
-        <p>Both fixes are proposed in the #836 design and are not yet in the tree. Re-read Module 4's current finish condition with streaming eyes:</p>
+        <p>The necessary wake and zero-task status evaluation are described by the follow-up design but are not implemented in PR #1094. Re-read Module 4's current finish condition with streaming eyes:</p>
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/pipeline/sirius_pipeline.cpp#L389" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp:389 &#8599;</a></span><pre><code><span class="code-line">      <span class="code-keyword">if</span> (limit_exhausted ||</span>
-<span class="code-line">          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>())) {</span>
+            <span class="translation-label">PR base 3e29a7d6 &middot; sirius_pipeline.cpp</span><pre><code><span class="code-line"><span class="code-keyword">bool</span> source_exhausted = !source ||</span>
+<span class="code-line">  (source-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp;</span>
+<span class="code-line">   source-&gt;<span class="code-function">all_ports_empty</span>());</span>
+<span class="code-line"></span>
+<span class="code-line"><span class="code-keyword">if</span> (limit_exhausted ||</span>
+<span class="code-line">    (source_exhausted &amp;&amp;</span>
+<span class="code-line">     first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp;</span>
+<span class="code-line">     first_node-&gt;<span class="code-function">all_ports_empty</span>())) {</span>
 <span class="code-line">        <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {</span>
 <span class="code-line">          pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);</span>
 <span class="code-line">          <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; op : <span class="code-function">get_operators</span>()) {</span>
@@ -338,7 +481,8 @@
             <span class="translation-label">STREAMING EYES</span>
             <div class="translation-lines">
               <p class="tl">You studied this in Module 4 — the LIMIT escape hatch is irrelevant for a stream that produced nothing.</p>
-              <p class="tl">For your source, both clauses delegate to the channel: <em>finished</em> and <code>all_ports_empty()</code> are both <code>drained()</code>. An empty, closed stream passes instantly.</p>
+              <p class="tl">The pipeline&rsquo;s source member delegates exhaustion to the channel: the streaming override makes <code>all_ports_empty()</code> equal <code>drained()</code>.</p>
+              <p class="tl">The first-node conjunct separately verifies downstream source pipelines and input ports. A closed empty stream with no downstream data satisfies both sides.</p>
               <p class="tl">Zero created equals zero completed — trivially true. Every condition holds.</p>
               <p class="tl">So the pipeline <em>would</em> finish, and every operator <em>would</em> finalize&hellip;</p>
               <p class="tl">&hellip;and <code>should_notify</code> would propagate dependency state using the current Module 4 completion path.</p>
@@ -350,8 +494,8 @@
         <div class="callout callout-accent">
           <div class="callout-icon">💡</div>
           <div class="callout-content">
-            <strong class="callout-title">Install your own switch</strong>
-            <p>A scan gets its completion evaluation for free — there&rsquo;s always a task in flight to trip the sensor. A stream must install its own switch: every zero-task EOS path has to trigger the status evaluation itself. Any operator whose input isn&rsquo;t the scan manager will face this exact gap.</p>
+            <strong class="callout-title">Guarantee an edge, then decide who owns it</strong>
+            <p>A stream must provide an explicit wake and status evaluation for every zero-task EOS path. Do not assume scans always get this for free: ask how an empty <code>GPU_SCAN</code> completes today. If that path can also close before creating a task, fix the generic external-source contract instead of adding a STREAMING_SOURCE-only exception.</p>
           </div>
         </div>
       </section>
@@ -360,11 +504,11 @@
       <section class="screen animate-in">
         <h2 class="screen-heading">The ship checklist</h2>
 
-        <p><strong>PROPOSED:</strong> resolve every row below in the implementation plan before creating production classes or wiring a compute node.</p>
+        <p><strong>MIXED STATUS:</strong> PR #1094 settles the standalone source shape, but every row below must be verified before merge or assigned to the correct integration follow-up.</p>
 
-        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Decision to close</th><th>Required answer before coding</th></tr></thead><tbody><tr><td>Channel element</td><td>ID/byte-count metadata, ownership, lookup failure behavior, and whether metadata must include ordering/partition identity</td></tr><tr><td>Hint convention</td><td>READY/WAITING/nullopt mapping for open-empty, open-nonempty, closed-nonempty, and closed-empty states</td></tr><tr><td>Sink finalization</td><td>Who closes the channel, exactly once, after all senders/tasks are accounted for</td></tr><tr><td>Boundary shape</td><td>Why the source/sink owns tasks and can express backpressure without blocking a worker</td></tr><tr><td>Re-arm ownership</td><td>Which event schedules task creation when data arrives, capacity returns, or EOS closes with zero tasks</td></tr><tr><td>Capacity/config</td><td>Units, defaults, memory accounting, validation, and runtime configuration plumbing</td></tr><tr><td>External batch accounting</td><td>How references are registered, released, cancelled, and included in teardown/leak checks</td></tr><tr><td>Ordering</td><td>Per-sender, per-partition, or global guarantees and how retries preserve them</td></tr><tr><td>Cancellation/abort</td><td>How both sides wake, discard metadata, release repository ownership, and report the first error</td></tr><tr><td>Multi-sender EOS / multi-GPU</td><td>Sender quorum, final close, partition affinity, and reservation-device authority</td></tr></tbody></table></div>
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Decision to close</th><th>Required answer before merge/integration</th></tr></thead><tbody><tr><td>Channel element</td><td>ID/byte-count metadata, ownership, lookup failure behavior, and whether metadata must include ordering/partition identity</td></tr><tr><td>Hint convention</td><td>READY/WAITING/nullopt mapping for open-empty, open-nonempty, closed-nonempty, and closed-empty states</td></tr><tr><td>Sink finalization</td><td>Who closes the channel, exactly once, after all senders/tasks are accounted for</td></tr><tr><td>Boundary shape</td><td>Why the source/sink owns tasks and can express backpressure without blocking a worker</td></tr><tr><td>Re-arm ownership</td><td>Which event schedules task creation when data arrives, capacity returns, or EOS closes with zero tasks</td></tr><tr><td>Capacity/config</td><td>Fix candidate-aware byte admission; add boundary-crossing tests; then choose additive item/byte, batch/coalescing, staging, and copy-credit settings without changing non-distributed defaults</td></tr><tr><td>External batch accounting</td><td>How references are registered, released, cancelled, and included in teardown/leak checks</td></tr><tr><td>Sink &rarr; nixl ownership</td><td>When output remains repository-registered and spillable versus when transport may steal ownership; reserve the deep-copy path and keep the batch alive through <code>transfer_complete</code></td></tr><tr><td>Ordering</td><td>Per-sender, per-partition, or global guarantees and how retries preserve them</td></tr><tr><td>Cancellation/abort</td><td>How both sides wake, discard metadata, release repository ownership, and report the first error</td></tr><tr><td>Multi-sender EOS / multi-GPU</td><td>Sender quorum, final close, partition affinity, and reservation-device authority</td></tr></tbody></table></div>
 
-        <p>Six invariants, one from each stop of this course. Pin this next to your two PRs:</p>
+        <p>Seven invariants, one from each stop of this course. Amber rows are known PR #1094 gaps, not completed checks:</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in" style="border-left-color: var(--color-success)">
@@ -372,6 +516,13 @@
             <div class="step-body">
               <strong>The channel carries IDs; the repository owns batches <code>M6</code></strong>
               <p>Queued data remains discoverable through the repository; the channel itself does not acquire a batch accessor or become the authoritative owner.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-4)">
+            <div class="step-num" style="background: var(--color-actor-4)">!</div>
+            <div class="step-body">
+              <strong>Byte admission evaluates the incoming handle <code>M6</code></strong>
+              <p>Reject a candidate that crosses the byte bound unless the queue is empty and the candidate itself is oversized. PR #1094 does not yet satisfy this invariant.</p>
             </div>
           </div>
           <div class="step-card animate-in" style="border-left-color: var(--color-success)">
@@ -388,11 +539,11 @@
               <p>The creator&rsquo;s loop doesn&rsquo;t re-poll hints — gate every pull, return <code>nullptr</code> when the channel is dry.</p>
             </div>
           </div>
-          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
-            <div class="step-num" style="background: var(--color-success)">✓</div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-4)">
+            <div class="step-num" style="background: var(--color-actor-4)">!</div>
             <div class="step-body">
               <strong>Zero-task EOS paths trigger status evaluation themselves <code>M4</code></strong>
-              <p>No completion edge means no free re-check. The empty stream and the late close both need <em>your</em> switch.</p>
+              <p>No completion edge means no free re-check. The empty stream and late close are still unresolved in PR #1094.</p>
             </div>
           </div>
           <div class="step-card animate-in" style="border-left-color: var(--color-success)">
@@ -406,7 +557,7 @@
             <div class="step-num" style="background: var(--color-success)">✓</div>
             <div class="step-body">
               <strong>The device comes from the reservation when proposed partitioning arrives <code>M7</code></strong>
-              <p>Never infer a GPU from a batch — the task&rsquo;s reservation is the sole authority, streaming or not.</p>
+              <p>The external producer chooses where an incoming batch first lands; <code>gpu_pipeline_task</code> still takes execution authority from the task reservation and prepares inputs there.</p>
             </div>
           </div>
         </div>
@@ -415,12 +566,12 @@
           <div class="callout-icon">🚢</div>
           <div class="callout-content">
             <strong class="callout-title">Agreed sequencing: standalone PRs first</strong>
-            <p>Operators plus unit tests, no compute-node wiring — <code>exchange_channel</code> + source as PR&nbsp;1, sink as PR&nbsp;2. The CN integration lands only after both stand alone in the tree.</p>
+            <p>Operators plus test sources, no compute-node wiring — <code>exchange_channel</code> + source are draft PR&nbsp;1 (#1094), sink is PR&nbsp;2 (#837). F1/#839 and F2 wiring start only after those standalone contracts are accepted.</p>
           </div>
         </div>
 
-        <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: var(--space-10) 0 var(--space-2);">The extension path #836/#837 will walk</h3>
-        <p>Every new operator enters the engine the same five-rung way. Rungs 1&ndash;4 are one standalone PR; rung 5 is deliberately its own.</p>
+        <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: var(--space-10) 0 var(--space-2);">PR #1094 touchpoints and the F2 wiring path</h3>
+        <p>Rungs 1&ndash;4 are present in the draft PR. Rungs 5&ndash;6 remain deliberate integration work.</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
@@ -447,27 +598,68 @@
           <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
             <div class="step-num" style="background: var(--color-actor-1)">4</div>
             <div class="step-body">
-              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">test</span><a href="https://github.com/sirius-db/sirius/tree/834e27c28aad41258472134f4706cf00ac6ad9aa/test/cpp"><code>test/cpp/</code>&nbsp;↗</a></strong>
-              <p><strong>Planned, not yet runnable:</strong> use focused tags <code>[exchange_channel]</code>, <code>[streaming_source]</code>, and <code>[streaming_sink]</code>, followed by integration, multi-sender EOS, cancellation, and multi-GPU coverage.</p>
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">test sources</span><a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-493cd6eb734f33dd60724ff0ac978f527164d85d3ff956d1db3cc965d198dc7b"><code>CH-1–11</code>&nbsp;↗</a> + <a href="https://github.com/sirius-db/sirius/pull/1094/changes#diff-cffc1bf88733604a96a42e3ac1d86da593de9aeb391c69423134987a448a9cb8"><code>SRC-1–21</code>&nbsp;↗</a></strong>
+              <p>PR #1094 adds <code>[exchange_channel]</code> CH-1&ndash;11 and <code>[streaming_source]</code> SRC-1&ndash;21. The PR checklist does not yet claim a green run; byte-crossing, real scheduler, EOS wake, cancellation, and integration coverage remain.</p>
             </div>
           </div>
           <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
             <div class="step-num" style="background: var(--color-actor-2)">5</div>
             <div class="step-body">
-              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-actor-2); color: var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">later, deliberate</span><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/planner/sirius_physical_plan_generator.cpp"><code>src/planner/sirius_physical_plan_generator.cpp</code>&nbsp;↗</a></strong>
-              <p>Plan-generator wiring. <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px;">standalone PR first</span> — unwired = the operator simply never runs (silent CPU fallback).</p>
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-actor-2); color: var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">F2 decision</span><code>pipeline converter or plan generator?</code></strong>
+              <p><code>CPU_SOURCE</code> is injected post-plan by <code>sirius_pipeline_converter::split_cpu_source()</code>, so it is the concrete wiring precedent. Decide whether exchange-input fragments follow that pattern or introduce plan-generator mapping. Do not copy <code>cpu_source_task</code>: after the #1114 revert, current <code>src/</code> constructs none.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">6</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-actor-2); color: var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">first edge</span><code>query::build_indices()</code> + <code>start_query()</code></strong>
+              <p>The query index currently registers only <code>GPU_SCAN</code>/<code>CPU_SOURCE</code>, and <code>start_query()</code> schedules exactly <code>scans.front()</code>. F2/F1 must decide whether STREAMING_SOURCE joins that index for an initial schedule or starts only from #839 channel events.</p>
             </div>
           </div>
         </div>
+      </section>
+
+      <!-- ── SCREEN 5B: KT AGENDA + INTEGRATION LADDER ──────────── -->
+      <section class="screen animate-in" id="streaming-kt-agenda">
+        <h2 class="screen-heading">KT agenda: spend meeting time on the unsettled edges</h2>
+
+        <p>Several original questions are already answered by the plans: #839 owns the session and re-arm; constructor capacity comes first and <code>operator_params</code> later; the bespoke channel rationale is settled; and one-CN-per-GPU means multi-GPU affinity is currently a flag, not a feature to solve. Use the KT for the decisions below.</p>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Priority</th><th>Evidence to present</th><th>Decision to leave with</th></tr></thead><tbody>
+          <tr><td><strong>A. Scheduling and completion</strong></td><td>Show the null-hint drop, the lambda-only status update, and the #1114-era teardown comment: completion callbacks can enqueue raw operator pointers while a query is draining.</td><td>Place the zero-task EOS evaluation in task creation or #839; verify empty <code>GPU_SCAN</code>; define callback lifetime/coalescing; confirm nullopt versus <code>WAITING{nullptr}</code> as a stable contract.</td></tr>
+          <tr><td><strong>B. Wiring and first schedule</strong></td><td><code>CPU_SOURCE</code> is inserted by the pipeline converter; <code>build_indices()</code> recognizes only GPU/CPU sources; <code>start_query()</code> schedules one indexed source.</td><td>Choose converter versus plan-generator insertion, source registration versus session-only wake, barrier shape, and a real terminal-sink finalization mechanism.</td></tr>
+          <tr><td><strong>C. EOS, errors, cancellation</strong></td><td>The channel has open/closed only; no poison/error payload. F8 must carry sender count from FE plans, and F9 aggregates closes.</td><td>Define sender quorum, queued-handle disposition on failure, first-error propagation, and the exact abort/clear-callback order.</td></tr>
+          <tr><td><strong>D. Memory and accounting</strong></td><td>Queued batches are spill candidates only after #839 registers their repo with the context manager. Wrapper-pushed bytes remain outside task reservations until #840.</td><td>Accept or reject the interim gap; choose conservative batch/capacity values; define the repository key and budget relationship to downgrade start/stop thresholds.</td></tr>
+          <tr><td><strong>E. Data plane</strong></td><td>External device writers add a CUDA-stream hand-off not exercised by SRC-1&ndash;21. Exchange has no global-order guarantee; one handle per task trades overlap for overhead. The proposed sink-to-nixl API must also choose between a sole-owner steal and a reserved deep copy.</td><td>Assign writer-event/rebind responsibility, add a cross-stream IT-0 case, choose batch granularity, define repository/spill ownership through <code>transfer_complete</code>, resolve <code>source_order()</code>, pin partial-aggregate wire format, and route around unsupported merging exchange/ORDER BY in v1.</td></tr>
+        </tbody></table></div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">MPMC</div>
+          <div class="callout-content">
+            <strong class="callout-title">Multiple producers are not merely defensive generality</strong>
+            <p>Cross-CN gather streams can have multiple senders. The remaining question is whether they push one shared channel concurrently or whether #839 serializes them before admission; either way, sender-count EOS must be explicit.</p>
+          </div>
+        </div>
+
+        <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: var(--space-10) 0 var(--space-2);">Gather first: the shortest path to evidence</h3>
+        <p>An unpartitioned gather exercises source, sink, session, EOS, and backpressure without partitioned-sink support. Hash partitioning&mdash;whether tracked under #837 as in the design or live #838 as in the issue tracker&mdash;is deliberately off the first integration critical path.</p>
+
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Step</th><th>Scenario</th><th>What it proves</th></tr></thead><tbody>
+          <tr><td><strong>IT-0</strong></td><td>C++ loopback: session A sink &rarr; in-process handles &rarr; session B source, with tiny capacity and EOS.</td><td>F1/#839 scheduling, close, backpressure, and result correctness without StarRocks, FFI, or nixl.</td></tr>
+          <tr><td><strong>IT-1</strong></td><td>IT-0 under a small GPU budget.</td><td>The session-registered exchange repo is discovered by downgrade and queued batches self-heal.</td></tr>
+          <tr><td><strong>IT-2</strong></td><td>Drive two sessions through FFI and the Rust <code>sirius</code> crate.</td><td>Public ownership and lifetime contracts.</td></tr>
+          <tr><td><strong>IT-3</strong></td><td>Real FE + one CN, two-fragment <code>COUNT(*)</code>, local gather.</td><td>F2/F7&ndash;F9 plan translation and same-CN execution; still no partitioned sink or nixl.</td></tr>
+          <tr><td><strong>IT-5+</strong></td><td>Two CN processes, then shuffle GROUP BY/joins and TPC-H.</td><td>nixl/bRPC transport first; add partitioning only when shuffle plans require it, after reconciling the #837/#838 PR boundary.</td></tr>
+        </tbody></table></div>
       </section>
 
       <!-- ── SCREEN 6: QUIZ + COURSE CLOSE ──────────────────────── -->
       <section class="screen animate-in">
         <h2 class="screen-heading">Review questions for your own PRs</h2>
 
-        <p><strong>PROPOSED:</strong> answer from current engine invariants plus explicit design choices, not from APIs that do not exist yet.</p>
+        <p><strong>MIXED STATUS:</strong> answer from the pinned engine, PR #1094 test sources, verified branch gaps, and explicitly named follow-ups. Do not credit planned session behavior to the standalone source.</p>
 
-        <p>Four questions a sharp reviewer will ask on #836/#837. Answer like you&rsquo;re defending the design.</p>
+        <p>Six questions a sharp reviewer will ask on #836/#837. Answer like you&rsquo;re defending the design.</p>
 
         <div class="quiz-container" id="quiz-module10">
           <div class="quiz-question-block"
@@ -574,16 +766,68 @@
             <div class="quiz-feedback"></div>
           </div>
 
+          <div class="quiz-question-block"
+               data-correct="q5-b"
+               data-explanation-right="Correct. The null producer terminates the recursive hint walk and the current request is discarded. There is no timer or automatic manager-loop retry. The feature tests poll manually; production needs #839 to turn push/close events into new scheduling and status-evaluation requests."
+               data-explanation-wrong="Not quite. WAITING with a null producer is safe because the recursive task-creator entry immediately returns null, but that also ends the request. The callback hook exists, yet no production session consumes it in this snapshot; tests that make progress do so with an explicit polling loop.">
+            <h3 class="quiz-question">5. The source returns <code>WAITING_FOR_INPUT_DATA{nullptr}</code> for an open, empty channel. What happens in the current feature snapshot?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q5-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The task-creator manager automatically polls the same source again on its next loop iteration</span>
+              </button>
+              <button class="quiz-option" data-value="q5-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The current request ends safely; without a session consuming channel events and calling <code>schedule()</code>, no automatic retry occurs</span>
+              </button>
+              <button class="quiz-option" data-value="q5-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The null producer is converted to <code>READY{this}</code> so the source can perform an empty non-blocking pull</span>
+              </button>
+              <button class="quiz-option" data-value="q5-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>on_push</code> already enqueues the next request through <code>task_creator::schedule()</code></span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q6-c"
+               data-explanation-right="Correct. Admission checks full_unlocked() before adding the candidate, and full_unlocked() sees only the existing 40 bytes. Because 40 is below 50, the second push succeeds and total occupancy becomes 80. The intended rule must consider current + candidate, with only an empty-channel oversized escape hatch."
+               data-explanation-wrong="Not quite. The current implementation does not test projected byte occupancy. CH-3 checks a queue already at its bound, while CH-4 checks an oversized handle entering an empty queue; neither catches the 40 + 40 crossing case.">
+            <h3 class="quiz-question">6. PR #1094 configures <code>capacity_bytes = 50</code>. The channel already holds a 40-byte handle, then receives another 40-byte handle. What does the current code do?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q6-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Rejects the second handle because projected occupancy would be 80 bytes</span>
+              </button>
+              <button class="quiz-option" data-value="q6-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Blocks only if the second handle is larger than the configured capacity by itself</span>
+              </button>
+              <button class="quiz-option" data-value="q6-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Accepts the second handle and reaches 80 bytes because admission checks only current occupancy before insertion</span>
+              </button>
+              <button class="quiz-option" data-value="q6-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Evicts the first handle to preserve the 50-byte channel bound</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
           <button class="quiz-check-btn" onclick="checkQuiz('quiz-module10')">Check Answers</button>
           <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module10')">Try Again</button>
         </div>
 
-        <p style="margin-top: var(--space-8)"><strong>Design exercise:</strong> complete the open-decision table, then write test names for empty EOS, late close, full-channel re-arm, cancellation, multi-sender EOS, and multi-GPU affinity. <strong>Failure scenario:</strong> identify the missing event in a zero-task close and the hidden-ownership bug in a private batch queue.</p>
-        <p>The current engine is covered in Modules 1–9. This optional module ends with a reviewed implementation proposal—not with runnable code. The design inputs live under <code>experimental/starrocks/docs/</code>; verify their status again before implementation.</p>
+        <p style="margin-top: var(--space-8)"><strong>Design exercise:</strong> write test names for byte-bound crossing, oversized-while-nonempty, empty EOS, late close, full-channel re-arm, callback teardown, multi-sender EOS, and cross-CUDA-stream arrival. <strong>Failure scenario:</strong> identify the missing engine edge in a zero-task close and the hidden-budget risk in an unregistered external repository.</p>
+        <p>The current engine is covered in Modules 1–9. This optional module ends with a draft core that has focused test sources plus a reviewed integration contract&mdash;not a verified-green, merged, or runnable distributed query path. Re-check PR #1094, F1/#839, F2 wiring, the #837/#838 partitioning/backpressure scope, F4/#840, the pinned <a href="https://github.com/mbrobbel/sirius/blob/c8593116000a5fab2228b25d9d937025e526adbe/experimental/starrocks/docs/exchange-design.md"><code>exchange-design.md</code></a>, and <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/experimental/starrocks/docs/streaming-source-plan.md"><code>experimental/starrocks/docs/streaming-source-plan.md</code> &#8599;</a> before implementation.</p>
       </section>
 
     </div>
   </div>
 
-      <div class="lesson-nav"><a href="#module-9"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Design Decisions</span></a><a class="ln-next" href="#module-1"><span class="ln-eyebrow">Course complete &#10003;</span><span class="ln-title">Back to the start</span></a></div>
+      <div class="lesson-nav"><a href="#module-9"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Design Decisions</span></a><a class="ln-next" href="#module-11"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">StarRocks Integration</span></a></div>
 </section>

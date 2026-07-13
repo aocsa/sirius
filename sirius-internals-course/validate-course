@@ -172,7 +172,29 @@ def validate_github_link(
         if revision in {"main", "master", "dev"}:
             return f"floating Sirius source link uses {revision!r}: {href}"
         if revision != sirius_commit:
-            return f"Sirius source link is not pinned to HEAD {sirius_commit[:8]}: {href}"
+            # Cross-snapshot lessons may compare the pinned course tree with a
+            # feature or historical commit. Keep those links immutable and
+            # validate the target directly from Git rather than the worktree.
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                return f"Sirius source link is not pinned to a full commit: {href}"
+            object_spec = f"{revision}:{'/'.join(rel_parts)}"
+            object_result = subprocess.run(
+                ["git", "cat-file", "-t", object_spec],
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if object_result.returncode != 0:
+                return f"linked source object does not exist at {revision[:8]}: {href}"
+            object_type = object_result.stdout.strip()
+            expected_type = "tree" if kind == "tree" else "blob"
+            if object_type != expected_type:
+                return (
+                    f"{kind} link points to Git object type {object_type!r}, "
+                    f"expected {expected_type!r}: {href}"
+                )
+            return None
         target = repo_root.joinpath(*rel_parts)
     elif (owner, repo) == ("duckdb", "duckdb"):
         if revision in {"main", "master", "dev"}:
@@ -222,7 +244,7 @@ def main() -> int:
     module_paths = sorted((course_dir / "modules").glob("[0-9][0-9]-*.html"))
     errors: list[str] = []
 
-    expected_numbers = list(range(1, 11))
+    expected_numbers = list(range(1, 12))
     actual_numbers = [int(path.name[:2]) for path in module_paths]
     if actual_numbers != expected_numbers:
         errors.append(f"module files must be exactly 01..10; found {actual_numbers}")
