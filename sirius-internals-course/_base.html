@@ -18,19 +18,19 @@
   })();
   </script>
 
-  <!-- Google Fonts: Bricolage Grotesque · DM Sans · JetBrains Mono -->
+  <!-- Google Fonts: Newsreader · Inter · JetBrains Mono -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&display=swap" rel="stylesheet">
 
   <link rel="stylesheet" href="styles.css">
 
   <style>
     :root {
-      --color-accent:       #2A7B9B;
-      --color-accent-hover: #1F6280;
-      --color-accent-light: #E4F2F7;
-      --color-accent-muted: #5A9DB8;
+      --color-accent:       #C14E36;
+      --color-accent-hover: #A8412B;
+      --color-accent-light: rgba(217, 92, 65, 0.10);
+      --color-accent-muted: #D95C41;
     }
 
     /* ── Responsive width overrides ─────────────────────────────
@@ -55,6 +55,27 @@
       overflow-wrap: anywhere;
     }
     .translation-english { overflow-wrap: break-word; }
+
+    /* Technical comparison tables added by the content pass. */
+    .comparison-table-wrap {
+      width: 100%; overflow-x: auto; margin: var(--space-6) 0;
+      border: 1px solid var(--color-border); border-radius: 12px;
+      background: var(--color-surface);
+    }
+    .comparison-table {
+      width: 100%; min-width: 680px; border-collapse: collapse;
+      font-size: var(--text-sm); line-height: 1.5;
+    }
+    .comparison-table th,
+    .comparison-table td {
+      text-align: left; vertical-align: top; padding: 10px 12px;
+      border-bottom: 1px solid var(--color-border-light);
+    }
+    .comparison-table th {
+      background: var(--color-bg-warm); color: var(--color-text-secondary);
+      font-size: var(--text-xs); letter-spacing: 0.04em; text-transform: uppercase;
+    }
+    .comparison-table tr:last-child td { border-bottom: 0; }
 
     /* Stack the panels while columns would still be cramped —
        the stock sheet only stacks below 768px, far too late. */
@@ -265,13 +286,13 @@
     .course-toc a.active .toc-num { background: var(--color-accent); border-color: var(--color-accent); color: #fff; }
 
     /* Screen-level sub-navigation under the active module */
-    .course-toc .toc-time { margin-left: auto; font-size: 10px; color: var(--color-text-muted); font-weight: 400; white-space: nowrap; }
+    .course-toc .toc-time { margin-left: auto; font-size: 11px; color: var(--color-text-muted); font-weight: 400; white-space: nowrap; }
     .course-toc .toc-sub { display: none; margin: 2px 0 6px 32px; border-left: 1px solid var(--color-border); }
     .course-toc a.active + .toc-sub { display: block; }
     .course-toc.no-spy .toc-sub { display: block; }
-    .course-toc .toc-sub a { display: block; padding: 4px 10px; font-size: 12px; color: var(--color-text-muted); border-radius: 0 6px 6px 0; }
+    .course-toc .toc-sub a { display: block; padding: 4px 10px; font-size: 13px; color: var(--color-text-muted); border-radius: 0 6px 6px 0; }
     .course-toc .toc-sub a:hover { color: var(--color-text); background: var(--color-accent-light); }
-    .toc-kbd-hint { margin-top: 14px; padding: 8px 10px; font-size: 11px; color: var(--color-text-muted); }
+    .toc-kbd-hint { margin-top: 14px; padding: 8px 10px; font-size: 12px; color: var(--color-text-muted); }
     kbd {
       font-family: var(--font-mono); font-size: 10px;
       border: 1px solid var(--color-border); border-bottom-width: 2px;
@@ -296,34 +317,31 @@
     }
     .resume-toast .rt-x { border: none; background: transparent; color: var(--color-text-muted); padding: 4px 6px; }
 
-    /* ── Dark theme (claude-ui-style warm dark, adapted to teal) ──
-       The light theme is the stock warm cream. Dark re-maps every
-       design token to Anthropic-style warm darks — never cold black. */
+    /* ── Dark theme — Learn Harness Engineering palette ─────────
+       Near-black foundations, raised charcoal surfaces and a softer
+       coral accent mirror the reference course without changing layout. */
     html[data-theme="dark"] {
-      --color-bg:             #262624;
-      --color-bg-warm:        #21201E;
-      --color-bg-code:        #1E1E2E;
-      --color-text:           #F0EEE9;
-      /* Secondary/muted measured against all four dark surfaces:
-         secondary 7.7–9.5:1, muted 5.5–6.8:1 — muted stays ≥4.5 even
-         at the 10-12px caption sizes this course uses it for. */
-      --color-text-secondary: #C9C6BC;
-      --color-text-muted:     #ABA79D;
-      --color-border:         #3D3C38;
-      --color-border-light:   #34332F;
-      --color-surface:        #30302E;
-      --color-surface-warm:   #2B2A28;
-      --color-accent:         #4FA3C4;
-      --color-accent-hover:   #66B4D2;
-      --color-accent-light:   #20353F;
-      --color-accent-muted:   #3B7E9B;
+      --color-bg:             #1A1A1A;
+      --color-bg-warm:        #141414;
+      --color-bg-code:        #141414;
+      --color-text:           #E5E5E5;
+      --color-text-secondary: #B3B3B3;
+      --color-text-muted:     #9A9A9A;
+      --color-border:         rgba(255, 255, 255, 0.12);
+      --color-border-light:   rgba(255, 255, 255, 0.08);
+      --color-surface:        #242424;
+      --color-surface-warm:   #202020;
+      --color-accent:         #E07A64;
+      --color-accent-hover:   #EE927E;
+      --color-accent-light:   rgba(224, 122, 100, 0.15);
+      --color-accent-muted:   #D95C41;
       --color-success:        #4CAF79;
       --color-success-light:  #1D3227;
       --color-error:          #E06B5F;
       --color-error-light:    #3A2422;
       --color-info:           #57A8C7;
       --color-info-light:     #20353F;
-      --color-actor-1:        #E0705A;
+      --color-actor-1:        #E07A64;
       --color-actor-2:        #57A8C7;
       --color-actor-3:        #9D91C9;
       --color-actor-4:        #D9B45E;
@@ -335,7 +353,7 @@
       /* Ink for text sitting ON brightened accent/actor fills — inline
          styles reference it as color: var(--fill-ink, white) so they
          follow the theme instead of bypassing the stylesheet override. */
-      --fill-ink: #14211C;
+      --fill-ink: #1A1A1A;
     }
     /* Accent/actor-filled controls: the dark theme brightens those fill
        colors (so they read as text on dark surfaces), which drops white
@@ -350,17 +368,18 @@
     html[data-theme="dark"] .btn-primary,
     html[data-theme="dark"] .btn-primary:hover,
     html[data-theme="dark"] .course-toc a.active .toc-num {
-      color: #14211C;
+      color: #1A1A1A;
     }
+    html[data-theme="dark"] .module-number { opacity: 0.28; }
 
     /* Components with hardcoded light values */
     html[data-theme="dark"] .nav {
-      background: rgba(33,32,30,0.92);
+      background: rgba(26,26,26,0.92);
       border-bottom-color: var(--color-border-light);
     }
     html[data-theme="dark"] :where(p, li, .tl, summary, h4, td, .pattern-desc, .callout-content, .rt-role, .badge-desc) > code {
-      background: rgba(87,168,199,0.14);
-      border-color: rgba(87,168,199,0.28);
+      background: rgba(224,122,100,0.14);
+      border-color: rgba(224,122,100,0.28);
     }
     html[data-theme="dark"] .lesson-nav a,
     html[data-theme="dark"] .repo-tree,
@@ -538,28 +557,32 @@
     <div class="nav-inner">
       <span class="nav-title">Sirius Internals — Interactive Onboarding</span>
       <div class="nav-dots" id="nav-dots" role="tablist">
-        <button class="nav-dot" data-target="module-1" data-tooltip="The Big Picture" role="tab" aria-label="Module 1: The Big Picture"></button>
-        <button class="nav-dot" data-target="module-2" data-tooltip="Meet the Actors" role="tab" aria-label="Module 2: Meet the Actors"></button>
-        <button class="nav-dot" data-target="module-3" data-tooltip="Life of a Query" role="tab" aria-label="Module 3: Life of a Query"></button>
-        <button class="nav-dot" data-target="module-4" data-tooltip="Where Data Comes From" role="tab" aria-label="Module 4: Where Data Comes From"></button>
-        <button class="nav-dot" data-target="module-5" data-tooltip="The Data Plane" role="tab" aria-label="Module 5: The Data Plane"></button>
-        <button class="nav-dot" data-target="module-6" data-tooltip="Memory & Multi-GPU" role="tab" aria-label="Module 6: Memory and Multi-GPU"></button>
-        <button class="nav-dot" data-target="module-7" data-tooltip="Design Decisions" role="tab" aria-label="Module 7: Design Decisions"></button>
-        <button class="nav-dot" data-target="module-8" data-tooltip="The Streaming Frontier" role="tab" aria-label="Module 8: The Streaming Frontier"></button>
+        <button class="nav-dot" data-target="module-1" data-tooltip="Big Picture & First Run" role="tab" aria-label="Module 1: Big Picture, Execution Model, and First Run"></button>
+        <button class="nav-dot" data-target="module-2" data-tooltip="Actors & Lifetimes" role="tab" aria-label="Module 2: Actors, Threads, Ownership, and Lifetimes"></button>
+        <button class="nav-dot" data-target="module-3" data-tooltip="Plan to Pipelines" role="tab" aria-label="Module 3: From DuckDB Plan to Sirius Pipelines"></button>
+        <button class="nav-dot" data-target="module-4" data-tooltip="Tasks & Completion" role="tab" aria-label="Module 4: Life of a Query, Tasks, Hints, and Completion"></button>
+        <button class="nav-dot" data-target="module-5" data-tooltip="Scan, IO & Cache" role="tab" aria-label="Module 5: Scan, IO, and Cache"></button>
+        <button class="nav-dot" data-target="module-6" data-tooltip="The Data Plane" role="tab" aria-label="Module 6: The Data Plane"></button>
+        <button class="nav-dot" data-target="module-7" data-tooltip="Memory & Multi-GPU" role="tab" aria-label="Module 7: Reservations, Downgrade, and Multi-GPU"></button>
+        <button class="nav-dot" data-target="module-8" data-tooltip="Authoring & Observability" role="tab" aria-label="Module 8: Operator Authoring, Observability, Testing, and Teardown"></button>
+        <button class="nav-dot" data-target="module-9" data-tooltip="Design Decisions" role="tab" aria-label="Module 9: Design Decisions and Tradeoffs"></button>
+        <button class="nav-dot" data-target="module-10" data-tooltip="Streaming Frontier" role="tab" aria-label="Module 10: Proposed Streaming Frontier"></button>
       </div>
     </div>
   </nav>
 
   <aside class="course-toc" aria-label="Course contents">
     <h3>Course contents</h3>
-    <a href="#module-1"><span class="toc-num">1</span>The Big Picture</a>
-    <a href="#module-2"><span class="toc-num">2</span>Meet the Actors</a>
-    <a href="#module-3"><span class="toc-num">3</span>Life of a Query</a>
-    <a href="#module-4"><span class="toc-num">4</span>Where Data Comes From</a>
-    <a href="#module-5"><span class="toc-num">5</span>The Data Plane</a>
-    <a href="#module-6"><span class="toc-num">6</span>Memory &amp; Multi-GPU</a>
-    <a href="#module-7"><span class="toc-num">7</span>Design Decisions</a>
-    <a href="#module-8"><span class="toc-num">8</span>The Streaming Frontier</a>
+    <a href="#module-1"><span class="toc-num">1</span>Big Picture &amp; First Run</a>
+    <a href="#module-2"><span class="toc-num">2</span>Actors &amp; Lifetimes</a>
+    <a href="#module-3"><span class="toc-num">3</span>Plan to Pipelines</a>
+    <a href="#module-4"><span class="toc-num">4</span>Tasks &amp; Completion</a>
+    <a href="#module-5"><span class="toc-num">5</span>Scan, IO &amp; Cache</a>
+    <a href="#module-6"><span class="toc-num">6</span>The Data Plane</a>
+    <a href="#module-7"><span class="toc-num">7</span>Memory &amp; Multi-GPU</a>
+    <a href="#module-8"><span class="toc-num">8</span>Authoring &amp; Observability</a>
+    <a href="#module-9"><span class="toc-num">9</span>Design Decisions</a>
+    <a href="#module-10"><span class="toc-num">10</span>Streaming Frontier</a>
     <div class="toc-kbd-hint"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> move between modules</div>
   </aside>
 

@@ -1,12 +1,18 @@
-<section class="module" id="module-7" style="background: var(--color-bg-warm)">
+<section class="module" id="module-9" style="background: var(--color-bg-warm)">
   <div class="module-content">
     <header class="module-header animate-in">
-      <span class="module-number">07</span>
-      <h1 class="module-title">Design Decisions</h1>
-      <p class="module-subtitle">Half of Sirius's design looks over-engineered until you learn which outage or rewrite produced it. Here are the receipts.</p>
+      <span class="module-number">09</span>
+      <h1 class="module-title">Design Decisions &amp; Tradeoffs</h1>
+      <p class="module-subtitle">Read current architecture as decisions with benefits, costs, evidence, and explicit conditions for reconsideration—not as mythology or changelog trivia.</p>
     </header>
 
     <div class="module-body">
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Lesson contract</h2>
+        <div class="callout callout-info"><div class="callout-icon">CURRENT + HISTORY</div><div class="callout-content"><strong class="callout-title">Current design first; PRs provide provenance</strong><p><strong>Prerequisites:</strong> Modules 1–8. <strong>Time:</strong> 25–35 minutes. Current code/tests decide what exists; PRs explain why a decision was made but do not prove that behavior still exists.</p></div></div>
+        <p>Objectives: evaluate an architectural decision as context → choice → benefit → cost → evidence → revisit condition; distinguish historical and current claims; explain the hybrid execution model, native AST boundary, compound splitting, wiring materialization, task-accounting lock, and observability decisions.</p>
+      </section>
 
       <!-- ── Screen 1: The two currents (hero) ──────────────────── -->
       <section class="screen animate-in">
@@ -122,8 +128,8 @@
 
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
             <div class="pattern-icon" style="background: var(--color-actor-5)">📦</div>
-            <h4 class="pattern-title">Repositories + ports, never returns</h4>
-            <p class="pattern-desc">Data lives in shared repositories and moves as handles through ports — no operator ever returns batches to a caller. That one rule buys spillability, barriers, and inspectability (module 4).</p>
+            <h4 class="pattern-title">Repositories at pipeline boundaries</h4>
+            <p class="pattern-desc">Inside one task, operators return <code>operator_data</code> forward. A terminal sink publishes <code>data_batch</code> references into repositories at pipeline boundaries, buying buffered scheduling, barriers, discoverability, and downgrade without imposing a repository between every operator call (Module 6).</p>
             <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/NVIDIA/cuCascade/pull/26">cc#26</a> · <a href="https://github.com/sirius-db/sirius/pull/519">#519</a> · <a href="https://github.com/sirius-db/sirius/pull/689">#689</a></p>
           </div>
 
@@ -157,6 +163,19 @@
         </div>
       </section>
 
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Six current ADRs</h2>
+        <p>Each record states the current design as-is. “Revisit” is a testable condition, not a prediction.</p>
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)"><div class="pattern-icon">FLOW</div><h4 class="pattern-title">Push-oriented hybrid execution</h4><p class="pattern-desc"><strong>Context:</strong> GPU tasks need forward batch execution, but pipelines must be independently admitted and memory-managed.<br><strong>Decision:</strong> drive <code>operator_data</code> forward inside a task; buffer pipeline edges in repositories; discover readiness with hints.<br><strong>Benefit:</strong> batching, asynchronous scheduling, barriers, and downgrade.<br><strong>Cost:</strong> explicit completion/re-arm protocol and harder liveness reasoning.<br><strong>Status/evidence:</strong> Current—<code>gpu_pipeline_task</code>, <code>task_creator</code>, operator sink/ports.<br><strong>Revisit if:</strong> a unified driver can preserve those properties with measurably simpler lifecycle semantics.</p></div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)"><div class="pattern-icon">AST</div><h4 class="pattern-title">Translate once into <code>sirius::ast</code></h4><p class="pattern-desc"><strong>Context:</strong> DuckDB expression classes couple operator execution to one frontend.<br><strong>Decision:</strong> translate at planning into native expression/value/function types; lower to cuDF AST or materialized operations later.<br><strong>Benefit:</strong> a stable engine boundary and non-DuckDB frontend path.<br><strong>Cost:</strong> Sirius owns translation, type coverage, AST breakers, and fallback tests.<br><strong>Status/evidence:</strong> Current—<code>src/expression/</code> and <code>src/expression_executor/</code>.<br><strong>Revisit if:</strong> a frontend-neutral shared IR satisfies the same ownership and GPU-lowering requirements.</p></div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)"><div class="pattern-icon">SPLIT</div><h4 class="pattern-title">Expand compound operators into pipelines</h4><p class="pattern-desc"><strong>Context:</strong> join, aggregate, and global sort need partition/build/merge phases with different barriers.<br><strong>Decision:</strong> let <code>sirius_pipeline_converter</code> insert PARTITION/CONCAT and sample/partition/merge chains.<br><strong>Benefit:</strong> explicit scheduling, device affinity, and phase-specific memory state.<br><strong>Cost:</strong> more pipelines, wiring, IDs, and completion edges.<br><strong>Status/evidence:</strong> Current—converter split helpers and plan printer.<br><strong>Revisit if:</strong> an operator can expose equivalent phases without hiding scheduler-visible state.</p></div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)"><div class="pattern-icon">WIRE</div><h4 class="pattern-title">Describe wiring before materializing it</h4><p class="pattern-desc"><strong>Context:</strong> pipeline conversion should not require live repositories or a runtime manager.<br><strong>Decision:</strong> emit <code>repository_wiring</code> data, then materialize repositories, ports, consumers, and dependencies in <code>initialize_internal()</code>.<br><strong>Benefit:</strong> deterministic, testable planning and explicit runtime ownership.<br><strong>Cost:</strong> two representations that must remain consistent.<br><strong>Status/evidence:</strong> Current—<code>compute_repository_wiring()</code> and <code>repository_wiring_materializer.cpp</code>.<br><strong>Revisit if:</strong> planning gains a runtime-independent repository abstraction with equal testability.</p></div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)"><div class="pattern-icon">LOCK</div><h4 class="pattern-title">Atomic state claim and task accounting</h4><p class="pattern-desc"><strong>Context:</strong> completion can race a port pop or partition claim before the new task is counted.<br><strong>Decision:</strong> hold the pipeline status lock across state consumption and the constructor that calls <code>mark_task_created()</code>; use RAII completion accounting.<br><strong>Benefit:</strong> no empty-port/balanced-counter false finish.<br><strong>Cost:</strong> a wider critical section and strict custom-task discipline.<br><strong>Status/evidence:</strong> Current—load-bearing comment in <code>sirius_pipeline.hpp</code>.<br><strong>Revisit if:</strong> state claims and task counts become one atomic reservation primitive.</p></div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)"><div class="pattern-icon">TRACE</div><h4 class="pattern-title">Observability is execution state</h4><p class="pattern-desc"><strong>Context:</strong> latency can be input wait, queueing, reservation, downgrade, GPU compute, or finalization; one timer cannot disambiguate them.<br><strong>Decision:</strong> carry IDs and states through structured logs, NVTX ranges, and experimental Quent telemetry.<br><strong>Benefit:</strong> cross-layer correlation and actionable performance/debug evidence.<br><strong>Cost:</strong> instrumentation overhead, schema evolution, and ID discipline.<br><strong>Status/evidence:</strong> Logs/NVTX current; Quent experimental.<br><strong>Revisit if:</strong> one stable trace schema covers all three consumers without losing profiler integration.</p></div>
+        </div>
+      </section>
+
       <!-- ── Screen 3: Archaeology — code↔English ───────────────── -->
       <section class="screen animate-in">
         <h2 class="screen-heading">Archaeology: reading a bug's fossil</h2>
@@ -164,7 +183,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/sirius_pipeline.cpp#L427-L436" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp · L427-436 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/pipeline/sirius_pipeline.cpp#L427-L436" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp · L427-436 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-line"><span class="code-keyword">void</span> sirius_pipeline::<span class="code-function">mark_task_completed</span>()</span>
 <span class="code-line">{</span>
 <span class="code-doc"><span class="doc-p">Sanity check: a task is completing here, which means this pipeline was still running work. If the pipeline was already marked finished, or any of its operators were already finalized, then we declared the pipeline done too early — i.e. a task was still in flight when we considered the pipeline complete. That mismatch can make the whole query look done while work is still running, so surface it loudly.</span></span>
@@ -207,7 +226,7 @@
           </div>
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
             <div class="pattern-icon" style="background: var(--color-actor-5)">📚</div>
-            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/tree/dev/docs/super-sirius">docs/super-sirius/</a></h4>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/tree/834e27c28aad41258472134f4706cf00ac6ad9aa/docs/super-sirius">docs/super-sirius/</a></h4>
             <p class="pattern-desc">The reference docs for the live engine — its README gives the reading order. Required before modifying Super Sirius code, not just recommended.</p>
           </div>
         </div>
@@ -218,7 +237,7 @@
         <h2 class="screen-heading">Three review comments</h2>
         <p>Three PRs, three reviewer questions. Answer as the author — with receipts.</p>
 
-        <div class="quiz-container" id="quiz-module6">
+        <div class="quiz-container" id="quiz-module9">
           <div class="quiz-question-block"
                data-correct="option-b"
                data-explanation-right="Both standing decisions in one review comment: repositories keep ownership so the batches stay findable and spillable under pressure (cc#26, #689), and only handles/IDs ever cross a boundary — raw buffers never travel."
@@ -297,15 +316,18 @@
             <div class="quiz-feedback"></div>
           </div>
 
-          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module6')">Check Answers</button>
-          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module6')">Try Again</button>
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module9')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module9')">Try Again</button>
         </div>
+
+        <p><strong>Code-reading task:</strong> choose one ADR and verify every “Current” claim against source rather than its PR. <strong>Observable exercise:</strong> take a proposed change and write context, decision, benefit, cost, evidence, status, and a measurable revisit condition. <strong>Failure scenario:</strong> use historical PR text as proof of current behavior and identify the source/test that disproves it.</p>
+        <div class="callout callout-accent"><div class="callout-icon">✓</div><div class="callout-content"><strong class="callout-title">Recap</strong><p>Architecture is a set of active tradeoffs. Current source establishes behavior; history supplies provenance; an ADR remains useful only when its cost and reconsideration condition are visible.</p></div></div>
 
         <div class="callout callout-info">
           <div class="callout-icon">➡️</div>
           <div class="callout-content">
-            <strong class="callout-title">Next: The Streaming Frontier</strong>
-            <p>The newest growth ring is being laid down right now — the streaming source and sink (<a href="https://github.com/sirius-db/sirius/pull/836">#836</a>, <a href="https://github.com/sirius-db/sirius/pull/837">#837</a>) — and you're the one drawing it.</p>
+            <strong class="callout-title">Next: Proposed Streaming Frontier</strong>
+            <p>The capstone applies these decisions to design material. Its <code>exchange_channel</code>, streaming source, and streaming sink are explicitly proposed—not callable APIs in this source snapshot.</p>
           </div>
         </div>
       </section>
@@ -313,5 +335,5 @@
     </div>
   </div>
 
-      <div class="lesson-nav"><a href="#module-6"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Memory & Multi-GPU</span></a><a class="ln-next" href="#module-8"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">The Streaming Frontier</span></a></div>
+      <div class="lesson-nav"><a href="#module-8"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Authoring &amp; Observability</span></a><a class="ln-next" href="#module-10"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Proposed Streaming Frontier</span></a></div>
 </section>

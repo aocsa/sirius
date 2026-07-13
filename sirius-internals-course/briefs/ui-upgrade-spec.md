@@ -21,8 +21,10 @@ Check design-system.md for the actual token names available (e.g., if `--color-b
   a second line in 12px muted showing the owning path in `code` font.
 - Arrows: use flex rows with `→` / `↓` glyphs in var(--color-text-muted) — never images.
 - **Control plane vs data plane:** control arrows are plain `→`; data movement is a
-  labeled chip (e.g. `⬤ batch handle`) in the accent color. Where relevant annotate:
-  "data never travels by function return — it goes through repositories".
+  labeled chip in the accent color. Use the layer-qualified annotation:
+  "inside a GPU task, returned `operator_data` moves forward; at a pipeline boundary,
+  the sink publishes `data_batch` references into repositories." Never claim that
+  operators do not return data.
 
 ## Semantics badges (consistent across all modules)
 - Blocking / pipeline-breaker operator: badge `⛔ breaker` (accent-colored border, not red).
@@ -50,9 +52,11 @@ Click-to-expand cards use native `<details class="explorer-card">`/`<summary>`:
 
 ## Clickable source paths
 - Every file/dir reference in a diagram or explorer is a real link:
-  files → `https://github.com/sirius-db/sirius/blob/dev/<path>`,
-  directories → `https://github.com/sirius-db/sirius/tree/dev/<path>`.
-- **VERIFY every path before linking** (ls/glob in /home/ubuntu/git/sirius-db/sirius). A
+  files → `https://github.com/sirius-db/sirius/blob/<pinned-sirius-commit>/<path>`,
+  directories → `https://github.com/sirius-db/sirius/tree/<pinned-sirius-commit>/<path>`.
+- DuckDB implementation links use the DuckDB gitlink commit recorded by that Sirius snapshot,
+  never floating `main`.
+- **VERIFY every path before linking** with `rg --files` in the course's Sirius checkout. A
   broken deep link is worse than no link. If a path doesn't exist, name the concept without
   a link.
 - Render paths in `code` font; the link carries a `↗` suffix.
@@ -63,7 +67,10 @@ compact ladder (one row per layer, each row = layer label chip + file link + one
 `planner node → physical operator → GPU work (cudf calls) → memory notes → tests → run command`.
 Run commands come from CLAUDE.md, verbatim:
 - one sqllogic file: `pixi run build/release/test/unittest --test-dir . test/sql/tpch-sirius.test`
-- by Catch2 tag: `pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"`
+- by Catch2 tag: `pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[relevant_tag]"`
+  where `relevant_tag` is verified in the test being taught. Do not recommend `[cpu_cache]`
+  for unrelated operator, scheduler, or streaming work. Module 10 labels
+  `[exchange_channel]`, `[streaming_source]`, and `[streaming_sink]` as planned/not-yet-runnable.
 
 ## Sanity checklist before finishing any module edit
 - No `<script>`, no `<style>`, single `<section>` root preserved, section id unchanged.

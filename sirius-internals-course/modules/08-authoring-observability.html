@@ -1,0 +1,154 @@
+<section class="module module--alt" id="module-8" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">08</span>
+      <h1 class="module-title">Operator Authoring, Observability, Testing &amp; Teardown</h1>
+      <p class="module-subtitle">A safe change is wired, measurable, memory-aware, testable, and drainable—not merely correct on one happy-path batch.</p>
+    </header>
+
+    <div class="module-body">
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Lesson contract</h2>
+        <div class="callout callout-info"><div class="callout-icon">CURRENT</div><div class="callout-content"><strong class="callout-title">The implementation checklist for live Super Sirius</strong><p><strong>Prerequisites:</strong> Modules 1–7. <strong>Time:</strong> 35–45 minutes. <strong>Scope:</strong> current operator, logging, NVTX, experimental Quent, test, and error-drain contracts.</p></div></div>
+        <p>By the end you should be able to:</p>
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">1</div><div class="step-body"><strong>Choose the correct operator shape</strong><p>Separate an ordinary intra-pipeline transform from a scan source, repository boundary, or compound/blocking operator.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">2</div><div class="step-body"><strong>Make the change schedulable and memory-aware</strong><p>Implement the right hint/input/finalization hooks, task state, and no-history estimate.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">3</div><div class="step-body"><strong>Read the three observability views</strong><p>Correlate one query across logs, NVTX, and Quent without treating any one view as the complete truth.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">4</div><div class="step-body"><strong>Prove teardown safety</strong><p>Explain why task creation stops before executors drain and which raw pointers make that ordering load-bearing.</p></div></div>
+        </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The operator-authoring contract</h2>
+        <div class="callout callout-accent"><div class="callout-icon">1</div><div class="callout-content"><strong class="callout-title">Load dependency context first</strong><p>Run <code>/module-context &lt;task&gt;</code> before changing operator, expression, memory, join, sort, or IO code. Then follow the <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/docs/super-sirius/README.md">Super Sirius reading order</a>. This is part of the repository contract, not optional preparation.</p></div></div>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">2</div><div class="step-body"><strong>Name and register</strong><p>Add the enum in <code>sirius_physical_operator_type.hpp</code>, its <code>ToString</code> case, source/header files, and production plus test CMake entries.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">3</div><div class="step-body"><strong>Choose the pipeline role</strong><p>An ordinary transform implements <code>execute()</code>. A boundary may need <code>sink()</code>, ports, hints, task input, or finalization. A scan owns split semantics. A compound operator also needs converter rules and wiring.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">4</div><div class="step-body"><strong>Define task state</strong><p>Put shared, pipeline-lifetime data in task global state and batch/retry-specific data in local state. Do not hide query state in a singleton or thread-local.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">5</div><div class="step-body"><strong>Account for memory and retry</strong><p>Implement a defensible <code>no_history_peak_memory_estimate()</code>. Decide whether OOM can resume at an operator index or whether the task must be atomic.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">6</div><div class="step-body"><strong>Finalize once</strong><p>Override <code>on_finalize_operator()</code>, not <code>finalize_operator()</code>; the base wrapper owns the finalized flag and lifecycle checks.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">7</div><div class="step-body"><strong>Prove and document</strong><p>Add focused, integration, CPU-comparison, multi-GPU, and race coverage in proportion to the contracts touched; update <code>docs/super-sirius/</code> and link it here.</p></div></div>
+        </div>
+
+        <div class="comparison-table-wrap">
+          <table class="comparison-table">
+            <thead><tr><th>Shape</th><th>Copy this concern</th><th>Do not copy blindly</th></tr></thead>
+            <tbody>
+              <tr><td>Filter/projection</td><td>Forward <code>execute()</code>, expression executor, output batches</td><td>Source hints or repository consumption</td></tr>
+              <tr><td>GPU scan</td><td>Split connector, scan input, decoder, source completion</td><td>Blocking <code>get_next_split()</code> semantics in an ordinary GPU operator</td></tr>
+              <tr><td>Concat/partition</td><td>Custom hints, ports, partition claims, boundary tasks</td><td>The base hint path if the operator has extra admission conditions</td></tr>
+              <tr><td>Hash join/order by</td><td>Converter expansion, named ports, barriers, device-affine state</td><td>A single-class implementation that ignores its companion pipelines</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The task-creation lock is an authoring rule</h2>
+        <p>If custom task input consumes pipeline state outside the base path, the critical section must cover the state claim and the task constructor. The source comment is the contract:</p>
+        <div class="translation-block animate-in">
+          <div class="translation-code"><span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/include/pipeline/sirius_pipeline.hpp#L177-L182"><code>sirius_pipeline.hpp:177–182</code> ↗</a></span><pre><code>//! Callers must hold this lock across the operation
+//! that consumes pipeline state (port data pop,
+//! partition claim, etc.) and the task constructor
+//! that calls mark_task_created(), so that
+//! update_pipeline_status() cannot observe an
+//! empty-port / balanced-counter state while a task
+//! is mid-creation.</code></pre></div>
+          <div class="translation-english"><span class="translation-label">Required critical section</span><div class="translation-lines"><p class="tl">Acquire the pipeline status lock.</p><p class="tl">Pop port data or claim a partition.</p><p class="tl">Construct the task; construction records <code>mark_task_created()</code>.</p><p class="tl">Release only after the counter and consumed state agree.</p></div></div>
+        </div>
+        <div class="callout callout-warning"><div class="callout-icon">RACE</div><div class="callout-content"><strong class="callout-title">The gap looks like completion</strong><p>If the lock is released after the pop but before construction, another thread can see empty ports and equal created/completed counters. It can finalize the pipeline while the new task is not yet counted.</p></div></div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three complementary observability views</h2>
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in"><div class="pattern-icon">LOG</div><h4 class="pattern-title">Structured logs</h4><p class="pattern-desc">Best for decisions and exceptions: query/pipeline/task IDs, operator index, reservation size, requested bytes, OOM peak, downgrade, retry, and teardown ordering.</p></div>
+          <div class="pattern-card animate-in"><div class="pattern-icon">NVTX</div><h4 class="pattern-title">Profiler timeline</h4><p class="pattern-desc">Best for CPU/GPU chronology: query, pipeline, task, operator, and sink ranges aligned with CUDA kernels in Nsight Systems.</p></div>
+          <div class="pattern-card animate-in"><div class="pattern-icon">Q</div><h4 class="pattern-title">Quent telemetry</h4><p class="pattern-desc">Best for execution state and relationships: plan edges and ports, queues, threads, routing, reservation, downgrade, compute, and finalization states.</p></div>
+        </div>
+
+        <div class="callout callout-warning"><div class="callout-icon">EXPERIMENTAL</div><div class="callout-content"><strong class="callout-title">Quent's schema is not stable</strong><p>The exporter and analyzer are active development. Use <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/docs/super-sirius/quent-telemetry.md"><code>docs/super-sirius/quent-telemetry.md</code></a> as the current procedure and avoid building permanent tooling around undocumented fields.</p></div></div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code"><span class="translation-label">Enable, label, run, visualize</span><pre><code># ~/.sirius/sirius.yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
+
+CALL sirius_set_query_label('join_debug_01');
+SELECT ...;
+
+pixi run quent telemetry_data</code></pre></div>
+          <div class="translation-english"><span class="translation-label">Correlation recipe</span><div class="translation-lines"><p class="tl">Use a unique label; <code>sirius_set_query_label</code> is consumed by the next Sirius query.</p><p class="tl">Find the query and task IDs in logs.</p><p class="tl">Match the task's operator and reservation states in Quent.</p><p class="tl">Use the same time window and operator ID in the NVTX/Nsight trace to decide whether it waited, queued, downgraded, or computed.</p></div></div>
+        </div>
+
+        <p><strong>Trace drill:</strong> if Quent shows a task waiting for reservation, logs show a downgrade request, and NVTX shows no operator range yet, the missing time is admission/memory pressure—not a slow kernel. If NVTX contains a long operator range with a dominant kernel, switch to profiling and source-level optimization.</p>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Test the contract you changed</h2>
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">1</div><div class="step-body"><strong>Focused Catch2</strong><p>Run the smallest real tag, for example <code>pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[expression_executor_ast_native]"</code> or <code>"[bounded_thread_pool]"</code>.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">2</div><div class="step-body"><strong>SQLLogic/integration</strong><p>Exercise the planner, converter, scheduler, and result path—not only the operator method in isolation.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">3</div><div class="step-body"><strong>DuckDB CPU oracle</strong><p>For correctness changes, compare rows, values, nulls, order guarantees, and error behavior against CPU execution.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">4</div><div class="step-body"><strong>Concurrency scope</strong><p>Add multi-GPU, OOM/retry, repeated-query, or sanitizer coverage when touching ownership, scheduling, finalization, or device affinity.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">5</div><div class="step-body"><strong>Repository gates</strong><p>Run <code>pixi run make test</code>, then <code>pixi run pre-commit run -a</code>. Do not substitute an unrelated familiar tag such as <code>[cpu_cache]</code>.</p></div></div>
+        </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Error teardown: stop the producer of dangling work first</h2>
+        <p><code>sirius_engine::execute()</code> calls <code>drain_after_error()</code> before query teardown. This is not cleanup polish: task-creation requests contain raw <code>sirius_physical_operator*</code> values owned by the engine's query plan.</p>
+
+        <div class="flow-steps animate-in">
+          <div class="flow-step"><div class="flow-step-num">1</div><div><strong>Report the exception</strong><p>The completion future receives the failure.</p></div></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step"><div class="flow-step-num">2</div><div><strong>Stop task creator</strong><p>Keep its request queue interrupted so completion callbacks cannot enqueue consumable raw pointers.</p></div></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step"><div class="flow-step-num">3</div><div><strong>Drain work</strong><p>Clear the top-level queue; quiesce GPU executors and their in-flight tasks.</p></div></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step"><div class="flow-step-num">4</div><div><strong>Discard stale creation requests</strong><p>Only now can no executor create another request. Drain again to close the restart race.</p></div></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step"><div class="flow-step-num">5</div><div><strong>Restart for the next query</strong><p>Query-owned operators and repositories may be destroyed after all readers are quiescent.</p></div></div>
+        </div>
+
+        <div class="callout callout-warning"><div class="callout-icon">UAF</div><div class="callout-content"><strong class="callout-title">Wrong order</strong><p>Draining GPU work while the task creator remains live lets an in-flight completion schedule a downstream request. Query teardown then frees its operator, and the creator later dereferences the stale pointer in <code>get_operator_for_next_task()</code>.</p></div></div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Authoring checkpoint</h2>
+        <p><strong>Code-reading task:</strong> compare the base operator, GPU scan, concat, and hash join. For each, list which of <code>execute</code>, <code>sink</code>, <code>get_next_task_hint</code>, <code>get_next_task_input_data</code>, <code>on_finalize_operator</code>, and <code>no_history_peak_memory_estimate</code> it owns.</p>
+        <p><strong>Observable exercise:</strong> run one labeled query with Quent enabled and capture a matching Nsight Systems trace. Select one task and classify every non-compute interval as waiting for input, queued, reserving, downgrading, blocked, or finalizing.</p>
+        <p><strong>Failure scenario:</strong> reorder “stop task creator” after “drain GPU executors.” Explain the exact callback, queued object, pointer owner, and dereference that form the use-after-free window.</p>
+
+        <div class="quiz-container" id="quiz-module8">
+          <div class="quiz-question-block" data-correct="option-b" data-explanation-right="Correct. The lock makes the port/partition claim and mark_task_created atomic with respect to completion checks." data-explanation-wrong="The important boundary is not operator execution; it is the state claim plus construction's task accounting.">
+            <h3 class="quiz-question">A custom boundary operator pops a port batch, releases the status lock, and then constructs its task. What can happen?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Only a harmless duplicate task</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Completion can observe empty ports and balanced counters and finalize the pipeline before the uncounted task exists</span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The repository automatically restores the batch</span></button>
+            </div><div class="quiz-feedback"></div>
+          </div>
+          <div class="quiz-question-block" data-correct="option-c" data-explanation-right="Exactly. Stop and interrupt task creation before in-flight completion callbacks run; drain executors; then discard requests when nothing can create more." data-explanation-wrong="Follow the lifetime of the raw operator pointer. Executor completion callbacks can still call task_creator::schedule while draining.">
+            <h3 class="quiz-question">Why must <code>drain_after_error()</code> stop the task creator before draining GPU executors?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>To make CUDA kernels run faster</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Because repositories cannot be read while a creator thread exists</span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>In-flight task completion can schedule requests holding raw operator pointers; the interrupted creator must drop them until executors quiesce</span></button>
+            </div><div class="quiz-feedback"></div>
+          </div>
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module8')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module8')">Try Again</button>
+        </div>
+
+        <div class="callout callout-accent"><div class="callout-icon">✓</div><div class="callout-content"><strong class="callout-title">Recap</strong><p>Choose an operator shape from its pipeline role, preserve task accounting and reservation contracts, instrument the state transitions that matter, select tests by the changed contract, and treat teardown ordering as part of correctness.</p></div></div>
+      </section>
+    </div>
+  </div>
+  <div class="lesson-nav"><a href="#module-7"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Memory &amp; Multi-GPU</span></a><a class="ln-next" href="#module-9"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Design Decisions</span></a></div>
+</section>

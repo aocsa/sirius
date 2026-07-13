@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Validate the Sirius Internals static course without third-party dependencies."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from collections import Counter, defaultdict
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+
+VOID_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
+
+
+class CourseParser(HTMLParser):
+    def __init__(self, source: Path) -> None:
+        super().__init__(convert_charrefs=True)
+        self.source = source
+        self.ids: list[str] = []
+        self.anchor_refs: list[str] = []
+        self.data_targets: list[str] = []
+        self.data_steps: list[str] = []
+        self.quiz_ids: list[str] = []
+        self.quiz_calls: list[str] = []
+        self.quiz_questions: list[dict[str, object]] = []
+        self._quiz_stack: list[dict[str, object]] = []
+        self.module_ids: list[str] = []
+        self.forbidden_tags: list[str] = []
+        self.links: list[str] = []
+        self.text: list[str] = []
+        self.stack: list[str] = []
+        self.structure_errors: list[str] = []
+        self.top_level_elements: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_map = {key: value or "" for key, value in attrs}
+        if not self.stack and tag not in VOID_TAGS:
+            self.top_level_elements.append(tag)
+        if tag not in VOID_TAGS:
+            self.stack.append(tag)
+
+        element_id = attrs_map.get("id")
+        if element_id:
+            self.ids.append(element_id)
+            if element_id.startswith("quiz-"):
+                self.quiz_ids.append(element_id)
+
+        classes = set(attrs_map.get("class", "").split())
+        if tag == "div" and "quiz-question-block" in classes:
+            question: dict[str, object] = {
+                "depth": len(self.stack),
+                "correct": attrs_map.get("data-correct", ""),
+                "values": [],
+            }
+            self.quiz_questions.append(question)
+            self._quiz_stack.append(question)
+        if self._quiz_stack and attrs_map.get("data-value"):
+            values = self._quiz_stack[-1]["values"]
+            assert isinstance(values, list)
+            values.append(attrs_map["data-value"])
+        if attrs_map.get("onclick"):
+            self.quiz_calls.extend(
+                re.findall(r"(?:checkQuiz|resetQuiz)\('([^']+)'\)", attrs_map["onclick"])
+            )
+        if tag == "section" and "module" in classes and element_id:
+            self.module_ids.append(element_id)
+
+        if tag in {"script", "style"}:
+            self.forbidden_tags.append(tag)
+        if tag == "a" and attrs_map.get("href"):
+            href = attrs_map["href"]
+            self.links.append(href)
+            if href.startswith("#") and len(href) > 1:
+                self.anchor_refs.append(href[1:])
+        if attrs_map.get("data-target"):
+            self.data_targets.append(attrs_map["data-target"])
+        if attrs_map.get("data-steps"):
+            self.data_steps.append(attrs_map["data-steps"])
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag not in VOID_TAGS and self.stack and self.stack[-1] == tag:
+            self.stack.pop()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in VOID_TAGS:
+            return
+        if not self.stack:
+            self.structure_errors.append(f"unexpected closing </{tag}>")
+            return
+        if self.stack[-1] != tag:
+            self.structure_errors.append(
+                f"closing </{tag}> while <{self.stack[-1]}> is still open"
+            )
+            if tag in self.stack:
+                while self.stack and self.stack[-1] != tag:
+                    self.stack.pop()
+                if self.stack:
+                    self.stack.pop()
+            return
+        if (
+            tag == "div"
+            and self._quiz_stack
+            and self._quiz_stack[-1]["depth"] == len(self.stack)
+        ):
+            self._quiz_stack.pop()
+        self.stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        self.text.append(data)
+
+    def close(self) -> None:
+        super().close()
+        if self.stack:
+            self.structure_errors.append("unclosed tags: " + ", ".join(self.stack[-8:]))
+
+
+def parse(path: Path) -> CourseParser:
+    parser = CourseParser(path)
+    parser.feed(path.read_text(encoding="utf-8"))
+    parser.close()
+    return parser
+
+
+def gitlink(repo_root: Path, path: str) -> str | None:
+    result = subprocess.run(
+        ["git", "ls-tree", "HEAD", path],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    fields = result.stdout.strip().split()
+    return fields[2] if len(fields) >= 3 and fields[1] == "commit" else None
+
+
+def validate_github_link(
+    href: str, repo_root: Path, sirius_commit: str, duckdb_commit: str | None
+) -> str | None:
+    parsed = urlparse(href)
+    if parsed.netloc != "github.com":
+        return None
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 5 or parts[2] not in {"blob", "tree"}:
+        return None
+    owner, repo, kind, revision = parts[:4]
+    rel_parts = parts[4:]
+
+    if (owner, repo) == ("sirius-db", "sirius"):
+        if revision in {"main", "master", "dev"}:
+            return f"floating Sirius source link uses {revision!r}: {href}"
+        if revision != sirius_commit:
+            return f"Sirius source link is not pinned to HEAD {sirius_commit[:8]}: {href}"
+        target = repo_root.joinpath(*rel_parts)
+    elif (owner, repo) == ("duckdb", "duckdb"):
+        if revision in {"main", "master", "dev"}:
+            return f"floating DuckDB source link uses {revision!r}: {href}"
+        if duckdb_commit and revision != duckdb_commit:
+            return f"DuckDB source link is not pinned to gitlink {duckdb_commit[:8]}: {href}"
+        target = repo_root.joinpath("duckdb", *rel_parts)
+        if not target.exists():
+            # Worktrees do not always initialize submodules. The revision check is
+            # still authoritative, so absence is not a local-path failure here.
+            return None
+    else:
+        return None
+
+    expected_directory = kind == "tree"
+    if not target.exists():
+        return f"linked source path does not exist: {target} ({href})"
+    if expected_directory and not target.is_dir():
+        return f"tree link does not point to a directory: {target}"
+    if not expected_directory and not target.is_file():
+        return f"blob link does not point to a file: {target}"
+    return None
+
+
+def network_check(urls: set[str]) -> list[str]:
+    errors: list[str] = []
+    for url in sorted(urls):
+        request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "course-validator"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                if response.status >= 400:
+                    errors.append(f"external link returned HTTP {response.status}: {url}")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            errors.append(f"external link check failed: {url}: {exc}")
+    return errors
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--assembled", type=Path, required=True)
+    parser.add_argument("--course-dir", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--network", action="store_true")
+    args = parser.parse_args()
+
+    course_dir = args.course_dir.resolve()
+    repo_root = course_dir.parent.resolve()
+    module_paths = sorted((course_dir / "modules").glob("[0-9][0-9]-*.html"))
+    errors: list[str] = []
+
+    expected_numbers = list(range(1, 11))
+    actual_numbers = [int(path.name[:2]) for path in module_paths]
+    if actual_numbers != expected_numbers:
+        errors.append(f"module files must be exactly 01..10; found {actual_numbers}")
+
+    module_parsers: list[CourseParser] = []
+    for path in module_paths:
+        inspected = parse(path)
+        module_parsers.append(inspected)
+        module_number = int(path.name[:2])
+        expected_module_id = f"module-{module_number}"
+        expected_quiz_id = f"quiz-module{module_number}"
+
+        if inspected.forbidden_tags:
+            errors.append(f"{path.name}: module contains forbidden tags {inspected.forbidden_tags}")
+        if inspected.top_level_elements != ["section"]:
+            errors.append(
+                f"{path.name}: expected one root <section>; found {inspected.top_level_elements}"
+            )
+        if inspected.module_ids != [expected_module_id]:
+            errors.append(
+                f"{path.name}: expected root id {expected_module_id}; found {inspected.module_ids}"
+            )
+        if inspected.quiz_ids != [expected_quiz_id]:
+            errors.append(
+                f"{path.name}: expected one quiz id {expected_quiz_id}; found {inspected.quiz_ids}"
+            )
+        if set(inspected.quiz_calls) != {expected_quiz_id}:
+            errors.append(
+                f"{path.name}: quiz buttons must call {expected_quiz_id}; found {sorted(set(inspected.quiz_calls))}"
+            )
+        for index, question in enumerate(inspected.quiz_questions, start=1):
+            correct = question["correct"]
+            values = question["values"]
+            assert isinstance(correct, str) and isinstance(values, list)
+            if not correct or correct not in values:
+                errors.append(
+                    f"{path.name}: quiz question {index} correct value {correct!r} "
+                    f"is not among {values}"
+                )
+            if len(values) != len(set(values)):
+                errors.append(f"{path.name}: quiz question {index} has duplicate option values")
+        for issue in inspected.structure_errors:
+            errors.append(f"{path.name}: {issue}")
+        for index, payload in enumerate(inspected.data_steps, start=1):
+            try:
+                json.loads(payload)
+            except json.JSONDecodeError as exc:
+                errors.append(f"{path.name}: data-steps #{index} is invalid JSON: {exc}")
+
+        text = " ".join(" ".join(inspected.text).split()).lower()
+        if "prerequisite" not in text or "time:" not in text:
+            errors.append(f"{path.name}: missing prerequisite/time lesson metadata")
+        if not any(label in text for label in ("current", "proposed", "historical", "disabled")):
+            errors.append(f"{path.name}: missing current/historical/proposed/disabled status label")
+
+    assembled = parse(args.assembled)
+    for issue in assembled.structure_errors:
+        errors.append(f"{args.assembled.name}: {issue}")
+
+    id_counts = Counter(assembled.ids)
+    for element_id, count in sorted(id_counts.items()):
+        if count != 1:
+            errors.append(f"assembled id {element_id!r} occurs {count} times")
+
+    for ref in sorted(set(assembled.anchor_refs + assembled.data_targets)):
+        count = id_counts.get(ref, 0)
+        if count != 1:
+            errors.append(f"internal target {ref!r} resolves {count} times")
+
+    expected = (course_dir / "_base.html").read_bytes()
+    for path in module_paths:
+        expected += path.read_bytes()
+    expected += (course_dir / "_footer.html").read_bytes()
+    if args.assembled.read_bytes() != expected:
+        errors.append("assembled file is not exactly _base.html + modules in numeric order + _footer.html")
+
+    head_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sirius_commit = head_result.stdout.strip()
+    duckdb_commit = gitlink(repo_root, "duckdb")
+    external_urls: set[str] = set()
+    all_links: list[tuple[Path, str]] = []
+    all_links.extend((args.assembled, href) for href in assembled.links)
+
+    for source, href in all_links:
+        parsed_url = urlparse(href)
+        if parsed_url.scheme in {"http", "https"}:
+            external_urls.add(href)
+            issue = validate_github_link(href, repo_root, sirius_commit, duckdb_commit)
+            if issue:
+                errors.append(f"{source.name}: {issue}")
+            continue
+        if href.startswith("#") or href.startswith("mailto:") or not href:
+            continue
+        target = (course_dir / unquote(parsed_url.path)).resolve()
+        if not target.exists():
+            errors.append(f"{source.name}: relative link does not exist: {href}")
+
+    if args.network:
+        errors.extend(network_check(external_urls))
+
+    if errors:
+        print("Course validation failed:", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Validated {len(module_paths)} modules, {len(assembled.ids)} IDs, "
+        f"{len(set(assembled.anchor_refs + assembled.data_targets))} internal targets, "
+        f"and {len(external_urls)} external links."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

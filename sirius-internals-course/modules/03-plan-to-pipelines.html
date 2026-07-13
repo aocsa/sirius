@@ -1,0 +1,186 @@
+<section class="module" id="module-3">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">03</span>
+      <h1 class="module-title">From DuckDB Plan to Sirius Pipelines</h1>
+      <p class="module-subtitle">Classify the executor correctly, cross the expression boundary, and inspect the pipeline graph that actually reaches the scheduler.</p>
+    </header>
+
+    <div class="module-body">
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Lesson contract</h2>
+        <div class="callout callout-info">
+          <div class="callout-icon">CURRENT</div>
+          <div class="callout-content">
+            <strong class="callout-title">Live Super Sirius at commit <code>834e27c2</code></strong>
+            <p><strong>Prerequisites:</strong> Modules 1–2. <strong>Time:</strong> 30–40 minutes. <strong>Scope:</strong> current planner, expression, initialization, and repository-wiring paths; <code>src/legacy/</code> is excluded.</p>
+          </div>
+        </div>
+        <p>By the end you should be able to:</p>
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">1</div><div class="step-body"><strong>Classify both engines by layer</strong><p>Explain why DuckDB is push-based and why Sirius is a push-oriented hybrid rather than a Volcano iterator.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">2</div><div class="step-body"><strong>Trace an expression</strong><p>Follow a DuckDB expression into <code>sirius::ast</code>, then through materialized, interpreted-AST, or JIT execution.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">3</div><div class="step-body"><strong>Expand a compound operator</strong><p>Sketch the runtime pipelines produced for a hash join or order by.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">4</div><div class="step-body"><strong>Separate description from materialization</strong><p>Identify a <code>repository_wiring</code> descriptor and the repositories and ports created from it.</p></div></div>
+        </div>
+        <div class="callout callout-accent">
+          <div class="callout-icon">↗</div>
+          <div class="callout-content">
+            <strong class="callout-title">Read before modifying this path</strong>
+            <p>Follow the <a href="https://github.com/sirius-db/sirius/tree/834e27c28aad41258472134f4706cf00ac6ad9aa/docs/super-sirius">Super Sirius reading order</a>, then run <code>/module-context</code> for expression, planner, cuDF, or DuckDB APIs involved in the change.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Push versus pull: classify the call path, not the method name</h2>
+        <p><a href="https://justinjaffray.com/query-engines-push-vs.-pull/">Jaffray's framing</a> asks who controls the next transfer. In a pull iterator, a consumer recursively calls its child for another tuple or batch. In a push pipeline, a producer or pipeline driver hands an available batch to downstream operators.</p>
+
+        <div class="comparison-table-wrap">
+          <table class="comparison-table">
+            <thead><tr><th>Scope</th><th>Classification</th><th>Evidence</th></tr></thead>
+            <tbody>
+              <tr><td>DuckDB physical execution</td><td><strong>Vectorized push</strong></td><td>A pipeline task fetches a <code>DataChunk</code>, then <code>ExecutePushInternal()</code> forwards it through operators and the sink.</td></tr>
+              <tr><td>DuckDB source/API boundary</td><td>Locally pull-like</td><td>The driver calls <code>GetData()</code>, and a client can fetch results. Intermediate operators still do not recursively call child <code>next()</code>.</td></tr>
+              <tr><td>Sirius task data path</td><td><strong>Forward/push-oriented</strong></td><td><code>gpu_pipeline_task::compute_task()</code> owns input and invokes operators in plan order.</td></tr>
+              <tr><td>Sirius pipeline boundary</td><td>Buffered handoff</td><td>A sink publishes batches to repositories; a later task pops them from repository-backed ports.</td></tr>
+              <tr><td>Sirius task discovery</td><td>Pull-like readiness</td><td><code>get_next_task_hint()</code> can send the task creator recursively toward an unfinished producer.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label"><a href="https://github.com/duckdb/duckdb/blob/08e34c447bae34eaee3723cac61f2878b6bdf787/src/parallel/pipeline_executor.cpp">DuckDB <code>pipeline_executor.cpp</code> at the pinned submodule revision ↗</a></span>
+            <pre><code>PipelineExecutor::Execute()
+  ├─ FetchFromSource(source_chunk)
+  ├─ ExecutePushInternal(source_chunk)
+  │    ├─ operator.Execute(input, output)
+  │    └─ sink.Sink(output)
+  └─ PushFinalize() / Combine()</code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">What the state machine adds</span>
+            <div class="translation-lines">
+              <p class="tl"><code>NEED_MORE_INPUT</code> asks the driver for another source chunk.</p>
+              <p class="tl"><code>HAVE_MORE_OUTPUT</code> keeps the same input active while an operator emits more chunks.</p>
+              <p class="tl"><code>BLOCKED</code> yields the task until an asynchronous source or sink can proceed.</p>
+              <p class="tl"><code>FINISHED</code> supports early termination such as a satisfied limit.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">★</div>
+          <div class="callout-content"><strong class="callout-title">Canonical wording</strong><p>DuckDB uses vectorized push-based pipeline execution. Sirius uses a push-oriented, task-based GPU dataflow architecture with buffered repository boundaries and a pull-like readiness scheduler.</p></div>
+        </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The expression boundary: DuckDB objects stop at planning</h2>
+        <p>Supported expressions are translated once while Sirius builds its physical plan. Operator interfaces carry the native <code>sirius::expression</code> PIMPL; execution code unwraps its <code>sirius::ast::node</code>. DuckDB planner expression classes do not leak through the operator surface.</p>
+
+        <div class="flow-steps animate-in">
+          <div class="flow-step"><div class="flow-step-num">1</div><div><strong>DuckDB expression</strong><p><code>BoundComparisonExpression</code>, references, constants, functions, casts…</p></div></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step"><div class="flow-step-num">2</div><div><strong><code>sirius::wrap()</code></strong><p><code>ast::from_duckdb()</code> performs the plan-time translation.</p></div></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step"><div class="flow-step-num">3</div><div><strong><code>sirius::ast::node</code></strong><p>A move-only variant tree: reference, constant, comparison, conjunction, case, cast, function, aggregate, and more.</p></div></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step"><div class="flow-step-num">4</div><div><strong>GPU execution</strong><p>Materialized cuDF calls or a cuDF AST interpreted/JIT-fused kernel.</p></div></div>
+        </div>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in"><div class="pattern-icon">M</div><h4 class="pattern-title">MATERIALIZE</h4><p class="pattern-desc">Each expression node becomes a cuDF operation and intermediate <code>cudf::column</code>. Easy to inspect; more launches and intermediates.</p></div>
+          <div class="pattern-card animate-in"><div class="pattern-icon">A</div><h4 class="pattern-title">AST_INTERPRET</h4><p class="pattern-desc">Build a <code>cudf::ast::tree</code> and evaluate a subtree with <code>cudf::compute_column</code>. This is the default.</p></div>
+          <div class="pattern-card animate-in"><div class="pattern-icon">J</div><h4 class="pattern-title">AST_JIT</h4><p class="pattern-desc">Compile the cuDF AST into a fused kernel with <code>cudf::compute_column_jit</code>. JIT means generated GPU code; fusion means multiple AST operations run in one kernel.</p></div>
+        </div>
+
+        <p>Not every node is AST-eligible. <code>CASE</code>, some functions, and unsupported casts become <span class="term" data-definition="An expression node that cannot be represented directly in the current cuDF AST. The executor materializes that node, then references its result from the enclosing AST subtree.">AST breakers</span>. The executor builds a tree of AST subtrees, materializing only at those boundaries. A translator returning <code>nullopt</code> is a local fallback signal; an expression rejected during plan support checking can instead keep the whole query on DuckDB.</p>
+
+        <div class="callout callout-info"><div class="callout-icon">CODE</div><div class="callout-content"><strong class="callout-title">Primary files</strong><p><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/expression/from_duckdb.cpp"><code>src/expression/from_duckdb.cpp</code></a>, <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/include/expression/ast/node.hpp"><code>src/include/expression/ast/node.hpp</code></a>, and <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/expression_executor/gpu_expression_executor.cpp"><code>src/expression_executor/gpu_expression_executor.cpp</code></a>.</p></div></div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Initialization turns an operator tree into runnable pipelines</h2>
+        <p><code>sirius_engine::initialize_internal()</code> is the missing bridge between physical-plan creation and task execution. It builds a meta-pipeline tree, runs <code>sirius_pipeline_converter</code>, materializes repository wiring, and hands execution-ready pipelines to the query context.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/sirius_engine.cpp#L331"><code>sirius_engine::initialize_internal()</code> ↗</a></span>
+            <pre><code>DuckDB optimized logical plan
+  → Sirius physical operator tree
+  → sirius_meta_pipeline::build()
+  → sirius_pipeline_converter::convert()
+  → materialize_repository_wiring()
+  → planner::query / task scheduler</code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Do not collapse these stages</span>
+            <div class="translation-lines">
+              <p class="tl">The plan generator maps DuckDB logical operators and expressions.</p>
+              <p class="tl">Meta-pipeline construction identifies pipeline structure around sources and sinks.</p>
+              <p class="tl">The converter inserts Sirius-specific partition, concat, sample, partition-sort, and merge stages.</p>
+              <p class="tl">Materialization creates runtime repositories and ports only after a context and repository manager exist.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="comparison-table-wrap">
+          <table class="comparison-table">
+            <thead><tr><th>DuckDB-shaped operation</th><th>Execution graph produced by Sirius</th><th>Why it is split</th></tr></thead>
+            <tbody>
+              <tr><td><code>HASH_JOIN</code></td><td>Input pipeline → <code>PARTITION</code> → <code>CONCAT</code> → join pipeline; build data uses the named <code>build</code> port.</td><td>Partition count coordination, device-affine hash state, and a full build barrier.</td></tr>
+              <tr><td><code>ORDER_BY</code></td><td>Local <code>ORDER_BY</code> → <code>SORT_SAMPLE + SORT_PARTITION</code> → <code>MERGE_SORT</code>.</td><td>Learn global boundaries, partition ranges, then perform the final merge only after all partitions exist.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Wiring is described first and materialized second</h2>
+        <p><code>sirius_pipeline_converter::compute_repository_wiring()</code> emits plain descriptors. Each descriptor identifies a source operator and pipeline, destination pipeline, port name, and barrier. <code>materialize_repository_wiring()</code> then creates a repository, attaches the destination port, registers the sink's downstream target, and establishes dependency relationships.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">1</div><div class="step-body"><strong>Describe</strong><p><code>repository_wiring{"build", FULL, concat, build_pipeline, join_pipeline}</code> is plan-time data with no repository allocation.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">2</div><div class="step-body"><strong>Sort deterministically</strong><p>Pipeline IDs and port ordering make multi-input task creation reproducible.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">3</div><div class="step-body"><strong>Materialize</strong><p>The repository manager creates the shared container and the destination operator receives a repository-backed port.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">4</div><div class="step-body"><strong>Execute</strong><p>The producer's sink publishes batches; task creation later observes the descriptor's barrier through the materialized port.</p></div></div>
+        </div>
+
+        <div class="callout callout-warning"><div class="callout-icon">!</div><div class="callout-content"><strong class="callout-title"><code>PIPELINE</code> is not an intra-task edge</strong><p>Adjacent operators inside one GPU task exchange returned <code>operator_data</code>. Barrier metadata exists on repository-backed edges between pipelines.</p></div></div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Code-reading checkpoint</h2>
+        <p><strong>Task:</strong> start at <a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/planner/sirius_plan_filter.cpp"><code>sirius_plan_filter.cpp</code></a>. Trace <code>l_extendedprice * (1 - l_discount) &gt; 100</code> into <code>sirius::ast</code>, identify its AST-eligible subtree, then find where a filter operator constructs <code>gpu_expression_executor</code>.</p>
+        <p><strong>Observable exercise:</strong> run the same supported query with <code>expression_executor_strategy</code> set to <code>materialize</code>, <code>ast_interpret</code>, and <code>ast_jit</code>; compare correctness first, then profiler kernel shape. If a strategy is unavailable in the active build, record that as environment evidence rather than changing the claim.</p>
+        <p><strong>Failure scenario:</strong> adding a new DuckDB expression only to the planner mapping can still fail in AST conversion, specialized GPU execution, type support, or fallback validation. Name the earliest safe fallback point before writing code.</p>
+
+        <div class="quiz-container" id="quiz-module3">
+          <div class="quiz-question-block" data-correct="option-b" data-explanation-right="Correct. DuckDB's driver polls its source, then explicitly drives chunks forward through intermediate operators and a sink. That source call is a local pull-like boundary, not recursive Volcano execution." data-explanation-wrong="The name GetData is not enough to classify the engine. Look at the complete operator call direction after the source produces a chunk.">
+            <h3 class="quiz-question">DuckDB's pipeline executor calls <code>GetData()</code> on its source. Why is DuckDB still classified as push-based?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Because method names never affect execution semantics</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The pipeline driver fetches the chunk and then passes it forward through <code>ExecutePushInternal()</code>, operators, and the sink; consumers do not recursively call child <code>next()</code></span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Because every source runs on a GPU</span></button>
+            </div><div class="quiz-feedback"></div>
+          </div>
+          <div class="quiz-question-block" data-correct="option-c" data-explanation-right="Exactly. The descriptor is pure plan-time intent. Runtime materialization owns repository creation, port attachment, downstream sink routing, and dependency relationships." data-explanation-wrong="Keep the converter's description phase separate from runtime objects owned by the repository manager.">
+            <h3 class="quiz-question">What does <code>materialize_repository_wiring()</code> add that a <code>repository_wiring</code> descriptor does not contain?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>DuckDB logical expressions</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The decision to split an order by</span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Runtime repositories, attached ports, downstream sink targets, and pipeline dependencies</span></button>
+            </div><div class="quiz-feedback"></div>
+          </div>
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module3')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module3')">Try Again</button>
+        </div>
+
+        <div class="callout callout-accent"><div class="callout-icon">✓</div><div class="callout-content"><strong class="callout-title">Recap</strong><p>DuckDB supplies the optimized plan and uses a vectorized push executor on CPU fallback. Supported Sirius plans cross into a native AST, expand into a repository-connected GPU pipeline graph, and run under a push-oriented data path plus readiness-driven task control.</p></div></div>
+      </section>
+    </div>
+  </div>
+  <div class="lesson-nav"><a href="#module-2"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Actors &amp; Lifetimes</span></a><a class="ln-next" href="#module-4"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Tasks, Hints &amp; Completion</span></a></div>
+</section>

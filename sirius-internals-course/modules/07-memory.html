@@ -1,19 +1,25 @@
-<section class="module" id="module-6">
+<section class="module" id="module-7">
   <div class="module-content">
 
     <header class="module-header animate-in">
-      <span class="module-number">06</span>
-      <h1 class="module-title">Memory &amp; Multi-GPU</h1>
-      <p class="module-subtitle">GPU memory is the scarcest thing in this engine. Sirius&rsquo;s answer: nothing runs without a reservation, and pressure triggers relocation &mdash; not a crash.</p>
+      <span class="module-number">07</span>
+      <h1 class="module-title">Reservations, Downgrade &amp; Multi-GPU</h1>
+      <p class="module-subtitle">A GPU pipeline task needs a device reservation before execution; shortfalls trigger discoverable-data downgrade, and OOM peaks refine later estimates within the same query.</p>
     </header>
 
     <div class="module-body">
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Lesson contract</h2>
+        <div class="callout callout-info"><div class="callout-icon">CURRENT</div><div class="callout-content"><strong class="callout-title">Memory admission is part of scheduling</strong><p><strong>Prerequisites:</strong> Modules 1–6. <strong>Time:</strong> 30–40 minutes. <strong>Sources:</strong> GPU task estimates, pipeline memory history, GPU executor reservations, downgrade executor, reservation-aware allocator, and SCHED-RR device contract.</p></div></div>
+        <p>Objectives: compute reservation components; trace partial-reservation downgrade; explain failure-peak feedback and its query scope; distinguish repository and queued-task victims; and derive the execution device only from the task reservation.</p>
+      </section>
 
       <!-- ── Screen 1: Tiers & reservations ───────────────────── -->
       <section class="screen animate-in">
         <h2 class="screen-heading">Book before you travel</h2>
 
-        <p>Think of a hotel with an annex and a storage depot: you don&rsquo;t get a room by walking in, you <em>book before travel</em>. In Sirius, every memory allocation lives on a three-rung <span class="term" data-definition="A rung on the spill ladder: tier 0 = GPU device memory, tier 1 = pinned host memory per NUMA node, tier 2 = disk. Downgrade moves data down; demand pulls it back up.">tier</span> ladder, and no task touches tier 0 without a booking.</p>
+        <p>Think of a hotel with an annex and a storage depot: a <em>GPU pipeline task</em> books device capacity before execution. Data representations live on a three-rung <span class="term" data-definition="A rung on the representation ladder: tier 0 = GPU device memory, tier 1 = pinned host memory per NUMA node, tier 2 = disk. Downgrade converts data down; task preparation materializes it back onto the reservation device.">tier</span> ladder. This statement is deliberately scoped: CPU planning, scheduling, and metadata work are not GPU-reserved tasks.</p>
 
         <div class="flow-steps animate-in">
           <div class="flow-step">
@@ -47,7 +53,7 @@
           </div>
         </div>
 
-        <p>This tier substrate lives in <a href="https://github.com/NVIDIA/cuCascade">cuCascade</a>, wired into Sirius under <a href="https://github.com/sirius-db/sirius/tree/dev/src/memory"><code>src/memory/</code> &#8599;</a>. All three tiers are managed by <code>sirius_memory_reservation_manager</code> (cuCascade). Before the GPU executor&rsquo;s manager thread dispatches a task, it makes a <span class="term" data-definition="A pre-granted memory budget from sirius_memory_reservation_manager, sized from the pipeline&rsquo;s memory history and attached to a task before dispatch. Operators allocate inside it; it is released at task end. No reservation, no execution.">reservation</span> sized from the pipeline&rsquo;s <span class="term" data-definition="A per-pipeline record of observed memory peaks &mdash; including peaks from failed attempts. It sizes future reservations, so a pipeline that OOMed once reserves more the next time.">memory history</span>.</p>
+        <p>This tier substrate lives in <a href="https://github.com/NVIDIA/cuCascade">cuCascade</a>, wired into Sirius under <a href="https://github.com/sirius-db/sirius/tree/834e27c28aad41258472134f4706cf00ac6ad9aa/src/memory"><code>src/memory/</code> &#8599;</a>. Before dispatch, the GPU executor asks its device memory space for a <span class="term" data-definition="A task-scoped memory budget sized from input materialization plus an operator peak estimate and attached before GPU execution.">reservation</span>. The estimate first consults the current query's <span class="term" data-definition="A per-pipeline, in-query record of successful and failed peak observations. task_creator::prepare_for_query creates fresh task global state, so this history does not teach a separately planned later query.">pipeline memory history</span>, then falls back to operator no-history estimates.</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in">
@@ -76,9 +82,30 @@
         <div class="badge-list">
           <div class="badge-item">
             <code class="badge-code">no reservation</code>
-            <span class="badge-desc">&rarr; the task won&rsquo;t run. There is no walk-in path to GPU memory.</span>
+            <span class="badge-desc">&rarr; a GPU pipeline task cannot execute. CPU control-plane work is outside this statement.</span>
           </div>
         </div>
+      </section>
+
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The real reservation and feedback loop</h2>
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">1</div><div class="step-body"><strong>Estimate</strong><p><code>gpu_pipeline_task::get_estimated_reservation_size_info()</code> computes an <code>input_basis</code>, bytes needed to materialize input on GPU, and an operator peak from history or <code>no_history_peak_memory_estimate()</code>.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">2</div><div class="step-body"><strong>Attempt admission</strong><p><code>gpu_pipeline_executor</code> calls <code>_memory_space-&gt;make_reservation(bytes_needs)</code>. The reservation also names the authoritative GPU device.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">3</div><div class="step-body"><strong>Relieve a shortfall</strong><p>A partial result triggers one <code>request_downgrade(predicate)</code>. After each conversion the predicate tries <code>make_reservation_or_null(bytes_needs)</code> and stops as soon as admission succeeds.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">4</div><div class="step-body"><strong>Run inside the budget</strong><p>The task attaches its reservation-aware allocator to the CUDA stream, colocates input representations onto the reservation device, and executes operators.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">5</div><div class="step-body"><strong>Record failure evidence</strong><p>On OOM, the task removes input-materialization bytes from the observed peak and calls <code>record_on_failure(input_basis, peak_bytes)</code> before rescheduling with its resume index.</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">6</div><div class="step-body"><strong>Improve later in-query admission</strong><p>Subsequent tasks or retries in that query call <code>estimate_peak_memory(input_basis)</code>. Similar input bases receive more weight, and repeated failures retain the higher peak.</p></div></div>
+        </div>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;"><span class="translation-label">Reservation components</span><pre><code>input_basis = estimated bytes consumed by operators
+operator_peak = history.estimate_peak_memory(input_basis)
+             or Σ operator.no_history_peak_memory_estimate(stats)
+materialize_input = bytes needed to move input to the reservation GPU
+
+reservation_bytes = operator_peak + materialize_input</code></pre></div>
+
+        <div class="callout callout-warning"><div class="callout-icon">SCOPE</div><div class="callout-content"><strong class="callout-title">History is recreated per query</strong><p><code>task_creator::prepare_for_query()</code> constructs fresh task global state and <code>pipeline_memory_history</code>. A failed task can improve retries and later tasks in the active query; it does not persist as a learned estimate for a separately planned next query.</p></div></div>
       </section>
 
       <!-- ── Screen 2: Pressure & downgrade (HERO) ────────────── -->
@@ -135,13 +162,13 @@
 
       <!-- ── Screen 3: OOM as control flow ────────────────────── -->
       <section class="screen animate-in">
-        <h2 class="screen-heading">OOM is control flow, not a crash</h2>
+        <h2 class="screen-heading">A recoverable OOM enters retry control flow</h2>
 
         <p>What if a task allocates beyond its reservation anyway? It throws <span class="term" data-definition="The exception a task throws when an allocation exceeds its reservation. It carries the intermediate operator data plus a resume index, so the retry restarts mid-pipeline instead of from scratch.">oom_reschedule_exception</span> &mdash; the moment a task gives up gracefully, packaging its partial state and the operator index to resume from.</p>
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_task.cpp#L327-L330" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_task.cpp:327-330 &#8599;</a></span><pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/pipeline/gpu_pipeline_task.cpp#L327-L330" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_task.cpp:327-330 &#8599;</a></span><pre><code>
 <span class="code-line">      <span class="code-keyword">throw</span> <span class="code-function">oom_reschedule_exception</span>(</span>
 <span class="code-line">        std::<span class="code-function">move</span>(operator_input_output_data),</span>
 <span class="code-line">        i,</span>
@@ -163,7 +190,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-doc"><span class="doc-p">SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far too short. With 100 retries × 50 ms backoff (~5 s) the probe tasks get enough patience to clear the contention window while still bailing out on truly wedged queries.</span></span>
 <span class="code-line">          <span class="code-keyword">static constexpr</span> <span class="code-keyword">uint32_t</span> MAX_OOM_RETRIES = <span class="code-number">100</span>;</span>
 <span class="code-line">          <span class="code-keyword">if</span> (next_retry_count &gt; MAX_OOM_RETRIES) {</span>
@@ -194,7 +221,7 @@
           <div class="callout-icon">&#128257;</div>
           <div class="callout-content">
             <strong class="callout-title">The closed loop</strong>
-            <p>Reserve &rarr; run &rarr; spill-under-pressure &rarr; retry-on-OOM is one circle, not four features. The memory history records each failure&rsquo;s peak, so the retry books a bigger room &mdash; the system converges instead of thrashing.</p>
+            <p>Reserve &rarr; run &rarr; downgrade-under-pressure &rarr; retry-on-OOM is one circle. In-query memory history records the failure peak, so a retry or later task with a similar basis can request a larger reservation. Exhausting the retry budget still terminates the query.</p>
           </div>
         </div>
       </section>
@@ -257,7 +284,7 @@
       <section class="screen animate-in">
         <h2 class="screen-heading">Debug it before it ships</h2>
 
-        <div class="quiz-container" id="quiz-module5">
+        <div class="quiz-container" id="quiz-module7">
 
           <div class="quiz-question-block"
                data-correct="option-b"
@@ -305,13 +332,13 @@
 
           <div class="quiz-question-block"
                data-correct="option-a"
-               data-explanation-right="Exactly. The pipeline&rsquo;s memory history records the peak observed during the failed attempt, and estimates keep the higher peak. The next reservation is booked bigger up front &mdash; that&rsquo;s what closes the reserve&ndash;run&ndash;spill&ndash;retry loop."
-               data-explanation-wrong="Not quite. The retry backoff buys time within one query; it teaches nothing across queries. Learning lives in the pipeline memory history: failure peaks are recorded, estimates keep the higher peak, and future reservations grow to match.">
-            <h3 class="quiz-question">Your operator&rsquo;s first run OOMs, retries, then succeeds using far more memory than the estimate. What mechanism makes the <em>next</em> query&rsquo;s estimate better?</h3>
+               data-explanation-right="Exactly. record_on_failure stores the observed operator peak against the input basis. A retry or later task in the same query uses estimate_peak_memory; prepare_for_query creates fresh history for a separate query."
+               data-explanation-wrong="The feedback is pipeline memory history scoped to the active query. It improves retries and later tasks there, but is recreated during preparation of a separately planned query.">
+            <h3 class="quiz-question">A task OOMs with a larger operator peak than estimated. What improves the next reservation—and for how long?</h3>
             <div class="quiz-options">
               <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
                 <div class="quiz-option-radio"></div>
-                <span>The pipeline memory history records the failure peak, and estimates keep the higher peak &mdash; so future reservations are sized up</span>
+                <span><code>record_on_failure(input_basis, peak)</code> updates the pipeline's in-query history, so retries or later tasks use a larger estimate; a separate query starts fresh</span>
               </button>
               <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
                 <div class="quiz-option-radio"></div>
@@ -347,15 +374,16 @@
             <div class="quiz-feedback"></div>
           </div>
 
-          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module5')">Check Answers</button>
-          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module5')">Try Again</button>
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module7')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module7')">Try Again</button>
         </div>
 
-        <p><strong>Next: Design Decisions.</strong> Every rule in this module was learned from a specific incident &mdash; next comes the decision history, so you inherit the scar tissue without the scars.</p>
+        <p><strong>Code-reading task:</strong> follow <code>get_estimated_reservation_size_info()</code> through <code>make_reservation()</code>, the downgrade predicate, allocator attachment, and <code>record_on_failure()</code>. <strong>Observable exercise:</strong> use one OOM log to identify input basis, materialization bytes, reserved bytes, requested bytes, and recorded operator peak. <strong>Failure scenario:</strong> infer a CUDA device from an input batch before colocation and explain the multi-GPU hazard.</p>
+        <p><strong>Next: Operator Authoring, Observability, Testing, and Teardown.</strong> Apply the execution, data, and memory contracts to a real change.</p>
       </section>
 
     </div>
   </div>
 
-      <div class="lesson-nav"><a href="#module-5"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">The Data Plane</span></a><a class="ln-next" href="#module-7"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Design Decisions</span></a></div>
+      <div class="lesson-nav"><a href="#module-6"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">The Data Plane</span></a><a class="ln-next" href="#module-8"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Authoring &amp; Observability</span></a></div>
 </section>

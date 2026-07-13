@@ -1,21 +1,27 @@
-<section class="module" id="module-5" style="background: var(--color-bg-warm)">
+<section class="module" id="module-6" style="background: var(--color-bg-warm)">
   <div class="module-content">
     <header class="module-header animate-in">
-      <span class="module-number">05</span>
+      <span class="module-number">06</span>
       <h1 class="module-title">The Data Plane</h1>
-      <p class="module-subtitle">In Sirius, no operator ever returns data to its caller. Ever. Here's why that one decision buys spilling, backpressure, and multi-GPU almost for free.</p>
+      <p class="module-subtitle">Inside a GPU task, operators return <code>operator_data</code> forward. Across pipeline boundaries, sinks publish <code>data_batch</code> references into repository-backed ports.</p>
     </header>
 
     <div class="module-body">
 
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Lesson contract</h2>
+        <div class="callout callout-info"><div class="callout-icon">CURRENT</div><div class="callout-content"><strong class="callout-title">Two paths, four object roles</strong><p><strong>Prerequisites:</strong> Modules 1–5. <strong>Time:</strong> 25–35 minutes. <strong>Sources:</strong> GPU task execution, physical-operator sink/ports, repositories, data-batch representations, RAII accessors, and downgrade discovery.</p></div></div>
+        <p>Objectives: distinguish <code>operator_data</code>, <code>data_batch</code>, accessors, and repository IDs; trace intra-pipeline and inter-pipeline movement; apply FULL/PARTIAL/PIPELINE barriers only to repository edges; and separate discoverability, lock state, ownership, and residency when diagnosing spillability.</p>
+      </section>
+
       <!-- ── Screen 1: The port ─────────────────────────────────── -->
       <section class="screen animate-in">
-        <h2 class="screen-heading">A named dock, not a return value</h2>
-        <p>Think freight docks: a producer pipeline drops pallets — batches — at a named dock, and the dock's rules say when the consumer may start unloading. In Sirius the dock is a <span class="term" data-definition="The struct that defines where an operator's data arrives or leaves: a barrier type + a pointer to a shared repository + the producing and consuming pipelines. Every operator declares its ports at plan time — they are the edges of the pipeline graph."><code>port</code></span> — and it never holds goods itself, it points at the <span class="term" data-definition="cucascade::shared_data_repository — the shared, first-class store where ALL inter-operator batches live. Because repositories are inspectable objects (not private members), the downgrade executor can walk them to find spill victims."><code>repository</code></span> where they live.</p>
+        <h2 class="screen-heading">A named dock exists at a pipeline boundary</h2>
+        <p>Think freight docks: a producer <em>pipeline</em> drops batches at a named dock, and the dock's rules say when another pipeline may unload. The dock is a <span class="term" data-definition="A repository-backed input edge on a pipeline boundary: barrier type, repository pointer, source pipeline, and destination pipeline. Dependency-only ports can have no repository."><code>port</code></span>; it points at a <span class="term" data-definition="cucascade::shared_data_repository—the discoverable buffer between pipelines. It is not inserted between adjacent operators executing in one gpu_pipeline_task."><code>repository</code></span>. Adjacent operators inside one task do not use this dock: the task driver passes the returned <code>operator_data</code> directly forward.</p>
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/op/sirius_physical_operator.hpp#L459-L472" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/op/sirius_physical_operator.hpp · L459-472 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/include/op/sirius_physical_operator.hpp#L459-L472" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/op/sirius_physical_operator.hpp · L459-472 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-line">  <span class="code-keyword">struct</span> port {</span>
 <span class="code-line">    MemoryBarrierType <span class="code-property">type</span>;</span>
 <span class="code-doc"><span class="doc-p">May be NULL for dependency-only ports that carry no data flow (e.g., "dependency"). Null repos are treated as "empty, not data-gating" by the base-class port handling methods (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).</span></span>
@@ -53,12 +59,12 @@
 
       <!-- ── Screen 2: How output leaves an operator ────────────── -->
       <section class="screen animate-in">
-        <h2 class="screen-heading">Output is a push, never a return</h2>
-        <p>Here is the entire replacement for "function returns data" — the base-class <code>sink()</code>, about seven lines. When our running <code>count(*)</code> query's filter finishes a batch of partial counts, this is how they leave: each <span class="term" data-definition="The manifest, not the pallet: a small object identifying a batch. push_data_batch moves handles between ports and repositories — the underlying device buffers are never repacked or copied.">handle</span> is filed at every downstream dock, and the caller never sees a thing.</p>
+        <h2 class="screen-heading">Forward inside the task, publish at the sink</h2>
+        <p><code>gpu_pipeline_task::compute_task()</code> owns an input <code>operator_data</code> and assigns each <code>execute()</code> return to the next call. Only after the final operator does <code>publish_output()</code> invoke the pipeline sink. The default sink publishes each <code>shared_ptr&lt;data_batch&gt;</code> into every downstream repository-backed port.</p>
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_operator.cpp#L238-L246" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/op/sirius_physical_operator.cpp · L238-246 &#8599;</a></span><pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/834e27c28aad41258472134f4706cf00ac6ad9aa/src/op/sirius_physical_operator.cpp#L238-L246" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/op/sirius_physical_operator.cpp · L238-246 &#8599;</a></span><pre><code>
 <span class="code-line"><span class="code-keyword">void</span> sirius_physical_operator::<span class="code-function">sink</span>(<span class="code-keyword">const</span> operator_data&amp; output_data, rmm::cuda_stream_view stream)</span>
 <span class="code-line">{</span>
 <span class="code-line">  <span class="code-keyword">auto</span>&amp; pipelineable_output = <span class="code-keyword">dynamic_cast</span>&lt;<span class="code-keyword">const</span> pipelineable_operator_data&amp;&gt;(output_data);</span>
@@ -73,12 +79,12 @@
           <div class="translation-english">
             <span class="translation-label">Plain English</span>
             <div class="translation-lines">
-              <p class="tl">Every operator's output funnels through here, on the worker's CUDA stream. Note the return type: void.</p>
+              <p class="tl">This method is the <em>terminal pipeline sink</em>; it is not the API between every adjacent operator.</p>
               <p class="tl">Downcast to <span class="term" data-definition="The operator_data subtype that actually carries GPU data batches. sink() downcasts to it because only pipelineable outputs fan out through ports — other operator_data flavors carry control state."><code>pipelineable_operator_data</code></span> — the flavor of output that actually carries batches.</p>
               <p class="tl">For every pallet this operator produced...</p>
               <p class="tl">...and every downstream dock wired up at plan time...</p>
-              <p class="tl">...hand over the manifest: the handle moves into the next operator's port. No copy, no return value, no waiting on the consumer.</p>
-              <p class="tl">That's it. Seven lines replace the entire concept of returning data to a caller.</p>
+              <p class="tl">The shared batch reference is added to the downstream repository. The consumer can run later and on another scheduling edge.</p>
+              <p class="tl">This buffered push complements—not replaces—the returned <code>operator_data</code> path inside the current task.</p>
             </div>
           </div>
         </div>
@@ -164,7 +170,8 @@
       <!-- ── Screen 4: Batch lifecycle (hero) ───────────────────── -->
       <section class="screen animate-in">
         <h2 class="screen-heading">Pallets have manifests: the batch lifecycle</h2>
-        <p>A <span class="term" data-definition="cuCascade's unit of data movement: a handle to buffers living in some memory space (GPU, pinned host, disk), tracked by ID. Moving one between operators or GPUs transfers the handle — the buffers are never repacked."><code>data_batch</code></span> is the manifest, not the pallet — and you never touch its buffers directly, only through <span class="term" data-definition="Access to a batch's buffers is only possible by constructing a lock object whose lifetime IS your access window: the destructor releases the batch back toward idle. No lock object, no pointer — forgetting to unlock is unrepresentable.">RAII locks</span>: many <span class="term" data-definition="The shared lock class: any number of concurrent readers may hold a batch read_only. Mutation and memory-space conversion must wait until every reader has released.">read_only</span> readers XOR one <span class="term" data-definition="The exclusive lock class: exactly one holder, zero readers. Required for in-place mutation and for converting the batch to another memory space (e.g., GPU to host).">mutable</span> holder. <span class="term" data-definition="The unlocked state: nobody holds the batch. The only state from which either lock class can be acquired — and the only state the downgrade executor is allowed to spill."><code>idle</code></span> means nobody holds it.</p>
+        <div class="comparison-table-wrap"><table class="comparison-table"><thead><tr><th>Object</th><th>Role</th><th>What it does not imply</th></tr></thead><tbody><tr><td><code>operator_data</code></td><td>Polymorphic task-local input/output; <code>pipelineable_operator_data</code> contains batch references</td><td>Repository ownership or a pipeline boundary</td></tr><tr><td><code>data_batch</code></td><td>The batch object and its convertible GPU/host/disk representations</td><td>That its current representation is GPU-resident</td></tr><tr><td><code>shared_ptr&lt;data_batch&gt;</code></td><td>Owning reference that keeps the batch object alive</td><td>A read/mutable lock or immunity from downgrade</td></tr><tr><td><code>read_only_data_batch</code> / <code>mutable_data_batch</code></td><td>RAII access window and lock state</td><td>Where the owning reference is registered</td></tr><tr><td>repository <code>batch_id</code></td><td>Stable lookup identity inside the authoritative repository</td><td>A proposed exchange-channel handle</td></tr></tbody></table></div>
+        <p>Access to representations is controlled by RAII: many <span class="term" data-definition="The shared accessor/lock: concurrent readers may coexist; mutation and representation conversion wait until they release.">read-only</span> holders or one <span class="term" data-definition="The exclusive accessor/lock required for mutation and representation conversion.">mutable</span> holder. <span class="term" data-definition="No read-only or mutable accessor currently owns the batch lock. Idle lock state is independent of shared_ptr ownership."><code>idle</code></span> describes lock state, not object lifetime.</p>
 
         <div class="flow-steps">
           <div class="flow-step" style="border-top: 3px solid var(--color-actor-2)">
@@ -187,7 +194,7 @@
           <div class="callout-icon">💡</div>
           <div class="callout-content">
             <strong class="callout-title">Spillable = idle + in a registered repository</strong>
-            <p>The <span class="term" data-definition="The per-memory-space service (src/downgrade/) that reacts to memory pressure by moving victim batches down the hierarchy: GPU device memory to pinned host to disk. It finds victims by walking registered repositories for idle batches.">downgrade executor</span> never asks operators for memory back — it walks repositories and takes idle batches. Both conditions are load-bearing: a batch it can't <em>find</em> or can't <em>lock</em> might as well not exist. That is why repositories being first-class, inspectable objects is the whole game — it's what makes <span class="term" data-definition="Moving an idle batch to a lower memory tier (GPU to host to disk) to free space. Transparent to operators: the handle stays valid; only where the buffers live changes.">spilling</span> possible at all.</p>
+            <p>The <span class="term" data-definition="The per-memory-space service that reacts to pressure by converting idle data to a lower tier.">downgrade executor</span> searches registered repositories first, then the inspectable scheduler queue for batches held by queued tasks. Both discoverability and idle lock state are load-bearing; ownership and residency are separate questions.</p>
           </div>
         </div>
 
@@ -195,7 +202,7 @@
           <div class="callout-icon">⚠️</div>
           <div class="callout-content">
             <strong class="callout-title">How you cause an OOM</strong>
-            <p>Park batches in a private queue, or sit on locks "for later" — either way they're invisible to the downgrade executor and the query dies under pressure instead of spilling. Module 8's streaming design exists to dodge exactly this: ownership stays in repositories, and only <code>{batch_id, size}</code> handles travel through channels.</p>
+            <p>Park batches in a private, unregistered queue and they are undiscoverable. Hold accessors “for later” and they are not idle. <strong>Proposed Module 10</strong> keeps an authoritative repository lookup and sends only <code>{batch_id, size}</code> metadata through a future channel, but that API is not live code.</p>
           </div>
         </div>
 
@@ -207,7 +214,7 @@
         <h2 class="screen-heading">Three tickets</h2>
         <p>Three incidents, all traceable to this module. Pick your diagnosis.</p>
 
-        <div class="quiz-container" id="quiz-module4">
+        <div class="quiz-container" id="quiz-module6">
           <div class="quiz-question-block"
                data-correct="option-b"
                data-explanation-right="Two conditions make a batch spillable: idle, and discoverable in a registered repository. Your queue violates both — the locks pin the batches, and the private container hides them. Keep output parked in the port's repository and take locks only for the duration of actual work."
@@ -232,6 +239,18 @@
               </button>
             </div>
             <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Correct. shared_ptr ownership keeps the object alive. Lock state comes from the RAII accessors, residency comes from the current representation, and discoverability comes from repository or inspectable-queue registration."
+               data-explanation-wrong="Do not merge ownership, lock state, residency, and discoverability. They are independent properties with different APIs and debugging consequences.">
+            <h3 class="quiz-question">A repository contains a <code>shared_ptr&lt;data_batch&gt;</code> and no accessor is active. What can you conclude?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The batch is permanently GPU-resident and locked</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The object is alive and discoverable; it is idle, but its current representation may be GPU, host, or disk</span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The repository is not an owner because only accessors own batches</span></button>
+            </div><div class="quiz-feedback"></div>
           </div>
 
           <div class="quiz-question-block"
@@ -286,15 +305,18 @@
             <div class="quiz-feedback"></div>
           </div>
 
-          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module4')">Check Answers</button>
-          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module4')">Try Again</button>
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module6')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module6')">Try Again</button>
         </div>
+
+        <p><strong>Code-reading task:</strong> trace one <code>shared_ptr&lt;data_batch&gt;</code> from <code>pipelineable_operator_data</code> through an adjacent <code>execute()</code>, the terminal <code>sink()</code>, repository insertion, and downstream port pop. <strong>Observable exercise:</strong> inspect a plan with one FULL and one PARTIAL edge and label which batches can be consumed before producer completion. <strong>Failure scenario:</strong> hide idle batches in an unregistered queue or hold an accessor across a wait and explain the distinct discoverability versus lock failures.</p>
+        <div class="callout callout-accent"><div class="callout-icon">✓</div><div class="callout-content"><strong class="callout-title">Recap</strong><p>Task-local <code>operator_data</code>, batch ownership, accessor locks, repository identity, and residency are different layers. Repositories buffer pipeline edges; they do not replace forward operator returns inside a task.</p></div></div>
 
         <div class="callout callout-info">
           <div class="callout-icon">➡️</div>
           <div class="callout-content">
             <strong class="callout-title">Next: Memory &amp; Multi-GPU</strong>
-            <p>Repositories decide where data <em>lives</em>. Next: who pays the memory bill — reservations, tiers, spilling, and the device contract.</p>
+            <p>Repositories make boundary data discoverable. Next: reservations, representation conversion, downgrade, memory history, and the device contract.</p>
           </div>
         </div>
       </section>
@@ -302,5 +324,5 @@
     </div>
   </div>
 
-      <div class="lesson-nav"><a href="#module-4"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Where Data Comes From</span></a><a class="ln-next" href="#module-6"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Memory & Multi-GPU</span></a></div>
+      <div class="lesson-nav"><a href="#module-5"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Scan, IO &amp; Cache</span></a><a class="ln-next" href="#module-7"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Memory &amp; Multi-GPU</span></a></div>
 </section>

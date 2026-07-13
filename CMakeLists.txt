@@ -607,6 +607,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_result_collector.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
+    test/cpp/operator/test_orders_filter_plan.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
