@@ -334,10 +334,32 @@ for i in $(seq 0 $((NUM_CNS - 1))); do
         --brpc-port         "$((base + 2))"
         --http-port         "$((base + 3))"
         --starlet-port      "$((base + 4))"
-        --gpu-memory-limit  "$GPU_MEM"
-        --host-memory-limit "$HOST_MEM"
         --engine-dir        "$ENGINE_DIR_PREFIX$i"
     )
+    # SIRIUS_TUNED_CONFIG: opt-in full-engine config (operator_params, scan_manager, ...).
+    #
+    # WHY THIS EXISTS. --sirius-config is declared conflicts_with_all
+    # [gpu_memory_limit, gpu_memory_fraction, host_memory_limit] (main.rs:67-71), and
+    # resolve() prefers the DERIVED yaml whenever any memory flag is set
+    # (main.rs:260-284). So passing --gpu-memory-limit -- which this launcher always did --
+    # makes a tuned config unreachable, and every CN ran with memory limits + cpu_affinity
+    # and NO operator tuning: default scan_task_batch_size, uring_n_reactors=1, no
+    # hash_partition_bytes, no memory_prefetcher.
+    #
+    # When set, the template supplies the memory limits ITSELF (GPU_MEM/HOST_MEM are not
+    # passed) and __ENGINE_DIR__ is substituted per CN so telemetry dirs never collide.
+    # Unset -> unchanged behaviour.
+    if [ -n "${SIRIUS_TUNED_CONFIG:-}" ]; then
+        mkdir -p "$ENGINE_DIR_PREFIX$i"
+        sed "s#__ENGINE_DIR__#$ENGINE_DIR_PREFIX$i#g" \
+            "$SIRIUS_TUNED_CONFIG" > "$ENGINE_DIR_PREFIX$i/tuned-sirius-config.yaml"
+        cn_args+=( --sirius-config "$ENGINE_DIR_PREFIX$i/tuned-sirius-config.yaml" )
+    else
+        cn_args+=(
+            --gpu-memory-limit  "$GPU_MEM"
+            --host-memory-limit "$HOST_MEM"
+        )
+    fi
     if [ "$PIN" = 1 ]; then
         # numactl execs the CN rather than forking, so $! is the CN's own pid and the cleanup
         # trap kills the CN itself, not a wrapper.

@@ -84,30 +84,78 @@ pub fn derive_sirius_config_yaml(
         let v = v.to_string_lossy().to_ascii_lowercase();
         !matches!(v.as_str(), "false" | "0" | "no" | "off")
     });
-    if datasource.is_some() || cpu_affinity.is_some() {
-        yaml.push_str("  executor:\n");
-        yaml.push_str("    scan_manager:\n");
-        if let Some(use_sirius) = datasource {
-            yaml.push_str(&format!("      use_sirius_datasource: {use_sirius}\n"));
-        }
-        // The three pools the engine never pins itself. The GPU pipeline pool is deliberately
-        // absent: `task_scheduler.cpp` overwrites its `cpu_affinity_list` from the discovered
-        // GPU topology, so a YAML value there would be silently discarded.
-        if let Some(cpus) = cpu_affinity {
-            let cpus = cpu_affinity_sequence(cpus);
-            yaml.push_str(&format!("      cpu_affinity: {cpus}\n"));
-            yaml.push_str("    task_creator:\n");
-            yaml.push_str(&format!("      cpu_affinity: {cpus}\n"));
-            yaml.push_str("    downgrade:\n");
-            yaml.push_str(&format!("      cpu_affinity: {cpus}\n"));
-        }
+    // ---- Operator tuning -------------------------------------------------------------
+    // Ported from bench/sf500-gb200/sirius-sf500.yaml, itself derived from the merged
+    // SF1000 campaign config (bench/sf1000-repro, PR #1371).
+    //
+    // WHY THIS LIVES HERE AND NOT IN A CONFIG FILE. `--sirius-config` is declared
+    // conflicts_with_all [gpu_memory_limit, gpu_memory_fraction, host_memory_limit]
+    // (main.rs), and `resolve()` prefers this derived YAML whenever any memory flag is
+    // set. Every benchmark launcher sets --gpu-memory-limit, so an operator-supplied
+    // tuned config was unreachable: CNs ran with memory limits + cpu_affinity and
+    // NOTHING else -- default scan_task_batch_size, uring_n_reactors = 1, no
+    // hash_partition_bytes, no memory_prefetcher. Emitting the tuning here is what
+    // makes it reachable at all.
+    //
+    // Every value is overridable by env so a sweep needs no rebuild.
+    let batch = env_or("SIRIUS_CN_SCAN_TASK_BATCH_SIZE", "6GB");
+    let reactors = env_or("SIRIUS_CN_URING_N_REACTORS", "4");
+    let scan_threads = env_or("SIRIUS_CN_SCAN_NUM_THREADS", "9");
+    let pipeline_threads = env_or("SIRIUS_CN_PIPELINE_NUM_THREADS", "8");
+    let hash_partition = env_or("SIRIUS_CN_HASH_PARTITION_BYTES", "32GB");
+    let build_hash_table = env_or("SIRIUS_CN_MAX_BUILD_HASH_TABLE_BYTES", "32GB");
+    let concat_batch = env_or("SIRIUS_CN_CONCAT_BATCH_BYTES", "5GB");
+    let prefetcher_threads = env_or("SIRIUS_CN_MEMORY_PREFETCHER_THREADS", "3");
+
+    yaml.push_str("  executor:\n");
+    yaml.push_str("    scan_manager:\n");
+    yaml.push_str("      memory_prefetcher:\n");
+    yaml.push_str("        enable: true\n");
+    yaml.push_str(&format!("        num_threads: {prefetcher_threads}\n"));
+    yaml.push_str(&format!("      num_threads: {scan_threads}\n"));
+    yaml.push_str(&format!("      uring_n_reactors: {reactors}\n"));
+    // Confirmed a 2.1x regression when true, by two independent sweeps. Do not flip.
+    yaml.push_str("      enable_prefetch_cache: false\n");
+    if let Some(use_sirius) = datasource {
+        yaml.push_str(&format!("      use_sirius_datasource: {use_sirius}\n"));
     }
+    // The three pools the engine never pins itself. The GPU pipeline pool is deliberately
+    // absent from the affinity list: `task_scheduler.cpp` overwrites its
+    // `cpu_affinity_list` from the discovered GPU topology, so a YAML value there would be
+    // silently discarded. `num_threads` on it IS honoured, so that is set below.
+    if let Some(cpus) = cpu_affinity {
+        let cpus = cpu_affinity_sequence(cpus);
+        yaml.push_str(&format!("      cpu_affinity: {cpus}\n"));
+        yaml.push_str("    task_creator:\n");
+        yaml.push_str(&format!("      cpu_affinity: {cpus}\n"));
+        yaml.push_str("    downgrade:\n");
+        yaml.push_str(&format!("      cpu_affinity: {cpus}\n"));
+    }
+    yaml.push_str("    pipeline:\n");
+    yaml.push_str(&format!("      num_threads: {pipeline_threads}\n"));
+    yaml.push_str("  operator_params:\n");
+    yaml.push_str(&format!("    scan_task_batch_size: {batch}\n"));
+    yaml.push_str("    max_sort_partition_bytes: 0\n");
+    yaml.push_str(&format!("    hash_partition_bytes: {hash_partition}\n"));
+    yaml.push_str(&format!("    concat_batch_bytes: {concat_batch}\n"));
+    yaml.push_str(&format!(
+        "    max_build_hash_table_bytes: {build_hash_table}\n"
+    ));
     yaml.push_str("  telemetry:\n");
     yaml.push_str(&format!(
         "    output_directory: \"{}\"\n",
         yaml_escape(&engine_dir.join("telemetry").display().to_string())
     ));
     Some(yaml)
+}
+
+/// Reads a tuning override from the environment, falling back to the shipped default.
+/// Lets a config sweep run without rebuilding the CN.
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Escapes a value for a double-quoted YAML scalar.

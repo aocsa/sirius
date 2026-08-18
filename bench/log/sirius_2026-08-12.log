@@ -1,0 +1,123 @@
+[2026-08-12 15:09:54.822] [info] [sirius_context.cpp:1656] No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, ~/.sirius/sirius.yaml). Using defaults.
+[2026-08-12 15:09:54.822] [warning] [sirius_context.cpp:1659] Super Sirius will allocate most GPU and pinned host memory on startup. If you are using the legacy code path (gpu_buffer_init / gpu_processing), set SIRIUS_DISABLE=1 to prevent this.
+[2026-08-12 15:09:54.829] [info] [sirius_context.cpp:632] SiriusContext: topology summary — 4 GPU(s), 34 NUMA node(s), host='presto-gb200-gcn-17'
+[2026-08-12 15:09:54.829] [info] [sirius_context.cpp:637]   GPU 0: NVIDIA GB200 (numa=0, pci=00000008:01:00.0)
+[2026-08-12 15:09:54.829] [info] [sirius_context.cpp:637]   GPU 1: NVIDIA GB200 (numa=0, pci=00000009:01:00.0)
+[2026-08-12 15:09:54.829] [info] [sirius_context.cpp:637]   GPU 2: NVIDIA GB200 (numa=1, pci=00000018:01:00.0)
+[2026-08-12 15:09:54.829] [info] [sirius_context.cpp:637]   GPU 3: NVIDIA GB200 (numa=1, pci=00000019:01:00.0)
+[2026-08-12 15:10:05.854] [info] [telemetry_context.cpp:136] Telemetry context initialized (engine=siriusDB, 4 GPU device group(s))
+[2026-08-12 15:10:05.854] [info] [batch_telemetry.cpp:227] Batch telemetry installed (6 tier resources).
+[2026-08-12 15:10:05.854] [warning] [sirius_context.cpp:667] SiriusContext: disk memory space is not configured; spilling GPU or HOST data to disk is disabled. If queries run out of GPU/HOST memory, downgrades to disk will not be possible.
+[2026-08-12 15:10:05.854] [info] [sirius_context.cpp:679] SiriusContext: 2 host memory space(s) created for 34 NUMA node(s)
+[2026-08-12 15:10:05.854] [warning] [sirius_context.cpp:684] SiriusContext: host space count (2) != NUMA node count (34) — expected one host space per NUMA domain. Check sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host configuration.
+[2026-08-12 15:10:05.856] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 1
+[2026-08-12 15:10:05.858] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 2
+[2026-08-12 15:10:05.861] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 3
+[2026-08-12 15:10:05.862] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 0
+[2026-08-12 15:10:05.863] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 2
+[2026-08-12 15:10:05.864] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 3
+[2026-08-12 15:10:05.865] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 0
+[2026-08-12 15:10:05.866] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 1
+[2026-08-12 15:10:05.867] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 3
+[2026-08-12 15:10:05.868] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 0
+[2026-08-12 15:10:05.868] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 1
+[2026-08-12 15:10:05.869] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 2
+[2026-08-12 15:10:05.889] [info] [sirius_context.cpp:788] SiriusContext: cuDF pinned memory resource configured (NUMA-aware, max slab 8192 B, fallback node=0)
+[2026-08-12 15:10:05.908] [info] [sirius_context.cpp:1615] Extension loaded: sirius	extension
+[2026-08-12 15:10:05.908] [info] [sirius_context.cpp:1620] Beginning to load extension: core_functions
+[2026-08-12 15:10:05.911] [info] [sirius_context.cpp:1615] Extension loaded: core_functions
+[2026-08-12 15:10:05.911] [info] [sirius_context.cpp:1620] Beginning to load extension: parquet
+[2026-08-12 15:10:05.911] [info] [sirius_context.cpp:1615] Extension loaded: parquet
+[2026-08-12 15:10:05.912] [info] [sirius_context.cpp:1595] Connection opened.
+[2026-08-12 15:10:05.912] [info] [sirius_context.cpp:1620] Beginning to load extension: shell
+[2026-08-12 15:10:05.912] [info] [sirius_context.cpp:1615] Extension loaded: shell
+[2026-08-12 15:10:05.912] [info] [sirius_context.cpp:312] QueryBegin: instance=0xaaaab59dcd10 connection=1 query=1 SQL: SELECT 'SF500' src, name, type FROM parquet_schema('/raid/prestouser/aocsa/tpch_parquet_sf500/lineitem/part.0.parquet') WHERE name LIKE 'l_%' UNION ALL SELECT 'SF1000', name, type FROM parquet_schema('/raid/tpch-sf1000/lineitem/part.0.parquet') WHERE name LIKE 'l_%' ORDER BY name, src;
+[2026-08-12 15:10:05.914] [info] [sirius_context.cpp:1463] Transparent execution fallback (unsupported): Set operation not supported
+[2026-08-12 15:10:05.917] [info] [sirius_context.cpp:1607] Connection closed.
+[2026-08-12 15:10:05.925] [info] [task_scheduler.cpp:365] Task request channel closed, exiting management event loop.
+[2026-08-12 15:10:05.925] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:05.926] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:05.926] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:05.927] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:29.846] [info] [sirius_context.cpp:1656] No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, ~/.sirius/sirius.yaml). Using defaults.
+[2026-08-12 15:10:29.846] [warning] [sirius_context.cpp:1659] Super Sirius will allocate most GPU and pinned host memory on startup. If you are using the legacy code path (gpu_buffer_init / gpu_processing), set SIRIUS_DISABLE=1 to prevent this.
+[2026-08-12 15:10:29.854] [info] [sirius_context.cpp:632] SiriusContext: topology summary — 4 GPU(s), 34 NUMA node(s), host='presto-gb200-gcn-17'
+[2026-08-12 15:10:29.854] [info] [sirius_context.cpp:637]   GPU 0: NVIDIA GB200 (numa=0, pci=00000008:01:00.0)
+[2026-08-12 15:10:29.854] [info] [sirius_context.cpp:637]   GPU 1: NVIDIA GB200 (numa=0, pci=00000009:01:00.0)
+[2026-08-12 15:10:29.854] [info] [sirius_context.cpp:637]   GPU 2: NVIDIA GB200 (numa=1, pci=00000018:01:00.0)
+[2026-08-12 15:10:29.854] [info] [sirius_context.cpp:637]   GPU 3: NVIDIA GB200 (numa=1, pci=00000019:01:00.0)
+[2026-08-12 15:10:41.784] [info] [telemetry_context.cpp:136] Telemetry context initialized (engine=siriusDB, 4 GPU device group(s))
+[2026-08-12 15:10:41.784] [info] [batch_telemetry.cpp:227] Batch telemetry installed (6 tier resources).
+[2026-08-12 15:10:41.784] [warning] [sirius_context.cpp:667] SiriusContext: disk memory space is not configured; spilling GPU or HOST data to disk is disabled. If queries run out of GPU/HOST memory, downgrades to disk will not be possible.
+[2026-08-12 15:10:41.784] [info] [sirius_context.cpp:679] SiriusContext: 2 host memory space(s) created for 34 NUMA node(s)
+[2026-08-12 15:10:41.784] [warning] [sirius_context.cpp:684] SiriusContext: host space count (2) != NUMA node count (34) — expected one host space per NUMA domain. Check sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host configuration.
+[2026-08-12 15:10:41.786] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 1
+[2026-08-12 15:10:41.787] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 2
+[2026-08-12 15:10:41.789] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 3
+[2026-08-12 15:10:41.790] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 0
+[2026-08-12 15:10:41.791] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 2
+[2026-08-12 15:10:41.792] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 3
+[2026-08-12 15:10:41.793] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 0
+[2026-08-12 15:10:41.794] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 1
+[2026-08-12 15:10:41.795] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 3
+[2026-08-12 15:10:41.796] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 0
+[2026-08-12 15:10:41.797] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 1
+[2026-08-12 15:10:41.797] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 2
+[2026-08-12 15:10:41.813] [info] [sirius_context.cpp:788] SiriusContext: cuDF pinned memory resource configured (NUMA-aware, max slab 8192 B, fallback node=0)
+[2026-08-12 15:10:41.833] [info] [sirius_context.cpp:1615] Extension loaded: sirius	extension
+[2026-08-12 15:10:41.833] [info] [sirius_context.cpp:1620] Beginning to load extension: core_functions
+[2026-08-12 15:10:41.836] [info] [sirius_context.cpp:1615] Extension loaded: core_functions
+[2026-08-12 15:10:41.836] [info] [sirius_context.cpp:1620] Beginning to load extension: parquet
+[2026-08-12 15:10:41.836] [info] [sirius_context.cpp:1615] Extension loaded: parquet
+[2026-08-12 15:10:41.836] [info] [sirius_context.cpp:1595] Connection opened.
+[2026-08-12 15:10:41.836] [info] [sirius_context.cpp:1620] Beginning to load extension: shell
+[2026-08-12 15:10:41.836] [info] [sirius_context.cpp:1615] Extension loaded: shell
+[2026-08-12 15:10:41.836] [info] [sirius_context.cpp:312] QueryBegin: instance=0xaaaab59dd220 connection=1 query=1 SQL: SELECT 'SF500' src, name, type, converted_type, logical_type FROM parquet_schema('/raid/prestouser/aocsa/tpch_parquet_sf500/lineitem/part.0.parquet') WHERE name IN ('l_extendedprice','l_quantity','l_partkey','l_shipdate') UNION ALL SELECT 'SF1000', name, type, converted_type, logical_type FROM parquet_schema('/raid/tpch-sf1000/lineitem/part.0.parquet') WHERE name IN ('l_extendedprice','l_quantity','l_partkey','l_shipdate') ORDER BY name, src;
+[2026-08-12 15:10:41.837] [info] [sirius_context.cpp:1463] Transparent execution fallback (unsupported): Set operation not supported
+[2026-08-12 15:10:41.841] [info] [sirius_context.cpp:1607] Connection closed.
+[2026-08-12 15:10:41.849] [info] [task_scheduler.cpp:365] Task request channel closed, exiting management event loop.
+[2026-08-12 15:10:41.849] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:41.849] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:41.850] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:41.850] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:46.262] [info] [sirius_context.cpp:1656] No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, ~/.sirius/sirius.yaml). Using defaults.
+[2026-08-12 15:10:46.262] [warning] [sirius_context.cpp:1659] Super Sirius will allocate most GPU and pinned host memory on startup. If you are using the legacy code path (gpu_buffer_init / gpu_processing), set SIRIUS_DISABLE=1 to prevent this.
+[2026-08-12 15:10:46.270] [info] [sirius_context.cpp:632] SiriusContext: topology summary — 4 GPU(s), 34 NUMA node(s), host='presto-gb200-gcn-17'
+[2026-08-12 15:10:46.270] [info] [sirius_context.cpp:637]   GPU 0: NVIDIA GB200 (numa=0, pci=00000008:01:00.0)
+[2026-08-12 15:10:46.270] [info] [sirius_context.cpp:637]   GPU 1: NVIDIA GB200 (numa=0, pci=00000009:01:00.0)
+[2026-08-12 15:10:46.270] [info] [sirius_context.cpp:637]   GPU 2: NVIDIA GB200 (numa=1, pci=00000018:01:00.0)
+[2026-08-12 15:10:46.270] [info] [sirius_context.cpp:637]   GPU 3: NVIDIA GB200 (numa=1, pci=00000019:01:00.0)
+[2026-08-12 15:10:57.090] [info] [telemetry_context.cpp:136] Telemetry context initialized (engine=siriusDB, 4 GPU device group(s))
+[2026-08-12 15:10:57.090] [info] [batch_telemetry.cpp:227] Batch telemetry installed (6 tier resources).
+[2026-08-12 15:10:57.090] [warning] [sirius_context.cpp:667] SiriusContext: disk memory space is not configured; spilling GPU or HOST data to disk is disabled. If queries run out of GPU/HOST memory, downgrades to disk will not be possible.
+[2026-08-12 15:10:57.090] [info] [sirius_context.cpp:679] SiriusContext: 2 host memory space(s) created for 34 NUMA node(s)
+[2026-08-12 15:10:57.090] [warning] [sirius_context.cpp:684] SiriusContext: host space count (2) != NUMA node count (34) — expected one host space per NUMA domain. Check sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host configuration.
+[2026-08-12 15:10:57.093] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 1
+[2026-08-12 15:10:57.094] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 2
+[2026-08-12 15:10:57.096] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 3
+[2026-08-12 15:10:57.096] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 0
+[2026-08-12 15:10:57.098] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 2
+[2026-08-12 15:10:57.099] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 3
+[2026-08-12 15:10:57.100] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 0
+[2026-08-12 15:10:57.100] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 1
+[2026-08-12 15:10:57.102] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 2 -> 3
+[2026-08-12 15:10:57.102] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 0
+[2026-08-12 15:10:57.103] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 1
+[2026-08-12 15:10:57.104] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 3 -> 2
+[2026-08-12 15:10:57.123] [info] [sirius_context.cpp:788] SiriusContext: cuDF pinned memory resource configured (NUMA-aware, max slab 8192 B, fallback node=0)
+[2026-08-12 15:10:57.144] [info] [sirius_context.cpp:1615] Extension loaded: sirius	extension
+[2026-08-12 15:10:57.144] [info] [sirius_context.cpp:1620] Beginning to load extension: core_functions
+[2026-08-12 15:10:57.148] [info] [sirius_context.cpp:1615] Extension loaded: core_functions
+[2026-08-12 15:10:57.148] [info] [sirius_context.cpp:1620] Beginning to load extension: parquet
+[2026-08-12 15:10:57.148] [info] [sirius_context.cpp:1615] Extension loaded: parquet
+[2026-08-12 15:10:57.148] [info] [sirius_context.cpp:1595] Connection opened.
+[2026-08-12 15:10:57.148] [info] [sirius_context.cpp:1620] Beginning to load extension: shell
+[2026-08-12 15:10:57.148] [info] [sirius_context.cpp:1615] Extension loaded: shell
+[2026-08-12 15:10:57.148] [info] [sirius_context.cpp:312] QueryBegin: instance=0xaaaab59dd1b0 connection=1 query=1 SQL: SELECT 'SF500 lineitem' t, count(*) FROM read_parquet('/raid/prestouser/aocsa/tpch_parquet_sf500/lineitem/*.parquet') UNION ALL SELECT 'SF1000 lineitem', count(*) FROM read_parquet('/raid/tpch-sf1000/lineitem/*.parquet') UNION ALL SELECT 'SF500 orders', count(*) FROM read_parquet('/raid/prestouser/aocsa/tpch_parquet_sf500/orders/*.parquet') UNION ALL SELECT 'SF1000 orders', count(*) FROM read_parquet('/raid/tpch-sf1000/orders/*.parquet');
+[2026-08-12 15:10:57.167] [info] [sirius_context.cpp:1463] Transparent execution fallback (unsupported): Set operation not supported
+[2026-08-12 15:10:57.426] [info] [sirius_context.cpp:1607] Connection closed.
+[2026-08-12 15:10:57.446] [info] [task_scheduler.cpp:365] Task request channel closed, exiting management event loop.
+[2026-08-12 15:10:57.446] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:57.446] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:57.447] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-12 15:10:57.447] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop

@@ -126,9 +126,23 @@ sirius:
 # COMPANION SETTINGS THAT DO NOT LIVE IN THIS FILE
 #
 #   SIRIUS_EXCHANGE_STAGING_BYTES = 8GiB     <-- NOT 16GiB. See ./HARDWARE.md.
-#       Tension: q17/q21 stage ~4.75-15 GB/CN at SF500 on 8 CNs, so 8 GiB may be
-#       exceeded at the top end. Raising it shrinks the pool 1:1. There is no
-#       comfortable setting; treat q17/q21 failures here as a measurement.
+#
+#       !! MEASURED 2026-08-12 ON THE GB200 BOX -- THIS BUDGET IS KNOWN INSUFFICIENT !!
+#       See ../gb200-4gpu/RESULTS-sf500.md.
+#         q17 at SF500 on 4 CNs: FAILS at 16 GiB, PASSES at 32 GiB.
+#         q21 at SF500 on 4 CNs: FAILS at 16 GiB AND at 32 GiB -- doubling the arena
+#              doubled the outstanding lease count (13-25 -> 32-36) instead of
+#              letting the query finish. Demand is >27 GB concurrent and unbounded
+#              by sizing; this looks like leases not being released, not a shortfall.
+#
+#       CONSEQUENCE FOR THIS BOX: an 80 GiB A100 cannot supply a >32 GiB arena at any
+#       setting -- 32 GiB alone is 40% of the card, before the pool. Expect q17 AND q21
+#       to fail here regardless of tuning until the staging-lease lifecycle is fixed.
+#       Treat that as a KNOWN BLOCKER, not a tuning exercise, and exclude both from
+#       the A100 query set until it lands.
+#
+#       8 CNs halve the per-CN share vs the 4-CN GB200 measurement, which helps but
+#       does not close a >4x gap.
 #
 #   UCX_TLS = cuda_copy,cuda_ipc,tcp,self   <-- cuda_ipc is LOAD-BEARING.
 #       Without it nixl falls off a 1349x cliff.

@@ -1,0 +1,1336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streaming primitives — features and PR stack</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --paper:   #f5f5f5;
+    --paper-2: #ececec;
+    --white:   #ffffff;
+    --ink:     #2d3142;
+    --muted:   #4f5d75;
+    --soft:    #7a8399;
+    --accent:  #eb6c36;
+    --link:    #2e5aa8;
+    --rule:    rgba(45,49,66,0.12);
+    --font-sans:  'Geist', system-ui, sans-serif;
+    --font-serif: 'Instrument Serif', serif;
+    --font-mono:  'Geist Mono', ui-monospace, monospace;
+  }
+  body {
+    font-family: var(--font-sans);
+    background: var(--paper);
+    color: var(--ink);
+    line-height: 1.6;
+    padding: 3rem 2rem 5rem;
+  }
+  .frame { max-width: 1080px; margin: 0 auto; }
+
+  .eyebrow {
+    font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500;
+    letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+  h1 {
+    font-family: var(--font-serif); font-size: clamp(1.9rem, 3vw + 1rem, 2.8rem);
+    font-weight: 400; letter-spacing: -0.02em; line-height: 1.1; margin-bottom: 0.75rem;
+  }
+  h2 {
+    font-family: var(--font-serif); font-size: 1.75rem; font-weight: 400;
+    letter-spacing: -0.01em; margin: 3.5rem 0 1rem; padding-top: 1.5rem;
+    border-top: 1px solid var(--rule);
+  }
+  h3 { font-size: 1.05rem; font-weight: 600; margin: 2rem 0 0.5rem; }
+  h4 {
+    font-family: var(--font-mono); font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted);
+    margin: 1rem 0 0.35rem;
+  }
+  p { margin-bottom: 0.9rem; max-width: 76ch; }
+  ul, ol { margin: 0 0 0.9rem 1.15rem; max-width: 76ch; }
+  li { margin-bottom: 0.3rem; }
+  code {
+    font-family: var(--font-mono); font-size: 0.84em;
+    background: rgba(45,49,66,0.06); padding: 0.1em 0.35em; border-radius: 3px;
+  }
+  a { color: var(--link); }
+  .lede { font-size: 1.05rem; color: var(--muted); max-width: 72ch; }
+
+  figure { margin: 2rem 0 2.5rem; }
+  figure svg { width: 100%; min-width: 880px; display: block; }
+  .scroll { overflow-x: auto; }
+  figcaption {
+    font-size: 0.85rem; color: var(--muted); margin-top: 0.75rem;
+    padding-top: 0.6rem; border-top: 1px solid var(--rule); max-width: 76ch;
+  }
+
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; font-size: 0.86rem; }
+  th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th {
+    font-family: var(--font-mono); font-size: 0.68rem; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
+  }
+  td code { font-size: 0.8em; }
+  .num { text-align: right; font-family: var(--font-mono); font-size: 0.8rem; white-space: nowrap; }
+
+  .feature {
+    background: var(--white); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 1.4rem 1.5rem; margin: 1.5rem 0;
+  }
+  .feature-head { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.2rem; }
+  .feature-head h3 { margin: 0; font-size: 1.1rem; }
+  .tag {
+    font-family: var(--font-mono); font-size: 0.62rem; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase; padding: 0.15em 0.5em;
+    border: 1px solid rgba(45,49,66,0.25); border-radius: 3px; color: var(--muted);
+    white-space: nowrap;
+  }
+  .tag.t1 { border-color: rgba(45,49,66,0.4); }
+  .tag.t2 { border-color: rgba(45,49,66,0.2); }
+  .tag.risk { border-color: rgba(235,108,54,0.5); color: var(--accent); }
+  .feature .where {
+    background: rgba(45,49,66,0.03); border-left: 2px solid rgba(45,49,66,0.18);
+    padding: 0.7rem 0.9rem; margin-top: 1rem; font-size: 0.84rem;
+  }
+  .feature .where p { margin-bottom: 0.35rem; max-width: none; }
+  .watch {
+    border-left: 2px solid var(--accent); background: rgba(235,108,54,0.05);
+    padding: 0.7rem 0.9rem; margin-top: 1rem; font-size: 0.86rem;
+  }
+  .watch p { margin: 0; max-width: none; }
+
+  .cards { display: grid; grid-template-columns: 1.15fr 1fr 0.9fr; gap: 1rem; margin: 1.5rem 0; }
+  .card {
+    background: var(--white); border: 1px solid var(--rule);
+    border-radius: 6px; padding: 1.25rem;
+  }
+  .card h3 { margin: 0.4rem 0 0.5rem; font-size: 0.98rem; }
+  .card ul { font-size: 0.85rem; margin-left: 1rem; }
+  .card-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 0.4rem; }
+  .dot-coral { background: var(--accent); }
+  .dot-ink   { background: var(--ink); }
+  .dot-muted { background: var(--muted); }
+
+  .aside {
+    font-family: var(--font-serif); font-style: italic; font-size: 1.05rem;
+    color: var(--muted); border-left: 2px solid var(--accent);
+    padding-left: 1rem; margin: 1.5rem 0; max-width: 68ch;
+  }
+  .q { background: var(--white); border: 1px solid rgba(235,108,54,0.35); border-radius: 6px; padding: 1.25rem 1.4rem; margin: 1.25rem 0; }
+  .q ol { margin-bottom: 0; }
+
+  footer {
+    margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--rule);
+    font-family: var(--font-mono); font-size: 0.7rem; color: var(--soft);
+  }
+  @media (max-width: 820px) { .cards { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="frame">
+
+<p class="eyebrow">Sirius · Transfer plan · demo-multi-cn → aocsa/sirius</p>
+<h1>Streaming primitives: what we built, and how the PR stack is organised</h1>
+<p class="lede">
+  A guide for the people who will review this work. It covers the nine features in Tracks 1 and 2,
+  how each one works, what it unlocks downstream, and the exact commits and files behind it.
+  Every statement here comes from <code>STREAMING-PRIMITIVES-HANDOFF.md</code>.
+</p>
+
+<h2>Read this first</h2>
+
+<p>
+  Two repositories are involved and <strong>they share no git objects</strong>. The source is
+  <code>demo-multi-cn</code> at <code>790612fb</code> (100 commits). The target is
+  <code>aocsa/sirius</code> at <code>stream/15-fragment</code> (<code>d1c0dc6d</code>).
+  Because there are no shared objects, <em>cherry-pick by hash is impossible</em>. Everything moves
+  as patches.
+</p>
+
+<p>
+  The decision has already been made: <strong>we work on top of the target, not the other way round.</strong>
+  The target is further along on the streaming series and carries review hardening the source lacks
+  &mdash; a producer-error plane on <code>batch_stream</code>, <code>stream_session::fail_output</code>,
+  and 17 test cases in <code>test_batch_stream.cpp</code>. Re-landing that work would be duplicate effort.
+</p>
+
+<div class="cards">
+  <div class="card">
+    <p class="eyebrow">Scope</p>
+    <h3><span class="card-dot dot-coral"></span>34 PRs, two tracks</h3>
+    <ul>
+      <li>Track 1 &mdash; engine and Rust primitives (PRs 1&ndash;16)</li>
+      <li>Track 2 &mdash; StarRocks CN and plan translator (PRs 17&ndash;34)</li>
+      <li>Tracks 3&ndash;4 (benchmark, docs) exist but are out of scope for this document</li>
+    </ul>
+  </div>
+  <div class="card">
+    <p class="eyebrow">Already done</p>
+    <h3><span class="card-dot dot-muted"></span>21 commits are in the target</h3>
+    <ul>
+      <li>16 dropped completely</li>
+      <li>5 re-landed as <strong>Rust hunks only</strong></li>
+      <li>Absorbed into <code>3bea68de</code>, <code>641b77eb</code>, <code>d1c0dc6d</code></li>
+    </ul>
+  </div>
+  <div class="card">
+    <p class="eyebrow">The gap</p>
+    <h3><span class="card-dot dot-ink"></span>No Rust binding</h3>
+    <ul>
+      <li>The target has the C++ <code>Fragment</code> FFI</li>
+      <li>It has <strong>no Rust caller</strong> for it</li>
+      <li>Every CN commit needs that binding &mdash; so PR 1 comes first</li>
+    </ul>
+  </div>
+</div>
+
+<h2>Where the features live</h2>
+
+<figure class="scroll">
+<svg viewBox="0 0 1000 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="layers-title layers-desc">
+  <title id="layers-title">Layers of the streaming work, from engine primitives up to the plan translator</title>
+  <desc id="layers-desc">A five-band stack. The bottom band is the streaming primitives already landed in the target repository. Above it sit the C++ engine primitives, then the Rust FFI binding which is missing in the target and highlighted, then the StarRocks compute node, then the plan translator at the top.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- direction indicator -->
+  <line x1="120" y1="364" x2="120" y2="72" stroke="#7a8399" stroke-width="1" marker-end="url(#arrow)"/>
+  <text x="120" y="400" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">ABSTRACTION</text>
+
+  <!-- bands: bottom (already landed) first -->
+  <rect x="176" y="312" width="680" height="64" fill="rgba(45,49,66,0.05)" stroke="none"/>
+  <rect x="176" y="248" width="680" height="64" fill="#ffffff" stroke="none"/>
+  <rect x="176" y="184" width="680" height="64" fill="rgba(235,108,54,0.08)" stroke="none"/>
+  <rect x="176" y="120" width="680" height="64" fill="#ffffff" stroke="none"/>
+  <rect x="176" y="56"  width="680" height="64" fill="#ffffff" stroke="none"/>
+
+  <!-- dividers -->
+  <line x1="176" y1="120" x2="856" y2="120" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+  <line x1="176" y1="184" x2="856" y2="184" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+  <line x1="176" y1="248" x2="856" y2="248" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+  <line x1="176" y1="312" x2="856" y2="312" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+  <!-- coral band border -->
+  <rect x="176" y="184" width="680" height="64" fill="none" stroke="#eb6c36" stroke-width="1.2"/>
+  <!-- outer silhouette -->
+  <rect x="176" y="56" width="680" height="320" fill="none" stroke="#2d3142" stroke-width="1"/>
+
+  <!-- L5 plan translator -->
+  <text x="192" y="92"  fill="#7a8399" font-size="8"  font-family="'Geist Mono', monospace" letter-spacing="0.12em">T2</text>
+  <text x="280" y="93"  fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', sans-serif">Plan translator</text>
+  <text x="840" y="92"  fill="#4f5d75" font-size="9"  font-family="'Geist Mono', monospace" text-anchor="end">starrocks-plan-translator · PRs 26-34</text>
+
+  <!-- L4 compute node -->
+  <text x="192" y="156" fill="#7a8399" font-size="8"  font-family="'Geist Mono', monospace" letter-spacing="0.12em">T2</text>
+  <text x="280" y="157" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', sans-serif">StarRocks compute node</text>
+  <text x="840" y="156" fill="#4f5d75" font-size="9"  font-family="'Geist Mono', monospace" text-anchor="end">experimental/starrocks/src · PRs 17-25</text>
+
+  <!-- L3 rust ffi binding (focal) -->
+  <text x="192" y="220" fill="#eb6c36" font-size="8"  font-family="'Geist Mono', monospace" letter-spacing="0.12em">T1</text>
+  <text x="280" y="221" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', sans-serif">Rust FFI binding</text>
+  <rect x="416" y="209" width="52" height="14" rx="2" fill="none" stroke="#eb6c36" stroke-width="0.8"/>
+  <text x="442" y="219" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.1em">GAP</text>
+  <text x="840" y="220" fill="#eb6c36" font-size="9"  font-family="'Geist Mono', monospace" text-anchor="end">rust/crates/sirius · PRs 1-2</text>
+
+  <!-- L2 engine primitives -->
+  <text x="192" y="284" fill="#7a8399" font-size="8"  font-family="'Geist Mono', monospace" letter-spacing="0.12em">T1</text>
+  <text x="280" y="285" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', sans-serif">Engine primitives (C++)</text>
+  <text x="840" y="284" fill="#4f5d75" font-size="9"  font-family="'Geist Mono', monospace" text-anchor="end">src/exec · src/op · src/planner · PRs 3-16</text>
+
+  <!-- L1 already in target -->
+  <text x="192" y="348" fill="#7a8399" font-size="8"  font-family="'Geist Mono', monospace" letter-spacing="0.12em">--</text>
+  <text x="280" y="349" fill="#4f5d75" font-size="14" font-weight="600" font-family="'Geist', sans-serif">Streaming primitives already in target</text>
+  <text x="840" y="348" fill="#7a8399" font-size="9"  font-family="'Geist Mono', monospace" text-anchor="end">3bea68de · 641b77eb · d1c0dc6d</text>
+
+  <!-- legend -->
+  <line x1="64" y1="424" x2="936" y2="424" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="64" y="444" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+  <rect x="152" y="434" width="14" height="12" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+  <text x="174" y="444" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Missing in target &mdash; blocks every layer above it</text>
+  <rect x="512" y="434" width="14" height="12" rx="2" fill="#ffffff" stroke="rgba(45,49,66,0.35)" stroke-width="1"/>
+  <text x="534" y="444" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">To be ported</text>
+  <rect x="664" y="434" width="14" height="12" rx="2" fill="rgba(45,49,66,0.05)" stroke="rgba(45,49,66,0.25)" stroke-width="1"/>
+  <text x="686" y="444" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Already landed in aocsa/sirius</text>
+</svg>
+<figcaption>
+  The bottom band is done. The C++ half of the band above it is largely done too. The
+  <strong>Rust FFI binding is the missing rung</strong>: without it, nothing in the two top bands can reach
+  the engine. Verified with <code>git grep 'Fragment|declare_output|declare_input'</code> over
+  <code>rust/crates/sirius*</code> at <code>stream/15-fragment</code> &mdash; it returns nothing.
+</figcaption>
+</figure>
+
+<h2>Feature dependency map</h2>
+
+<figure class="scroll">
+<svg viewBox="0 0 1000 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="deps-title deps-desc">
+  <title id="deps-title">How the nine features depend on each other across the two tracks</title>
+  <desc id="deps-desc">Two zones. On the left, four engine and Rust features: the Rust FFI binding, the exchange staging arena, engine correctness fixes, and the byte-range parquet scan. On the right, five StarRocks compute-node features in review order: multi-fragment compute node, addressed exchange over nixl, fan-out, two-phase aggregation, and translator correctness. Four arrows cross from left to right showing which engine feature each compute-node feature requires.</desc>
+  <defs>
+    <marker id="d2-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d2-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- zones -->
+  <rect x="64"  y="32" width="192" height="428" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <rect x="584" y="32" width="212" height="428" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <rect x="88"  y="36" width="144" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="160" y="45" fill="rgba(45,49,66,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">TRACK 1 · ENGINE</text>
+  <rect x="608" y="36" width="164" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="690" y="45" fill="rgba(45,49,66,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">TRACK 2 · STARROCKS CN</text>
+
+  <!-- ARROWS FIRST -->
+  <!-- F1 -> F5 -->
+  <path d="M 240,112 H 292 Q 300,112 300,104 V 104 Q 300,96 308,96 H 600" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d2-arrow-accent)"/>
+  <!-- F4 -> F6 -->
+  <path d="M 240,200 H 332 Q 340,200 340,192 V 184 Q 340,176 348,176 H 600" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d2-arrow-accent)"/>
+  <!-- F2 -> F8 -->
+  <path d="M 240,288 H 372 Q 380,288 380,296 V 328 Q 380,336 388,336 H 600" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <!-- F3 -> F9 -->
+  <path d="M 240,376 H 412 Q 420,376 420,384 V 408 Q 420,416 428,416 H 600" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <!-- review-order chain in zone B -->
+  <line x1="690" y1="120" x2="690" y2="148" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="690" y1="200" x2="690" y2="228" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="690" y1="280" x2="690" y2="308" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="690" y1="360" x2="690" y2="388" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+
+  <!-- arrow labels -->
+  <rect x="380" y="76"  width="60" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="410" y="85"  fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REQUIRES</text>
+  <rect x="416" y="156" width="60" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="446" y="165" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REQUIRES</text>
+  <rect x="452" y="316" width="60" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="482" y="325" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REQUIRES</text>
+  <rect x="484" y="396" width="60" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="514" y="405" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REQUIRES</text>
+
+  <!-- ZONE A NODES -->
+  <rect x="80" y="88" width="160" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="80" y="88" width="160" height="48" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+  <text x="160" y="108" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Rust FFI binding</text>
+  <text x="160" y="124" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 1-2</text>
+
+  <rect x="80" y="176" width="160" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="80" y="176" width="160" height="48" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+  <text x="160" y="196" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Staging arena</text>
+  <text x="160" y="212" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 12-16</text>
+
+  <rect x="80" y="264" width="160" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="80" y="264" width="160" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="160" y="284" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Correctness fixes</text>
+  <text x="160" y="300" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 3-9</text>
+
+  <rect x="80" y="352" width="160" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="80" y="352" width="160" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="160" y="372" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Byte-range scan</text>
+  <text x="160" y="388" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 10-11</text>
+
+  <!-- ZONE B NODES -->
+  <rect x="600" y="72" width="180" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="600" y="72" width="180" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="690" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Multi-fragment CN</text>
+  <text x="690" y="108" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 17-19</text>
+
+  <rect x="600" y="152" width="180" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="600" y="152" width="180" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="690" y="172" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Exchange over nixl</text>
+  <text x="690" y="188" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 20-23</text>
+
+  <rect x="600" y="232" width="180" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="600" y="232" width="180" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="690" y="252" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fan-out</text>
+  <text x="690" y="268" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 24-25</text>
+
+  <rect x="600" y="312" width="180" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="600" y="312" width="180" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="690" y="332" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Two-phase aggregation</text>
+  <text x="690" y="348" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 26-30</text>
+
+  <rect x="600" y="392" width="180" height="48" rx="6" fill="#f5f5f5"/>
+  <rect x="600" y="392" width="180" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="690" y="412" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Translator correctness</text>
+  <text x="690" y="428" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PRs 31-34</text>
+
+  <!-- legend -->
+  <line x1="64" y1="486" x2="936" y2="486" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="64" y="506" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+  <line x1="152" y1="502" x2="196" y2="502" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d2-arrow-accent)"/>
+  <text x="208" y="506" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Hard blocker &mdash; the CN cannot run without it</text>
+  <line x1="524" y1="502" x2="568" y2="502" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <text x="580" y="506" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Requires / review order within a track</text>
+</svg>
+<figcaption>
+  Nine feature clusters, not 34 boxes &mdash; the per-PR ordering lives in the table further down. The
+  vertical chain on the right is <strong>review order</strong>, which is close to but not identical to
+  strict dependency. Only the two coral arrows are hard blockers: without the Rust binding the CN cannot
+  reach the engine at all, and without the staging arena the nixl transport has nothing to register.
+</figcaption>
+</figure>
+
+<h2>Track 1 &mdash; engine and Rust primitives</h2>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>1. Rust binding for the Fragment FFI</h3>
+    <span class="tag t1">Track 1</span><span class="tag">PRs 1&ndash;2</span><span class="tag risk">Partial cherry-pick</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    Gives Rust callers a way to build a <code>Fragment</code>, declare its inputs and outputs, and hand
+    device-resident batches across a fragment boundary. The C++ side of this already exists in the target;
+    only the Rust surface is missing.
+  </p>
+
+  <h4>How it works</h4>
+  <p>
+    A thin <code>-sys</code> layer declares the C ABI, and a safe wrapper in <code>rust/crates/sirius</code>
+    exposes <code>Fragment</code>, <code>declare_output_broadcast</code>, <code>declare_output_hash_key</code>,
+    and the schema-agreement guard. Hash keys are normalised before partitioning: <code>DECIMAL</code> is
+    cast to <code>FLOAT64</code>, and string keys use the kernel's hash-as-is sentinel, so two senders
+    that see the same key always agree on the destination.
+  </p>
+
+  <h4>What it enables</h4>
+  <p>
+    Everything in Track 2. The compute node is a Rust binary; without this binding it cannot construct a
+    plan fragment, so no CN feature can be reviewed or tested. This is why PR 1 is first and smallest.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong> (Rust hunks only): <code>f8249e7c</code>, <code>cfad5dce</code>, <code>02aaa6c0</code>, <code>d5c59a0a</code>, <code>14333ead</code></p>
+    <p><strong>New code</strong>: <code>rust/crates/sirius/src/lib.rs</code>, <code>rust/crates/sirius-sys</code></p>
+    <p><strong>C++ side, already in target</strong>: <code>src/sirius_ffi.cpp:403</code> (broadcast), <code>:413</code> (hash key), <code>src/exec/streaming_fragment.cpp:44-59</code> (decimal normalisation)</p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> This is the only place in the whole stack that is not a whole commit.
+      Take <em>only</em> the <code>rust/crates/</code> hunks &mdash; the <code>src/</code> and
+      <code>test/cpp/</code> halves will conflict head-on with the target's own version. Check the
+      <code>-sys</code> declarations against the <strong>target's</strong> current C++ ABI, not the source's
+      older signature. Also confirm no panic can unwind across the FFI boundary.
+    </p>
+  </div>
+</div>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>2. Engine correctness fixes</h3>
+    <span class="tag t1">Track 1</span><span class="tag">PRs 3&ndash;9</span><span class="tag risk">4 high risk</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    Six independent fixes plus one characterisation test. Each one closes a hang or a wrong-answer bug that
+    the streaming path exposed. They are independent of each other, so they can be reviewed in parallel.
+  </p>
+
+  <h4>How it works</h4>
+  <ul>
+    <li><strong>PR 3</strong> loads <code>core_functions</code> into the embedded DuckDB, so plans submitted through the FFI can resolve scalar functions.</li>
+    <li><strong>PR 5</strong> plans Substrait inside a transaction, so planning cannot observe a torn catalog.</li>
+    <li><strong>PR 6</strong> completes a query whose input stream ends with zero batches &mdash; previously the fragment waited forever.</li>
+    <li><strong>PR 7</strong> completes a hash join whose build side finishes empty; the probe was never released.</li>
+    <li><strong>PR 8</strong> refuses a 64-bit integer sum that could overflow its accumulator, instead of silently wrapping.</li>
+    <li><strong>PR 9</strong> makes float grouped sums bit-stable by routing them through the sort-based groupby.</li>
+  </ul>
+
+  <h4>What it enables</h4>
+  <p>
+    Reproducibility and trust. PR 9 in particular is what makes every downstream benchmark number
+    comparable &mdash; without it the same query can return different sums on different runs.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>7e09aabf</code>, <code>f8360593</code>, <code>0c49416b</code>, <code>e11d4ac5</code>, <code>e8ca9e60</code>, <code>5d149277</code>; test <code>4bf9598e</code> (PR 4)</p>
+    <p><strong>Files</strong>: <code>src/sirius_ffi.cpp</code>, <code>src/creator/task_creator.cpp</code>, <code>src/include/pipeline/task_scheduler.hpp</code>, <code>src/op/sirius_physical_partition.cpp</code></p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> PR 9 ships an <em>ungated</em> performance and memory regression &mdash;
+      a full sort and gather on <em>every</em> float SUM. Ask for timing data before approving.
+      PR 8's bound is whole-column, not per-group, so confirm it does not push ordinary TPC-H sums onto the
+      CPU. PRs 6 and 7 both touch <code>task_scheduler.hpp</code>; PR 7 introduces a new lock order
+      (<code>partition &rarr; join &rarr; sibling</code>) that needs an ABBA check.
+    </p>
+  </div>
+</div>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>3. Byte-range parquet scan</h3>
+    <span class="tag t1">Track 1</span><span class="tag">PRs 10&ndash;11</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    Lets several compute nodes read <em>one</em> parquet file at the same time without overlapping. Each
+    node is given a byte range and reads only the row groups it owns.
+  </p>
+
+  <h4>How it works</h4>
+  <p>
+    A pure, deterministic rule maps a byte range to the row groups that range owns. The parquet ingestible
+    then honours a per-file range, and the ranges travel from the Rust caller through the Substrait plan
+    into the scan.
+  </p>
+
+  <h4>What it enables</h4>
+  <p>
+    Scale-out reads. Without it the CN had to refuse split scans outright, so a table in a single large
+    file could only be read by one node. Feature 9 is the CN-side consumer.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>7f5fbf07</code>, <code>a77e52f9</code> (PR 10); <code>5c19836f</code>, <code>4db3aea2</code> (PR 11)</p>
+    <p><strong>New code</strong>: <code>src/op/scan/parquet_byte_range.{cpp,hpp}</code>, <code>src/planner/substrait_scan_ranges.{cpp,hpp}</code></p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> The ownership rule must be a true partition &mdash; no gaps and no
+      double-reads at range boundaries &mdash; and it must match the StarRocks BE rule byte-for-byte, or
+      rows go missing. <code>start + length</code> can overflow. In PR 11,
+      <code>extract_scan_byte_ranges</code> runs on <em>every</em> plan and throws on unknown relation
+      types, which is a regression surface far wider than this feature. <code>4db3aea2</code> has
+      <strong>no test</strong> and strips any authority from a URI, so a remote path can alias to a local one.
+    </p>
+  </div>
+</div>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>4. Exchange staging arena</h3>
+    <span class="tag t1">Track 1</span><span class="tag">PRs 12&ndash;16</span><span class="tag risk">All high risk</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    A dedicated GPU memory region, allocated with a bare <code>cudaMalloc</code> outside the RMM pool, used
+    to stage batches that are about to cross a fragment or host boundary. Callers take a lease, pack into
+    it, push, and release.
+  </p>
+
+  <h4>How it works</h4>
+  <p>
+    A bump allocator hands out leases. <code>export_packed</code> and <code>push_packed</code> give Rust a
+    device pointer, so a batch crosses the boundary without a round trip through host memory. Two follow-up
+    fixes harden the protocol: zero-row exports no longer orphan their lease, and leases are served off the
+    engine thread so acquisition cannot deadlock under load. The last PR adds fabric handles so the buffer
+    is reachable from another host.
+  </p>
+
+  <h4>What it enables</h4>
+  <p>
+    The whole exchange path, including nixl (feature 6) and every fan-out mode (feature 7). It is also the
+    single biggest lever on how large a query can run.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>fe1199f6</code> (PR 12), <code>bd8e0a97</code> (PR 13), <code>295ea7be</code> (PR 14), <code>ae949ade</code> (PR 15), <code>3b19962f</code> (PR 16)</p>
+    <p><strong>New code</strong>: <code>src/exec/exchange_staging_arena.{cpp,hpp}</code>; lease call site at <code>src/sirius_ffi.cpp:755</code>, chunked packer at <code>:761</code></p>
+    <p><strong>Configured by</strong>: <code>SIRIUS_EXCHANGE_STAGING_BYTES</code> (environment only)</p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> Lease lifetime is the whole review. Every early return must release,
+      or the bump allocator wedges permanently on one stuck lease. In PR 13, decide who releases the lease
+      if Rust drops the handle without pushing. In PR 15, a lease served after arena teardown begins is a
+      use-after-free. PR 16 has no <code>cuInit</code>, so it gives a misleading error if it is the first
+      CUDA touch, and ships with zero tests.
+    </p>
+    <p style="margin-top:0.5rem">
+      Split out the hunks that belong to Track 2: <code>295ea7be</code>'s <code>nixl_transport.rs</code>,
+      <code>ae949ade</code>'s SIGTERM handling, <code>3b19962f</code>'s benchmarks hunk.
+    </p>
+  </div>
+</div>
+
+<figure class="scroll">
+<svg viewBox="0 0 1000 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="lease-title lease-desc">
+  <title id="lease-title">Staging arena lease lifecycle</title>
+  <desc id="lease-desc">A state machine. From unconfigured the arena becomes ready when the environment variable is set, or refused when it is not. From ready a caller takes a lease, packs the batch, pushes it, and releases back to ready. Two failure states are highlighted: refused when the arena is exhausted, and orphaned when a zero-row export takes a lease it never returns.</desc>
+  <defs>
+    <marker id="d3-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d3-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- ARROWS FIRST -->
+  <!-- start -> Unconfigured -->
+  <line x1="80" y1="136" x2="112" y2="136" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <!-- Unconfigured -> Ready -->
+  <line x1="256" y1="128" x2="336" y2="128" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <!-- Ready -> Leased -->
+  <line x1="464" y1="136" x2="544" y2="136" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <!-- Leased -> Packed -->
+  <line x1="672" y1="136" x2="752" y2="136" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <!-- Packed -> Pushed (vertical) -->
+  <line x1="816" y1="160" x2="816" y2="312" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <!-- Unconfigured -> Refused (vertical) -->
+  <line x1="184" y1="160" x2="184" y2="312" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d3-arrow-accent)"/>
+  <!-- Leased -> Orphaned (vertical) -->
+  <line x1="608" y1="160" x2="608" y2="312" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d3-arrow-accent)"/>
+  <!-- Ready -> Refused (elbow left-down) -->
+  <path d="M 336,148 H 304 Q 296,148 296,156 V 328 Q 296,336 288,336 H 256" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d3-arrow-accent)"/>
+  <!-- Pushed -> Ready (return, dashed, routed below) -->
+  <path d="M 816,360 V 420 Q 816,428 808,428 H 408 Q 400,428 400,420 V 160" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d3-arrow)"/>
+
+  <!-- arrow labels -->
+  <rect x="268" y="106" width="56" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="296" y="115" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ENV SET</text>
+
+  <rect x="472" y="114" width="64" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="504" y="123" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">LEASE()</text>
+
+  <rect x="680" y="114" width="64" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="712" y="123" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PACK</text>
+
+  <rect x="828" y="224" width="92" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="874" y="233" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PUSH_PACKED</text>
+
+  <rect x="196" y="224" width="84" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="238" y="233" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">UNSET</text>
+
+  <rect x="620" y="224" width="92" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="666" y="233" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ZERO-ROW</text>
+
+  <rect x="308" y="248" width="76" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="346" y="257" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">EXHAUSTED</text>
+
+  <rect x="576" y="404" width="64" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="608" y="413" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RELEASE</text>
+
+  <!-- start dot -->
+  <circle cx="72" cy="136" r="6" fill="#2d3142"/>
+
+  <!-- STATES -->
+  <rect x="112" y="112" width="144" height="48" rx="8" fill="#f5f5f5"/>
+  <rect x="112" y="112" width="144" height="48" rx="8" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+  <text x="184" y="133" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Unconfigured</text>
+  <text x="184" y="149" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">arena.cpp:160</text>
+
+  <rect x="336" y="112" width="128" height="48" rx="8" fill="#f5f5f5"/>
+  <rect x="336" y="112" width="128" height="48" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="400" y="141" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Ready</text>
+
+  <rect x="544" y="112" width="128" height="48" rx="8" fill="#f5f5f5"/>
+  <rect x="544" y="112" width="128" height="48" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="608" y="141" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Leased</text>
+
+  <rect x="752" y="112" width="128" height="48" rx="8" fill="#f5f5f5"/>
+  <rect x="752" y="112" width="128" height="48" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="816" y="141" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Packed</text>
+
+  <rect x="112" y="312" width="144" height="48" rx="8" fill="#f5f5f5"/>
+  <rect x="112" y="312" width="144" height="48" rx="8" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="184" y="333" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Refused</text>
+  <text x="184" y="349" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">throws, never degrades</text>
+
+  <rect x="544" y="312" width="128" height="48" rx="8" fill="#f5f5f5"/>
+  <rect x="544" y="312" width="128" height="48" rx="8" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="608" y="333" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Orphaned</text>
+  <text x="608" y="349" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">fixed by PR 14</text>
+
+  <rect x="752" y="312" width="128" height="48" rx="8" fill="#f5f5f5"/>
+  <rect x="752" y="312" width="128" height="48" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="816" y="341" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Pushed</text>
+
+  <!-- legend -->
+  <line x1="64" y1="474" x2="936" y2="474" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="64" y="494" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+  <rect x="152" y="484" width="14" height="12" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="174" y="494" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Failure state &mdash; the query stops, it does not fall back</text>
+  <line x1="560" y1="490" x2="604" y2="490" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d3-arrow)"/>
+  <text x="616" y="494" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Return path</text>
+</svg>
+<figcaption>
+  The arena <strong>never degrades</strong>. It throws when the environment variable is unset
+  (<code>exchange_staging_arena.cpp:175</code>) and throws again when exhausted (<code>:192</code>).
+  That is why <em>Refused</em> is a terminal state and not a fallback. <em>Orphaned</em> is the leak PR 14
+  closes &mdash; before it, a zero-row export took a lease and never gave it back, which capped a cluster at
+  roughly 20 queries.
+</figcaption>
+</figure>
+
+<h2>Track 2 &mdash; StarRocks compute node and plan translator</h2>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>5. Multi-fragment compute node</h3>
+    <span class="tag t2">Track 2</span><span class="tag">PRs 17&ndash;19</span><span class="tag risk">Over size guideline</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    Turns the compute node from a single-fragment demo into one that runs several fragments and passes
+    data between them. Adds per-instance GPU carve-outs so several CNs can share one box, and multi-file
+    schema inference so they can read a partitioned table.
+  </p>
+
+  <h4>How it works</h4>
+  <p>
+    A local exchange and a result store handle the handoff between fragments inside one node. Batches cross
+    the fragment boundary natively, which replaced an earlier file-based hop &mdash; <code>ExchangeFile</code>
+    is deleted by this feature. <code>EngineConfig</code> carves the GPU into per-instance slices.
+  </p>
+
+  <h4>What it enables</h4>
+  <p>
+    Everything else in Track 2. It is the component the exchange, the fan-out and the translator all plug into.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>2f03b3fd</code> (PR 17), <code>2121c3ea</code> + <code>e0451ca3</code> (PR 18), <code>874fb330</code> + <code>d3b7c3f0</code> (PR 19)</p>
+    <p><strong>New code</strong>: <code>experimental/starrocks/src/local_exchange.rs</code>, <code>result_store.rs</code>, <code>engine_settings.rs</code>, <code>gpu_affinity.rs</code></p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> PR 17 is 15 files and about +2,972 lines and <em>cannot be usefully
+      split</em> &mdash; no subset compiles on its own. Review it as a new component and ask the author for a
+      reading order. The <code>parked</code> map pins GPU memory until dispatch, so check what happens when
+      dispatch never comes. In PR 19, the carve-out arithmetic matters: over-subscription does not fail here,
+      it surfaces as an out-of-memory error in an unrelated query later. <code>d3b7c3f0</code> does serial
+      file opens on the RPC path.
+    </p>
+    <p style="margin-top:0.5rem">
+      <strong>Check the target's prior art first.</strong> <code>origin/stream/09-cn-multifragment</code> and
+      <code>origin/stream/10-native-crossing</code> already contain this work under different hashes. They are
+      superseded 2026-08-03 branches, so they are <em>not</em> in the base &mdash; but if they carry review
+      fixes the source lacks, rebase those instead of re-applying the source patches.
+    </p>
+  </div>
+</div>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>6. Addressed exchange and the nixl transport</h3>
+    <span class="tag t2">Track 2</span><span class="tag">PRs 20&ndash;23</span><span class="tag risk">Over size guideline</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    Makes the exchange address its destinations, then carries the hop over nixl (RDMA) so fragments on
+    different hosts can exchange data. Adds loud failure propagation, then a formatting pass.
+  </p>
+
+  <h4>How it works</h4>
+  <p>
+    A routing table maps a destination address to a sender. The nixl transport registers the staging arena's
+    memory and moves batches host-to-host without going through the CPU. <code>fetch_data</code> long-polls,
+    because a not-ready reply desynchronises the frontend.
+  </p>
+
+  <h4>What it enables</h4>
+  <p>
+    Multi-node execution, and both fan-out modes in feature 7 &mdash; you cannot broadcast or hash-partition
+    until senders are addressable.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>6a126c13</code> (PR 20); <code>681c3089</code>, <code>82a6fa25</code>, <code>f83fc549</code> (PR 21); <code>9669d9fb</code> (PR 22); <code>4ab267de</code> (PR 23)</p>
+    <p><strong>New code</strong>: <code>experimental/starrocks/src/nixl_transport.rs</code>, <code>prpc_client.rs</code>, <code>compute_node_service.rs</code></p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> PR 21 is about 3,260 lines across 16 files and has
+      <strong>zero CI coverage</strong> &mdash; <code>cargo test --workspace --no-default-features</code>
+      excludes all of <code>nixl_transport.rs</code>, so it needs a manual two-CN run.
+      <strong>Blocker:</strong> parameterise the hardcoded <code>/home/ubuntu/...</code> paths before this
+      lands. Destination matching is string hostname equality, and a single dispatch thread serialises all
+      receivers. PR 22's failure propagation must not itself deadlock &mdash; peers blocked on the exchange
+      have to unblock. PR 23 is formatting only: verify by re-running rustfmt on the parent and confirming an
+      empty diff. It is placed deliberately, because later diffs depend on the reflowed lines.
+    </p>
+  </div>
+</div>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>7. Fan-out &mdash; broadcast and hash partitioning</h3>
+    <span class="tag t2">Track 2</span><span class="tag">PRs 24&ndash;25</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    Lets one fragment send its output to N destinations, in two modes: <em>broadcast</em>, where every
+    destination gets a full copy, and <em>hash</em>, where each destination gets a disjoint slice keyed by a
+    hash of chosen columns.
+  </p>
+
+  <h4>How it works</h4>
+  <p>
+    A sender is parked once and then owns one output stream per destination. Broadcast fans the same batch
+    out to all of them. Hash mode resolves the frontend's partition expressions to output column indices and
+    routes each row by hash. The Rust declarations for both modes come from feature 1.
+  </p>
+
+  <h4>What it enables</h4>
+  <p>
+    Distributed joins and distributed aggregation. Hash fan-out in particular is what lets the grouped
+    two-phase aggregation in feature 8 run across nodes.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>bed62cd1</code> + <code>666769dc</code> (PR 24); <code>b5609d01</code> + <code>21dbe458</code> (PR 25)</p>
+    <p><strong>Files</strong>: <code>experimental/starrocks/src/engine.rs:441-445</code> (one output stream per destination), <code>nixl_transport.rs:496-552</code> (lease per destination)</p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> Two silent-failure risks, and both produce wrong answers rather than
+      errors. First, the mode selector can fall through from hash to broadcast &mdash; and
+      <code>21dbe458</code> ships with <strong>no test</strong> for it. Second, an off-by-one in index
+      resolution mis-partitions silently. Also check the cleanup path: a partial remote-send failure strands
+      local receivers and leaks GPU memory. <code>b5609d01</code> narrows the set of accepted plans for
+      single-destination hash sinks and adds <strong>zero new tests</strong>.
+    </p>
+  </div>
+</div>
+
+<figure class="scroll">
+<svg viewBox="0 0 1000 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="fanout-title fanout-desc">
+  <title id="fanout-title">Broadcast versus hash-partitioned fan-out</title>
+  <desc id="fanout-desc">One fragment output feeds two alternative sink modes. Broadcast sends a full copy to every destination and occupies N times the staging arena. Hash partitioning sends disjoint slices and occupies one copy. A dashed arrow marks the untested fall-through from hash mode back to broadcast.</desc>
+  <defs>
+    <marker id="d4-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d4-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- ARROWS FIRST -->
+  <!-- source -> broadcast (up) -->
+  <path d="M 224,208 H 256 Q 264,208 264,200 V 132 Q 264,124 272,124 H 304" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <!-- source -> hash (down) -->
+  <path d="M 224,224 H 256 Q 264,224 264,232 V 324 Q 264,332 272,332 H 304" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <!-- broadcast -> dest -->
+  <line x1="496" y1="124" x2="592" y2="124" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d4-arrow-accent)"/>
+  <!-- hash -> dest -->
+  <line x1="496" y1="332" x2="592" y2="332" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <!-- fall-through, dashed, from the hash sink up into the broadcast sink -->
+  <path d="M 400,304 V 240 Q 400,232 392,232 H 360 Q 352,232 352,224 V 152" fill="none" stroke="#eb6c36" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#d4-arrow-accent)"/>
+
+  <!-- arrow labels -->
+  <rect x="516" y="104" width="60" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="546" y="113" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">N COPIES</text>
+  <rect x="516" y="312" width="60" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="546" y="321" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">1 COPY</text>
+  <rect x="412" y="262" width="112" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="468" y="271" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FALL-THROUGH</text>
+
+  <!-- NODES -->
+  <rect x="64" y="188" width="160" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="64" y="188" width="160" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="144" y="212" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fragment output</text>
+  <text x="144" y="228" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">one batch</text>
+
+  <rect x="304" y="96" width="192" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="304" y="96" width="192" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="400" y="120" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Broadcast sink</text>
+  <text x="400" y="136" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">declare_output_broadcast</text>
+
+  <rect x="304" y="304" width="192" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="304" y="304" width="192" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="400" y="328" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Hash sink</text>
+  <text x="400" y="344" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">declare_output_hash_key</text>
+
+  <rect x="592" y="96" width="216" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="592" y="96" width="216" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="700" y="120" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">N destinations, full copy</text>
+  <text x="700" y="136" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">arena: N x payload</text>
+
+  <rect x="592" y="304" width="216" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="592" y="304" width="216" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="700" y="328" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">N destinations, disjoint slices</text>
+  <text x="700" y="344" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">arena: 1 x payload</text>
+
+  <!-- legend -->
+  <line x1="64" y1="416" x2="936" y2="416" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="64" y="436" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+  <rect x="152" y="426" width="14" height="12" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="174" y="436" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Known memory cost &mdash; one lease per destination today</text>
+  <line x1="616" y1="432" x2="660" y2="432" stroke="#eb6c36" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#d4-arrow-accent)"/>
+  <text x="672" y="436" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Untested path &mdash; review target</text>
+</svg>
+<figcaption>
+  Broadcast takes <strong>one lease per destination</strong> even though the payload is byte-identical, so a
+  fan-out of N occupies N times the arena. The handoff lists this as an open optimisation: one lease, N
+  transmits, refcounted release. The dashed arrow is the mode selector falling through from hash back to
+  broadcast &mdash; it produces a wrong answer rather than an error, and it has no test.
+</figcaption>
+</figure>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>8. Two-phase aggregation translation</h3>
+    <span class="tag t2">Track 2</span><span class="tag">PRs 26&ndash;30</span><span class="tag risk">Wrong-answer risk</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    Teaches the plan translator to run the frontend's default two-phase aggregation: a <em>partial</em>
+    aggregate on each node, an exchange, then a <em>merge</em> that produces the final answer.
+  </p>
+
+  <h4>How it works</h4>
+  <p>
+    First a refactor replaces a boolean rejection with a proper phase classification. Then a data model maps
+    each aggregate function to its partial-state wire type. The partial and merge phases are translated
+    together, with the exchange schema overridden to carry partial state instead of final values. Grouping
+    keys follow. <code>avg</code> is special: it cannot be merged directly, so it is expanded into a
+    <code>sum</code>/<code>count</code> pair and divided in a finalizing projection. A CI harness then checks
+    the wire-type model against what the engine actually produces.
+  </p>
+
+  <h4>What it enables</h4>
+  <p>
+    Most of TPC-H. Without it the CN rejected the frontend's default plan shape, so queries had to be
+    rewritten by hand.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>a2582212</code> (PR 26), <code>178c1770</code> (PR 27), <code>35bb03c7</code> + <code>4c8193fe</code> + <code>759e0835</code> (PR 28), <code>7d349606</code> + <code>398e9c5f</code> + <code>c1d21506</code> (PR 29), <code>a9d7135b</code> (PR 30)</p>
+    <p><strong>New code</strong>: <code>crates/starrocks-plan-translator/src/agg_phase.rs</code>, <code>partial_state.rs</code>; harness at <code>tests/wire_type_parity.rs</code></p>
+    <p><strong>Cross-check</strong>: PR 4's characterisation test (<code>4bf9598e</code>) landed <em>before</em> this work &mdash; it is the independent oracle.</p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> <code>4c8193fe</code> is the riskiest commit in the whole range:
+      <em>every</em> failure mode here is a wrong number, not a crash. Check the exchange schema override
+      against PR 27's model line by line. For <code>avg</code>, check where the division happens and what
+      a null or zero count does. PR 26 claims behaviour preservation &mdash; that claim <em>is</em> the review:
+      confirm every previously-rejected plan is still rejected, because it deletes the only
+      double-aggregation guard and leaves safety positional. PR 30 is labelled <code>test</code> but adds a
+      <strong>new public FFI method</strong> (<code>Fragment::output_types</code>) across three layers, and it
+      must fail loudly on an unmodelled aggregate rather than skipping.
+    </p>
+  </div>
+</div>
+
+<figure class="scroll">
+<svg viewBox="0 0 1000 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="agg-title agg-desc">
+  <title id="agg-title">Two-phase aggregation through the plan translator</title>
+  <desc id="agg-desc">A left-to-right pipeline. The StarRocks frontend plan is classified by phase, translated into a partial aggregate, and sent across an exchange carrying partial state. The exchange node is highlighted as the riskiest contract. The merge phase then runs and exits through a finalizing projection, which is where average is divided. A CI parity harness checks the wire-type model against the engine.</desc>
+  <defs>
+    <marker id="d5-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d5-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- ARROWS FIRST -->
+  <line x1="208" y1="132" x2="264" y2="132" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <line x1="432" y1="132" x2="488" y2="132" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <line x1="632" y1="132" x2="712" y2="132" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d5-arrow-accent)"/>
+  <line x1="784" y1="160" x2="784" y2="280" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d5-arrow-accent)"/>
+  <line x1="712" y1="308" x2="632" y2="308" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <line x1="440" y1="308" x2="384" y2="308" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d5-arrow)"/>
+
+  <!-- arrow labels -->
+  <rect x="640" y="112" width="64" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="672" y="121" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PARTIAL</text>
+  <rect x="796" y="214" width="80" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="836" y="223" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">WIRE TYPE</text>
+  <rect x="392" y="288" width="40" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="412" y="297" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CI</text>
+
+  <!-- NODES row 1 -->
+  <rect x="64" y="104" width="144" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="64" y="104" width="144" height="56" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+  <text x="136" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">FE plan</text>
+  <text x="136" y="144" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">StarRocks frontend</text>
+
+  <rect x="264" y="104" width="168" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="264" y="104" width="168" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="348" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Phase classifier</text>
+  <text x="348" y="144" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">agg_phase.rs · PR 26</text>
+
+  <rect x="488" y="104" width="144" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="488" y="104" width="144" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="560" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Partial phase</text>
+  <text x="560" y="144" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PR 28</text>
+
+  <rect x="712" y="104" width="144" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="712" y="104" width="144" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="784" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Exchange</text>
+  <text x="784" y="144" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">partial_state.rs · PR 27</text>
+
+  <!-- NODES row 2 -->
+  <rect x="712" y="280" width="144" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="712" y="280" width="144" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="784" y="304" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Merge phase</text>
+  <text x="784" y="320" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PR 28</text>
+
+  <rect x="440" y="280" width="192" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="440" y="280" width="192" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="536" y="304" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Finalizing projection</text>
+  <text x="536" y="320" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">avg = sum / count · PR 29</text>
+
+  <rect x="192" y="280" width="192" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="192" y="280" width="192" height="56" rx="6" fill="rgba(235,108,54,0.05)" stroke="rgba(235,108,54,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="288" y="304" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Wire-type parity harness</text>
+  <text x="288" y="320" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">PR 30 · fails CI on drift</text>
+
+  <!-- legend -->
+  <line x1="64" y1="376" x2="936" y2="376" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="64" y="396" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+  <rect x="152" y="386" width="14" height="12" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="174" y="396" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">The contract that must match exactly &mdash; every failure here is a wrong number</text>
+  <rect x="656" y="386" width="14" height="12" rx="2" fill="rgba(235,108,54,0.05)" stroke="rgba(235,108,54,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="678" y="396" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Verification, not execution</text>
+</svg>
+<figcaption>
+  The exchange is the only place where two independently written models must agree: the translator's
+  wire-type table and the engine's actual partial-state encoding. PR 30 exists to make a future divergence
+  fail CI instead of silently producing wrong sums.
+</figcaption>
+</figure>
+
+<div class="feature">
+  <div class="feature-head">
+    <h3>9. Translator correctness &mdash; splits, slot order, slot resolution, types</h3>
+    <span class="tag t2">Track 2</span><span class="tag">PRs 31&ndash;34</span><span class="tag risk">Silent corruption</span>
+  </div>
+
+  <h4>Summary</h4>
+  <p>
+    The CN-side consumer of the byte-range work, plus four groups of translator fixes that all share one
+    property: when they are wrong, the query still succeeds and returns bad data.
+  </p>
+
+  <h4>How it works</h4>
+  <ul>
+    <li><strong>PR 31</strong> emits byte-range splits instead of refusing them, and adds back a narrower refusal for compressed containers, where byte offsets do not map to row groups.</li>
+    <li><strong>PR 32</strong> ships sort tuples and aggregation grouping keys in <em>materialized-slot</em> order. The CN was using declaration order; the frontend expects materialized order.</li>
+    <li><strong>PR 33</strong> fixes three slot-resolution defects: <code>CLONE_EXPR</code> unwrapped as identity, a fallback to slot id when the tuple id is stale, and materialising a project's common slots consumed above it.</li>
+    <li><strong>PR 34</strong> casts frontend-narrowed builtin returns back to their declared types.</li>
+  </ul>
+
+  <h4>What it enables</h4>
+  <p>
+    Correct results at scale. PR 32's grouping-key fix is what closed q03; PR 31 is what lets several CNs
+    split one large parquet file.
+  </p>
+
+  <div class="where">
+    <p><strong>Commits</strong>: <code>864e917a</code>, <code>397dd878</code>, <code>25e3a80f</code> (PR 31); <code>7b52c882</code>, <code>db5d5088</code> (PR 32); <code>9e3f97d9</code>, <code>56d541af</code>, <code>e934c7c7</code> (PR 33); <code>cff3618a</code> (PR 34)</p>
+    <p><strong>Files</strong>: <code>crates/starrocks-plan-translator/src/</code> &mdash; mostly translator plus large test fixtures</p>
+  </div>
+
+  <div class="watch">
+    <p>
+      <strong>For reviewers.</strong> In PR 31, the compressed-container guard must be conservative: any
+      offset it cannot resolve should fall back to a whole-file scan. Note that <code>864e917a</code> deletes
+      the previous whole-file safety net, and an all-empty-range node falls back to a full scan.
+      In PR 32, ask whether any <em>other</em> tuple-emitting site has the same
+      declaration-versus-materialized confusion. In PR 33, <code>56d541af</code>
+      <strong>relaxes a correctness guard</strong> &mdash; unique-by-id is not the same as correct-by-id, so
+      ask for an optimizer-version assertion. In PR 34, lossy narrowing should error rather than truncate;
+      the fix uses a hardcoded five-name allowlist, so it closes five instances, not the class.
+    </p>
+  </div>
+</div>
+
+<h2>How the PRs are organised</h2>
+
+<p>
+  The stack is <strong>layered on top of the target's existing streaming PRs</strong>, not merged into them.
+  The target's <code>3bea68de</code>, <code>641b77eb</code> and <code>d1c0dc6d</code> already sit on
+  <code>dev</code>; our stack branches from the tip of that and goes up.
+</p>
+
+<h3>Layering</h3>
+<ul>
+  <li><strong>Base:</strong> <code>origin/stream/15-fragment</code> &mdash; verified to be <code>origin/dev</code> (<code>f107ba88</code>) plus exactly three commits. Branching here inherits every upstream commit the source has never compiled against (#1320, #1444, #1447, #1450, #1456).</li>
+  <li><strong>Preparation commit:</strong> a single <code>xfer/base</code> branch that resolves the two renames once, before anything else is applied. This is the main reason to rebase rather than port &mdash; you resolve them once instead of 75 times.</li>
+  <li><strong>Then one branch per PR</strong>, each stacked on the previous one inside its track.</li>
+</ul>
+
+<table>
+  <thead><tr><th>Source symbol</th><th>Target symbol</th><th>Why it matters</th></tr></thead>
+  <tbody>
+    <tr><td><code>stream_lifecycle</code> (25 files)</td><td><code>batch_stream</code> (15 files)</td><td>The target adds a producer-error plane. Source code that assumes no error plane may need a <code>fail_input</code> call, not just a rename.</td></tr>
+    <tr><td><code>partition_spec::partition_mode</code> &mdash; <code>mode</code> is <strong>last</strong></td><td><code>sirius::op::partition_mode</code> &mdash; <code>mode</code> is <strong>first</strong></td><td>The source relies on <code>{keys, casts}</code> aggregate init still meaning hash. Every initialiser must be rewritten as designated init or reordered. <code>sed</code> cannot do this.</td></tr>
+    <tr><td><em>absent</em></td><td><code>stream_session::fail_output(id, error)</code></td><td>Target-only verb. Source error paths may need to call it.</td></tr>
+    <tr><td>inline cast logic</td><td><code>derive_key_cast_type()</code></td><td>Textual conflict even though the semantics are identical. Prefer the target's version and drop the source hunk.</td></tr>
+  </tbody>
+</table>
+
+<h3>Naming</h3>
+<ul>
+  <li><code>xfer/base</code> &mdash; the preparation branch that resolves the renames.</li>
+  <li><code>pr/NN-short-slug</code> &mdash; one per PR, numbered by the order in the table below. Example: <code>pr/01-rust-fragment-ffi</code>.</li>
+  <li>The number is the <em>review order</em>, so a reviewer can always tell what a branch sits on top of.</li>
+  <li>Three commit subjects need rewriting before they land: <code>4b72e708</code> ("step 1 gb200"), <code>031c2494</code> and <code>e3756be6</code> (both "minor"). Fifteen more have a prefix that does not match their content &mdash; the handoff lists them.</li>
+</ul>
+
+<h3>Ordering and dependencies</h3>
+
+<table>
+  <thead><tr><th class="num">PR</th><th>Title</th><th>Depends on</th><th>Risk</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Rust binding for the Fragment FFI</td><td>&mdash;</td><td>med</td></tr>
+    <tr><td class="num">2</td><td>Rust binding for fan-out, schema and decimal keys</td><td>1</td><td>med</td></tr>
+    <tr><td class="num">3</td><td>Load <code>core_functions</code> into embedded DuckDB</td><td>&mdash;</td><td>low</td></tr>
+    <tr><td class="num">4</td><td>Test: partial aggregates merge across the hop</td><td>1</td><td>low</td></tr>
+    <tr><td class="num">5</td><td>Plan Substrait inside a transaction</td><td>&mdash;</td><td>med</td></tr>
+    <tr><td class="num">6</td><td>Complete a query whose stream ends with zero batches</td><td>1</td><td>high</td></tr>
+    <tr><td class="num">7</td><td>Hash join with an empty build side completes</td><td>6</td><td>high</td></tr>
+    <tr><td class="num">8</td><td>Refuse a 64-bit integer sum that could overflow</td><td>1</td><td>high</td></tr>
+    <tr><td class="num">9</td><td>Bit-stable float grouped sums</td><td>&mdash;</td><td>high</td></tr>
+    <tr><td class="num">10</td><td>Byte-range to row-group ownership</td><td>&mdash;</td><td>med</td></tr>
+    <tr><td class="num">11</td><td>Byte ranges ride the Substrait plan into the scan</td><td>10</td><td>high</td></tr>
+    <tr><td class="num">12</td><td><code>cudaMalloc</code> exchange staging arena</td><td>&mdash;</td><td>high</td></tr>
+    <tr><td class="num">13</td><td><code>export_packed</code> / <code>push_packed</code></td><td>1, 12</td><td>high</td></tr>
+    <tr><td class="num">14</td><td>Zero-row exports no longer orphan leases</td><td>13</td><td>high</td></tr>
+    <tr><td class="num">15</td><td>Serve staging leases off the engine thread</td><td>14</td><td>high</td></tr>
+    <tr><td class="num">16</td><td>Fabric-handle arena for cross-host exchange</td><td>15</td><td>high</td></tr>
+    <tr><td class="num">17</td><td>Multi-fragment compute node</td><td>1, 3</td><td>high</td></tr>
+    <tr><td class="num">18</td><td>Cross the fragment boundary as native batches</td><td>17</td><td>high</td></tr>
+    <tr><td class="num">19</td><td>Per-instance GPU carve-outs + <code>FILES()</code> inference</td><td>17</td><td>high</td></tr>
+    <tr><td class="num">20</td><td>Route exchange senders by destination address</td><td>18</td><td>high</td></tr>
+    <tr><td class="num">21</td><td>Carry the exchange hop over nixl</td><td>16, 20</td><td>high</td></tr>
+    <tr><td class="num">22</td><td>A failing fragment fails its whole query, loudly</td><td>21</td><td>high</td></tr>
+    <tr><td class="num">23</td><td>rustfmt pass over the CN crate</td><td>22</td><td>low</td></tr>
+    <tr><td class="num">24</td><td>Park a sender once, fan out to N destinations</td><td>2, 20, 23</td><td>high</td></tr>
+    <tr><td class="num">25</td><td>Hash-partitioned fan-out through the CN</td><td>24</td><td>high</td></tr>
+    <tr><td class="num">26</td><td>Classify aggregation phases</td><td>23</td><td>med</td></tr>
+    <tr><td class="num">27</td><td>Model the partial-state wire type per aggregate</td><td>26</td><td>low</td></tr>
+    <tr><td class="num">28</td><td>Translate the partial and merge phases</td><td>4, 27</td><td>high</td></tr>
+    <tr><td class="num">29</td><td>Grouped two-phase aggregation and <code>avg</code> expansion</td><td>28</td><td>high</td></tr>
+    <tr><td class="num">30</td><td>Wire-type model checked against the engine in CI</td><td>29</td><td>high</td></tr>
+    <tr><td class="num">31</td><td>CN emits byte-range splits; refuses compressed containers</td><td>11, 23</td><td>high</td></tr>
+    <tr><td class="num">32</td><td>Sort and aggregation tuples in materialized-slot order</td><td>29</td><td>high</td></tr>
+    <tr><td class="num">33</td><td>Slot resolution: CLONE_EXPR, stale tuple ids, common slots</td><td>32</td><td>high</td></tr>
+    <tr><td class="num">34</td><td>Cast FE-narrowed builtin returns to declared types</td><td>33</td><td>med</td></tr>
+  </tbody>
+</table>
+
+<p class="aside">
+  Note that PR 23, a pure formatting pass, is a dependency of PRs 24, 26 and 31. That is deliberate: later
+  diffs are written against the reflowed lines, so applying it out of order creates conflicts everywhere.
+</p>
+
+<h2>Bringing the commits across</h2>
+
+<figure class="scroll">
+<svg viewBox="0 0 1000 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="xfer-title xfer-desc">
+  <title id="xfer-title">How commits move from the source branch into the PR stack</title>
+  <desc id="xfer-desc">Two rows. The top row shows the source branch producing patches with git format-patch, then sixteen commits being dropped and eighty-four kept, then a rename mapping applied to the patches. The bottom row shows the target base branch, the preparation branch that resolves the renames, the stack of PR branches, and finally review and merge.</desc>
+  <defs>
+    <marker id="d6-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d6-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- ARROWS FIRST -->
+  <line x1="200" y1="140" x2="256" y2="140" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d6-arrow)"/>
+  <line x1="408" y1="140" x2="464" y2="140" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d6-arrow)"/>
+  <line x1="624" y1="140" x2="680" y2="140" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d6-arrow)"/>
+  <!-- rename map down to xfer/base -->
+  <path d="M 756,168 V 232 Q 756,240 748,240 H 348 Q 340,240 340,248 V 296" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d6-arrow-accent)"/>
+  <!-- base -> xfer/base -->
+  <line x1="216" y1="324" x2="272" y2="324" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#d6-arrow-accent)"/>
+  <line x1="408" y1="324" x2="464" y2="324" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d6-arrow)"/>
+  <line x1="624" y1="324" x2="680" y2="324" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d6-arrow)"/>
+
+  <!-- arrow labels -->
+  <rect x="208" y="120" width="40" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="228" y="129" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">100</text>
+  <rect x="412" y="120" width="48" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="436" y="129" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PATCH</text>
+  <rect x="628" y="120" width="48" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="652" y="129" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">84 KEPT</text>
+  <rect x="440" y="222" width="72" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="476" y="231" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SED + HAND</text>
+  <rect x="220" y="304" width="48" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="244" y="313" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BRANCH</text>
+  <rect x="412" y="304" width="48" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="436" y="313" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GIT AM</text>
+  <rect x="628" y="304" width="48" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="652" y="313" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">STACK</text>
+
+  <!-- ROW 1 NODES -->
+  <rect x="48" y="112" width="152" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="48" y="112" width="152" height="56" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+  <text x="124" y="136" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">demo-multi-cn</text>
+  <text x="124" y="152" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">790612fb</text>
+
+  <rect x="256" y="112" width="152" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="256" y="112" width="152" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="332" y="136" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">format-patch</text>
+  <text x="332" y="152" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/tmp/xfer</text>
+
+  <rect x="464" y="112" width="160" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="464" y="112" width="160" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="544" y="136" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Drop 16, keep 84</text>
+  <text x="544" y="152" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">5 are rust-only</text>
+
+  <rect x="680" y="112" width="152" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="680" y="112" width="152" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="756" y="136" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Rename map</text>
+  <text x="756" y="152" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">2 renames, once</text>
+
+  <!-- ROW 2 NODES -->
+  <rect x="48" y="296" width="168" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="48" y="296" width="168" height="56" rx="6" fill="rgba(45,49,66,0.05)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+  <text x="132" y="320" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">stream/15-fragment</text>
+  <text x="132" y="336" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">d1c0dc6d = dev + 3</text>
+
+  <rect x="272" y="296" width="136" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="272" y="296" width="136" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="340" y="320" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">xfer/base</text>
+  <text x="340" y="336" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">green build first</text>
+
+  <rect x="464" y="296" width="160" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="464" y="296" width="160" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="544" y="320" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">pr/01 ... pr/34</text>
+  <text x="544" y="336" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">one branch per PR</text>
+
+  <rect x="680" y="296" width="152" height="56" rx="6" fill="#f5f5f5"/>
+  <rect x="680" y="296" width="152" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="756" y="320" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Review and merge</text>
+  <text x="756" y="336" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">track by track</text>
+
+  <!-- legend -->
+  <line x1="48" y1="416" x2="952" y2="416" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="48" y="436" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+  <rect x="136" y="426" width="14" height="12" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+  <text x="158" y="436" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Do this once, before anything else &mdash; it is the whole reason to rebase</text>
+  <rect x="608" y="426" width="14" height="12" rx="2" fill="rgba(45,49,66,0.05)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+  <text x="630" y="436" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Existing branch, not created by us</text>
+</svg>
+<figcaption>
+  There is no cherry-pick step because there are no shared objects. Adding the source as a remote is still
+  worth doing &mdash; it makes the source SHAs available locally so you can run <code>git diff</code> and
+  <code>git format-patch</code> from inside the target &mdash; but it does not make the histories related.
+</figcaption>
+</figure>
+
+<h3>The commands</h3>
+
+<pre style="background:var(--white);border:1px solid var(--rule);border-radius:6px;padding:1rem;overflow-x:auto;font-family:var(--font-mono);font-size:0.78rem;line-height:1.7"># 0 — establish a green baseline BEFORE applying anything.
+#     The source branch could not build its own test target for ~16 days.
+cd /home/prestouser/aocsa/aocsa_upstream/sirius
+git fetch --all
+git submodule update --init --recursive     # worktrees do NOT auto-init
+pixi run make &amp;&amp; pixi run make test
+
+# 1 — make the source objects reachable (does NOT relate the histories)
+git remote add sirius-db /home/prestouser/aocsa/sirius
+git fetch sirius-db demo-multi-cn:refs/remotes/sirius-db/demo-multi-cn
+
+# 2 — generate the series, then delete the 16 dropped patches by number
+cd /home/prestouser/aocsa/sirius
+git format-patch --no-merges -o /tmp/xfer efdf3dc..790612fb
+
+# 3 — the 5 partial commits: Rust hunks ONLY
+for h in f8249e7c cfad5dce 02aaa6c0 d5c59a0a 14333ead; do
+  git format-patch -1 "$h" --stdout -- rust/ &gt; /tmp/xfer/rustonly-$h.patch
+done
+grep -c '^+++ b/rust/' /tmp/xfer/rustonly-*.patch   # each must be non-empty
+
+# 4 — resolve the renames ONCE on the preparation branch
+cd /home/prestouser/aocsa/aocsa_upstream/sirius
+git checkout -b xfer/base origin/stream/15-fragment
+sed -i 's/\bstream_lifecycle\b/batch_stream/g' /tmp/xfer/00*.patch
+# then hand-fix the partition_spec aggregate initialisers — sed cannot reorder members
+
+# 5 — one branch per PR, in the table order
+git checkout -b pr/01-rust-fragment-ffi xfer/base
+git am --3way --keep-non-patch /tmp/xfer/rustonly-f8249e7c.patch</pre>
+
+<h3>The 16 commits to drop</h3>
+<p>
+  Every one is verified present in the target tree, file by file. Re-landing any of them conflicts head-on
+  with the target's better-reviewed version.
+</p>
+<table>
+  <thead><tr><th>Absorbed into</th><th>Source commits</th></tr></thead>
+  <tbody>
+    <tr><td><code>3bea68de</code><br><span style="color:var(--muted);font-size:0.9em">streaming sink</span></td><td><code>2d26d9d8</code> <code>97f42556</code> <code>7e2d3c2c</code> <code>61803a72</code> <code>f779b30e</code> <code>876576e3</code></td></tr>
+    <tr><td><code>641b77eb</code><br><span style="color:var(--muted);font-size:0.9em">stream_session</span></td><td><code>e5831f8f</code> <code>67c35837</code> <code>00a4ce64</code></td></tr>
+    <tr><td><code>d1c0dc6d</code><br><span style="color:var(--muted);font-size:0.9em">streaming fragment</span></td><td><code>c27832ac</code> <code>cb5e906d</code> <code>d87a955b</code> <code>655dfa2b</code> <code>5c456e04</code> <code>adacda38</code> <code>77f7b825</code></td></tr>
+  </tbody>
+</table>
+
+<h2>How to review the stack</h2>
+
+<h3>Review track by track, not PR by PR</h3>
+<ol>
+  <li><strong>Track 1 must build and pass with zero <code>experimental/starrocks</code> changes applied.</strong> If it does not, a track boundary has leaked. This is the single most useful check in the whole plan.</li>
+  <li>After PR 16, run the GPU tests by hand &mdash; <code>[streaming_fragment]</code>, <code>[batch_stream]</code>, <code>[staging_arena]</code>. They do not run in a CPU-only CI lane.</li>
+  <li>After PR 34, <code>cargo test --workspace --no-default-features</code> must be green. Remember this <em>excludes</em> all of <code>nixl_transport.rs</code>.</li>
+</ol>
+
+<h3>Conflict strategy, in priority order</h3>
+<ol>
+  <li>A conflict in <code>src/exec/</code>, <code>src/op/sirius_physical_streaming_sink.cpp</code>, <code>src/include/op/</code> or <code>src/pipeline/</code> almost certainly means you are re-landing something already excluded. <strong>Stop and check the drop list.</strong></li>
+  <li>When source and target disagree on streaming semantics, <strong>take the target</strong>. It went through upstream review and carries the error plane the source lacks.</li>
+  <li>A <code>.rej</code> in <code>experimental/starrocks/</code> is usually base drift from the rustfmt pass. Apply PR 23 before anything downstream of it.</li>
+  <li><code>CMakeLists.txt</code> conflicts are almost always additive &mdash; both sides add sources. Union them.</li>
+  <li>If a source commit modifies a file the target deleted, drop the whole hunk. That is a signal the CN track has no base there yet.</li>
+</ol>
+
+<h3>What "it compiles" does not prove</h3>
+<ul>
+  <li><strong>Bit-exactness.</strong> Run PR 9's permuted-order tests and the two-sender determinism test on the target build. If the <code>batch_stream</code> rename or the <code>partition_mode</code> reordering perturbed the hash path, these fail loudly instead of silently mis-partitioning.</li>
+  <li><strong>Numeric agreement.</strong> Diff a 22-query sweep against a single-process DuckDB run. Expect the <em>known</em> ~0.1% deficit on every <code>sum(l_extendedprice*(1-l_discount))</code> &mdash; it is <strong>not fixed anywhere in this range</strong>. Any other divergence is a transfer defect.</li>
+  <li><strong>Endurance.</strong> Three consecutive sweeps with zero restarts and the same CN process ids. This is the only way to prove PR 14's lease fix survived the transfer.</li>
+</ul>
+
+<h2>Known gaps in this work</h2>
+
+<p>These are recorded so reviewers do not have to rediscover them. All are from the handoff's §G.</p>
+
+<table>
+  <thead><tr><th>Item</th><th>Where</th><th>Impact</th></tr></thead>
+  <tbody>
+    <tr><td>One monolithic staging lease</td><td><code>sirius_ffi.cpp:755</code></td><td>Leases the whole table at once even though the packer already chunks at <code>:761</code>. Direct cause of q17 failing at SF500 with a 16&nbsp;GiB arena.</td></tr>
+    <tr><td>One lease per broadcast destination</td><td><code>nixl_transport.rs:496-552</code></td><td>N&times; arena for byte-identical data.</td></tr>
+    <tr><td>Receiver holds leases until drain</td><td><code>local_exchange.rs:44</code></td><td>High-water mark is cumulative epoch bytes, not the in-flight set. A retention bug, not a sizing shortfall.</td></tr>
+    <tr><td><code>SIRIUS_EXCHANGE_STAGING_BYTES</code> undocumented</td><td><code>configuration.md</code></td><td>Load-bearing, no default, throws when unset. Documented with four contradictory values across runbooks.</td></tr>
+    <tr><td>No test for <code>stream_plan_bindings.cpp</code></td><td><code>src/exec/</code></td><td>Six of seven translation units have a matching test; this high-risk one does not.</td></tr>
+    <tr><td><code>streaming-sessions.md</code> is 96 commits stale</td><td><code>docs/super-sirius/</code></td><td>Its "Not here yet" list names four things that shipped inside this range. <code>CLAUDE.md</code> tells you to read it first, so it actively misleads.</td></tr>
+  </tbody>
+</table>
+
+<h2>Missing info / Questions</h2>
+
+<div class="q">
+<p><strong>These are open and should be answered before anyone applies a patch.</strong> Items 1&ndash;4 come from the handoff's §J; item 5 is a gap in this document specifically.</p>
+<ol>
+  <li><strong>Is <code>790612fb</code> the intended tip?</strong> The originally requested end commit <code>fa836455846c71572bb5156ace9798aae32f1c88</code> <em>does not exist in either repository</em>. Everything here assumes <code>790612fb</code>.</li>
+  <li><strong>Is <code>aocsa/sirius</code> the destination, or a staging fork for <code>sirius-db/sirius</code>?</strong> This changes whether the subject rewrites and path parameterisation are needed at all.</li>
+  <li><strong>Are the CN and benchmark tracks wanted upstream?</strong> The target carries no <code>nixl_transport.rs</code>, <code>engine_settings.rs</code>, <code>partial_state.rs</code>, <code>agg_phase.rs</code> or <code>.claude/skills/</code> today. Whether it <em>wants</em> them is a product decision, not a merge decision.</li>
+  <li><strong>Should the three <code>derived-sirius-config.yaml</code> files be tracked?</strong> They are regenerated on every CN start, so tracking them guarantees a permanently dirty tree &mdash; and the committed values have already drifted from the code defaults.</li>
+  <li><strong>There are no PR URLs to link.</strong> None of these 34 PRs exist yet. The only real PR references are the target's merged <code>#1320</code> (source <code>#836</code>) and the source's <code>#837</code>/<code>#838</code>. Everything else is referenced by commit hash and file path. If you want live links, the PRs have to be opened first.</li>
+</ol>
+</div>
+
+<p class="aside">
+  One more thing worth saying out loud: nothing in this document is a correctness claim about query results.
+  The benchmark harness scores a query as passing when it exits cleanly with at least one row &mdash; it never
+  compares values. The DuckDB oracle diff has not been run.
+</p>
+
+<footer>
+  Source: STREAMING-PRIMITIVES-HANDOFF.md &middot; scope PRs 1&ndash;34 &middot; base origin/stream&#47;15-fragment (d1c0dc6d)
+  &middot; diagrams: diagram-design, default editorial skin
+</footer>
+
+</div>
+</body>
+</html>

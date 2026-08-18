@@ -656,7 +656,13 @@ if [ "$needs_pixi" = 1 ]; then
   [ -f "$C_MANIFEST" ]   || die "no Engine C pixi manifest at $C_MANIFEST (set C_MANIFEST)"
 fi
 command -v numactl >/dev/null 2>&1 || die "numactl not found -- every engine here is NUMA-pinned"
-command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found -- cannot verify the GPUs are free"
+needs_gpu=0
+for e in $ENGINE_LIST; do
+  case $e in A|C) needs_gpu=1 ;; esac
+done
+if [ "$needs_gpu" = 1 ]; then
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found -- engines A and C need it to verify the GPUs are free"
+fi
 
 MYSQL=("$MYSQL_BIN" --host 127.0.0.1 --port "$FE_PORT" --user root --batch --connect-timeout=5)
 
@@ -816,6 +822,14 @@ run_sql_sweep() {
     for r in $(seq 0 "$RUNS"); do
       if [ "$r" -eq 0 ]; then phase=cold; tmo=$COLD_TIMEOUT; else phase=warm; tmo=$WARM_TIMEOUT; fi
       f=$outdir/$q.r$r.out
+      # PRE_QUERY_HOOK: run before EVERY timed execution, outside the t0..t1 window.
+      # Exists so Engine A can be given the same cold definition cudf-polars gets from
+      # `--io-mode cold`: posix_fadvise(POSIX_FADV_DONTNEED) over the dataset, which needs
+      # no root. Without it "cold" for A is only first-contact-after-cluster-start, and a
+      # cold-vs-cold comparison against C is not possible. Unset -> unchanged behaviour.
+      if [ -n "${PRE_QUERY_HOOK:-}" ]; then
+        "$PRE_QUERY_HOOK" "$DATA" >> "$outdir/pre-query-hook.log" 2>&1 || true
+      fi
       t0=$(date +%s%3N)
       timeout "$tmo" "${MYSQL[@]}" -e "$sqltext" > "$f" 2>&1
       rc=$?
@@ -1067,13 +1081,55 @@ B_OUT=$OUT/engineB
 B_NUM_BES=${B_NUM_BES:-2}
 B_STARTED=0
 
+# 2 BEs: one process per Grace socket, via start_be.sh --numa (whole node).
+# 4 BEs: --numa cannot express a half socket, so wrap with physcpubind. The CPU
+# sets match configs/gb200-4gpu/engine-b/setup-engine-b-gb200.sh. $1=dry prints
+# the commands and starts nothing.
+engine_b_start_bes() {
+  local i node cpus spec mode=${1:-}
+  local nodes; IFS=',' read -r -a nodes <<< "$CPU_NODES"
+  if [ "$B_NUM_BES" = 4 ]; then
+    # be1 node0 0-35; be2 node1 72-107; be3 node0 36-71; be4 node1 108-143
+    local -a binds=("0-35:0" "72-107:1" "36-71:0" "108-143:1")
+    for i in 1 2 3 4; do
+      spec=${binds[$((i - 1))]}
+      cpus=${spec%%:*}; node=${spec##*:}
+      if [ "$mode" = dry ]; then
+        say "  [dry-run] would start: numactl --physcpubind=$cpus --membind=$node -- $B_DIR/be$i/bin/start_be.sh --daemon"
+      else
+        say "    be$i numactl --physcpubind=$cpus --membind=$node"
+        numactl --physcpubind="$cpus" --membind="$node" -- \
+          "$B_DIR/be$i/bin/start_be.sh" --daemon >> "$B_OUT/be$i.log" 2>&1
+      fi
+    done
+    return 0
+  fi
+  for i in $(seq 1 "$B_NUM_BES"); do
+    node=${nodes[$(( (i - 1) % ${#nodes[@]} ))]}
+    if [ "$mode" = dry ]; then
+      say "  [dry-run] would start: $B_DIR/be$i/bin/start_be.sh --daemon --numa $node"
+    else
+      say "    be$i --numa $node"
+      "$B_DIR/be$i/bin/start_be.sh" --daemon --numa "$node" >> "$B_OUT/be$i.log" 2>&1
+    fi
+  done
+}
+
 engine_b_up() {
   local i hb
+  case "$B_NUM_BES" in
+    2|4) ;;
+    *) warn "engine B: B_NUM_BES=$B_NUM_BES is not 2 or 4.
+     The committed confs only exist for those topologies (2 = headline, 4 = sensitivity).
+     Install with NUM_BES=$B_NUM_BES configs/gb200-4gpu/engine-b/setup-engine-b-gb200.sh -- except
+     that script itself only accepts 2 or 4. Aborting."
+       return 1 ;;
+  esac
   [ -x "$B_DIR/fe/bin/start_fe.sh" ] ||
     { warn "engine B: no FE at $B_DIR/fe -- run configs/gb200-4gpu/engine-b/setup-engine-b-gb200.sh first"; return 1; }
   for i in $(seq 1 "$B_NUM_BES"); do
     [ -x "$B_DIR/be$i/bin/start_be.sh" ] ||
-      { warn "engine B: no be$i at $B_DIR/be$i -- run setup-engine-b-gb200.sh first"; return 1; }
+      { warn "engine B: no be$i at $B_DIR/be$i -- run NUM_BES=$B_NUM_BES setup-engine-b-gb200.sh first"; return 1; }
     if ! grep -qE '^\s*num_cores\s*=' "$B_DIR/be$i/conf/be.conf" 2>/dev/null; then
       warn "engine B: be$i/conf/be.conf has no num_cores.
      StarRocks' CpuInfo never calls sched_getaffinity, so a NUMA-pinned BE still reports all 144
@@ -1089,11 +1145,13 @@ engine_b_up() {
       return 1
     fi
   done
-  for i in 3 4; do
-    [ -d "$B_DIR/be$i" ] && warn "engine B: $B_DIR/be$i exists and is NOT being started.
+  if [ "$B_NUM_BES" = 2 ]; then
+    for i in 3 4; do
+      [ -d "$B_DIR/be$i" ] && warn "engine B: $B_DIR/be$i exists and is NOT being started.
      It still carries the 218-byte trap conf from benchmarks/tpch/setup-engine-b.sh. Nothing here
      starts it, and the backend-count gate below would catch it if something else did."
-  done
+    done
+  fi
 
   say "  starting engine B FE (membind $CPU_NODES) and $B_NUM_BES BEs"
   numactl --membind="$CPU_NODES" -- "$B_DIR/fe/bin/start_fe.sh" --daemon >> "$B_OUT/fe.log" 2>&1
@@ -1101,13 +1159,9 @@ engine_b_up() {
   fe_up 300 || { warn "engine B: the FE never answered on port $FE_PORT"; return 1; }
 
   # --numa N -> start_backend.sh's `numactl --cpubind N --membind N`. Only CPU-bearing nodes are
-  # ever passed: --numa 2/10/18/26 would membind a BE heap into a GPU's HBM.
-  local nodes; IFS=',' read -r -a nodes <<< "$CPU_NODES"
-  for i in $(seq 1 "$B_NUM_BES"); do
-    local node=${nodes[$(( (i - 1) % ${#nodes[@]} ))]}
-    say "    be$i --numa $node"
-    "$B_DIR/be$i/bin/start_be.sh" --daemon --numa "$node" >> "$B_OUT/be$i.log" 2>&1
-  done
+  # ever passed: --numa 2/10/18/26 would membind a BE heap into a GPU's HBM. 4-BE uses
+  # physcpubind instead; see engine_b_start_bes.
+  engine_b_start_bes
 
   for i in $(seq 1 "$B_NUM_BES"); do
     hb=$((9050 + (i - 1) * 2))
@@ -1123,24 +1177,55 @@ engine_b_up() {
   fi
   say "  $B_NUM_BES backends alive and settled"
 
-  # CpuCores is the gate that proves num_cores took effect. 144 here means every BE thread pool is
-  # sized for the whole box while numactl gives it half -- the exact strawman that produced the
-  # published Engine B numbers.
-  local cores
+  # CpuCores is the gate that proves num_cores took effect. StarRocks' CpuInfo ignores the
+  # cpuset, so without num_cores a pinned BE still reports nproc and every thread pool is
+  # sized for the whole box. Expected value is whatever be1.conf says, not a hardcoded 144.
+  local cores want_cores c
+  want_cores=$(awk -F= '/^[[:space:]]*num_cores[[:space:]]*=/ {
+      gsub(/[[:space:]]/, "", $2); print $2; exit
+    }' "$B_DIR/be1/conf/be.conf")
+  [[ $want_cores =~ ^[1-9][0-9]*$ ]] || {
+    warn "engine B: could not read num_cores from $B_DIR/be1/conf/be.conf. Aborting."; return 1
+  }
   cores=$("${MYSQL[@]}" -e 'SHOW BACKENDS;' 2>/dev/null | awk -F'\t' '
     NR==1 { for (i=1;i<=NF;i++) if ($i=="CpuCores") c=i; next } c { print $c }' | tr '\n' ' ')
-  say "  backend CpuCores: $cores"
-  case " $cores " in *" 144 "*)
-    warn "engine B: a backend reports CpuCores=144 despite num_cores in its conf.
-     Every thread pool is then sized for the whole box on a half-socket pin. This is not a fair
-     CPU baseline. Aborting engine B." ; return 1 ;;
-  esac
+  say "  backend CpuCores: $cores  (want $want_cores each, from be.conf num_cores)"
+  for c in $cores; do
+    if [ "$c" != "$want_cores" ]; then
+      warn "engine B: a backend reports CpuCores=$c, expected $want_cores (be.conf num_cores).
+     Wrong confs are installed, or num_cores did not take effect. Re-run
+     NUM_BES=$B_NUM_BES configs/gb200-4gpu/engine-b/setup-engine-b-gb200.sh, and set num_cores
+     to (physical cores / BEs) for this box. Aborting."
+      return 1
+    fi
+  done
 
   if ! set_and_verify_pipeline "$PIPELINE"; then
     warn "engine B: enable_pipeline_engine read back as '${PIPELINE_READBACK:-<empty>}', wanted '$PIPELINE'. Aborting."
     return 1
   fi
   say "  enable_pipeline_engine = $PIPELINE_READBACK (set explicitly and read back)"
+  # B_EXTRA_SQL: semicolon-separated statements applied once, after the cluster has
+  # gated, so Engine B can be tuned without editing be.conf or restarting the BEs.
+  # Session/global variables only -- be.conf knobs (num_cores, mem_limit, datacache)
+  # need a BE restart and are set by setup-engine-b-gb200.sh.
+  # Each statement is READ BACK where it is a variable, so a silently-rejected
+  # setting cannot masquerade as a tuning result. Unset -> unchanged behaviour.
+  if [ -n "${B_EXTRA_SQL:-}" ]; then
+    say "  applying B_EXTRA_SQL"
+    local stmt name val got
+    while IFS= read -r stmt; do
+      [ -n "${stmt// /}" ] || continue
+      sql "$stmt;" >/dev/null 2>&1
+      name=$(sed -nE 's/.*SET[[:space:]]+(GLOBAL[[:space:]]+)?([a-zA-Z_]+)[[:space:]]*=.*/\2/p' <<<"$stmt")
+      val=$(sed -nE "s/.*=[[:space:]]*'?([^';]*)'?[[:space:]]*$/\1/p" <<<"$stmt")
+      if [ -n "$name" ]; then
+        got=$("${MYSQL[@]}" -e "SHOW GLOBAL VARIABLES LIKE '$name';" 2>/dev/null | awk 'NR==2{print $2}')
+        if [ "$got" = "$val" ]; then say "    $name = $got"
+        else warn "engine B: $name read back as '${got:-<empty>}', wanted '$val' -- NOT applied"; fi
+      fi
+    done <<< "${B_EXTRA_SQL//;/$'\n'}"
+  fi
   return 0
 }
 
@@ -1182,11 +1267,11 @@ engine_b() {
 
   if [ "$DRY_RUN" = 1 ]; then
     say "  [dry-run] would start: numactl --membind=$CPU_NODES -- $B_DIR/fe/bin/start_fe.sh --daemon"
+    engine_b_start_bes dry
     for i in $(seq 1 "$B_NUM_BES"); do
-      say "  [dry-run] would start: $B_DIR/be$i/bin/start_be.sh --daemon --numa $(( (i-1) % 2 ))"
       say "  [dry-run] would register: ALTER SYSTEM ADD BACKEND \"127.0.0.1:$((9050 + (i-1)*2))\""
     done
-    say "  [dry-run] would gate on: exactly $B_NUM_BES alive backends, CpuCores != 144, absolute mem_limit"
+    say "  [dry-run] would gate on: exactly $B_NUM_BES alive backends, CpuCores=num_cores from be.conf, absolute mem_limit"
     say "  [dry-run] would run $NQUERIES queries x (1 cold + $RUNS warm)"
     return 0
   fi
@@ -1229,6 +1314,13 @@ engine_c() {
   local ngpus=${C_GPUS:-$NGPU}
   local qids; qids=$(for q in $QUERIES; do printf '%d,' "$((10#${q#q}))"; done); qids=${qids%,}
   local iters=$((RUNS + 1))              # iteration 0 = the warm-up; 1..RUNS are the timed runs
+  # C_IO_MODE / C_ITERATIONS: opt-in overrides so the OLD recipe
+  # (--io-mode lukewarm --iterations 1) can be reproduced verbatim for comparison.
+  # WARNING: with iterations=1 cudf-polars' single number IS the first touch (see the
+  # header note at :59) -- a 1.4-4.6x warm-up penalty that Engine A does not pay,
+  # because A gets a cold run plus timed warm runs. Unset -> hot/(RUNS+1), unchanged.
+  local io_mode=${C_IO_MODE:-hot}
+  iters=${C_ITERATIONS:-$iters}
 
   # NUMA. --interleave=all resolves to {0,1,2,10,18,26} on this box and four of those six nodes
   # are GPU HBM with zero CPUs -- see caveat 4 in the header. The node list is derived from the
@@ -1265,7 +1357,7 @@ engine_c() {
              python -m cudf_polars.streaming.benchmarks.pdsh "$qids"
              --frontend ray --num-gpus "$ngpus"
              --path "$DATA" --suffix ""
-             --io-mode hot --iterations "$iters"
+             --io-mode "$io_mode" --iterations "$iters"
              --results-directory "$C_OUT/results-parquet"
              -o "$jsonl")
 
@@ -1279,7 +1371,7 @@ engine_c() {
   prov "num_gpus          = $ngpus"
   prov "frontend          = ray"
   prov "suffix            = \"\"  (REQUIRED for the <table>/*.parquet subdirectory layout)"
-  prov "io_mode           = hot, iterations = $iters"
+  prov "io_mode           = $io_mode, iterations = $iters"
   prov "                    iteration 0 is the warm-up. NOTE: in cudf-polars 26.8 'hot' only"
   prov "                    VALIDATES iterations>=2 (utils.py:521) and still RECORDS iteration 0,"
   prov "                    so this script maps iteration 0 -> phase=cold itself."

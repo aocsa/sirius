@@ -6,13 +6,27 @@ sirius:
       usage_limit_bytes: "140GiB"
       reservation_limit_fraction: 1.0
     host:
-      capacity_bytes: "160GiB"
+      capacity_bytes: "128GiB"
   executor:
     scan_manager:
+      memory_prefetcher:
+        enable: true
+        num_threads: 4
+      num_threads: 18
+      uring_n_reactors: 8
+      enable_prefetch_cache: false
       cpu_affinity: [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143]
     task_creator:
       cpu_affinity: [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143]
     downgrade:
       cpu_affinity: [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143]
+    pipeline:
+      num_threads: 8
+  operator_params:
+    scan_task_batch_size: 5GB
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 32GB
+    concat_batch_bytes: 5GB
+    max_build_hash_table_bytes: 32GB
   telemetry:
     output_directory: ".cn3/telemetry"
