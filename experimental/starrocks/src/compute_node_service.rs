@@ -1063,15 +1063,15 @@ impl ServiceCore {
                 ));
             }
             let route = self.route_destination(destination)?;
-            if let DestinationRoute::Remote { host, brpc_port } = &route {
-                if self.transport.is_none() {
-                    return Err(format!(
-                        "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
-                         tier, which is not active: build the CN with the `nixl-transport` \
-                         feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the \
-                         exchange staging arena exists"
-                    ));
-                }
+            if let DestinationRoute::Remote { host, brpc_port } = &route
+                && self.transport.is_none()
+            {
+                return Err(format!(
+                    "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
+                     tier, which is not active: build the CN with the `nixl-transport` \
+                     feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the \
+                     exchange staging arena exists"
+                ));
             }
             slots.push(slot);
             routes.push(route);
