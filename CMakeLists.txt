@@ -294,6 +294,7 @@ set(EXTENSION_SOURCES
     src/exec/exchange_staging_arena.cpp
     src/exec/stream_session.cpp
     src/exec/stream_bind_catalog.cpp
+    src/exec/stream_lifecycle.cpp
     src/exec/stream_plan_bindings.cpp
     src/exec/streaming_fragment.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
