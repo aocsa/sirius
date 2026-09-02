@@ -755,9 +755,7 @@ impl ServiceCore {
         let mut lines = Vec::with_capacity(total);
         for (index, command) in commands.into_iter().enumerate() {
             let line = match &command {
-                crate::admin_command::AdminCommand::PinTable(spec) => {
-                    self.executor.pin_table(spec)
-                }
+                crate::admin_command::AdminCommand::PinTable(spec) => self.executor.pin_table(spec),
                 crate::admin_command::AdminCommand::UnpinTable { name } => {
                     self.executor.unpin_table(name)
                 }
@@ -1728,10 +1726,7 @@ mod tests {
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].name, "lineitem");
         assert_eq!(pins[0].tier, crate::fragment_executor::PinTier::Gpu);
-        assert_eq!(
-            pins[0].cols,
-            Some(vec!["a".to_string(), "b".to_string()])
-        );
+        assert_eq!(pins[0].cols, Some(vec!["a".to_string(), "b".to_string()]));
         assert_eq!(executor.unpins.lock().unwrap().as_slice(), ["old_pin"]);
     }
 

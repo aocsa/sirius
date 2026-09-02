@@ -396,10 +396,10 @@ impl Fragment<'_> {
         let mut offset = 0u64;
         let mut len = 0u64;
         let mut rows = 0u64;
-        let metadata = self
-            .inner
-            .pin_mut()
-            .export_packed(stream_id, &mut offset, &mut len, &mut rows)?;
+        let metadata =
+            self.inner
+                .pin_mut()
+                .export_packed(stream_id, &mut offset, &mut len, &mut rows)?;
         if metadata.is_null() {
             return Ok(None);
         }

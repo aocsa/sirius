@@ -700,6 +700,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
+    test/cpp/exec/test_stream_lifecycle.cpp
     test/cpp/exec/test_stream_session.cpp
     test/cpp/exec/test_streaming_fragment.cpp
     test/cpp/expression/test_ast_aggregate.cpp
