@@ -196,6 +196,10 @@ struct ServiceCore {
     /// The executor serves every staging call from a thread-safe arena handle, never from the
     /// engine's request queue, so a lease request costs a mutex — not an engine wait.
     staging_info: Mutex<Option<(u64, u64)>>,
+    /// Whether sender-only fragments are queued on the dispatch worker instead of running inside
+    /// their exec_plan_fragment RPC. Off unless `SIRIUS_CN_ASYNC_SENDER_DISPATCH` is set at
+    /// bring-up (or a test flips it); see [`SiriusComputeNodeService::try_dispatch_sender`].
+    async_sender_dispatch: std::sync::atomic::AtomicBool,
 }
 
 impl SiriusComputeNodeService {
@@ -237,6 +241,9 @@ impl SiriusComputeNodeService {
             identity,
             transport,
             staging_info: Mutex::new(None),
+            async_sender_dispatch: std::sync::atomic::AtomicBool::new(
+                Self::async_sender_dispatch_from_env(),
+            ),
         });
         // A dedicated thread with a std channel (not a tokio task): fragment execution is
         // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
@@ -251,6 +258,66 @@ impl SiriusComputeNodeService {
             core,
             ready_fragments,
         }
+    }
+
+    /// Reads `SIRIUS_CN_ASYNC_SENDER_DISPATCH` once at bring-up: `1`, `true` or `on` queue
+    /// sender-only fragments (no exchange input, no RESULT_SINK) on the dispatch worker instead of
+    /// running them inside their exec_plan_fragment RPC. Off by default.
+    ///
+    /// Why it exists: the FE deploys the first fragment instance of every node in one wave and
+    /// waits for all of those RPCs before it deploys the remaining instances. A sender that runs
+    /// inside its RPC holds that wave open for its whole scan, so on a gather (q06: partial ->
+    /// EXCHANGE UNPARTITIONED) the node that also hosts the merge fragment only receives its own
+    /// scan after every other node's scan has finished. Measured on 4 GB200 CNs at SF1000: three
+    /// scans started together and the fourth 726 ms later, right after the last `transmitted
+    /// batches via nixl`. Returning as soon as the fragment is queued lets every scan start in the
+    /// same wave.
+    ///
+    /// Why it is off by default: a queued sender's failure (a malformed sink, an untranslatable
+    /// plan, a failed remote drain) is attributed through `results.fail_query`, which only reaches
+    /// result instances reserved on this node. When the result fragment lives on another node the
+    /// FE learns of the failure through its query timeout instead of this RPC's status. Flip the
+    /// default once a sender failure is forwarded to the receiver's node.
+    fn async_sender_dispatch_from_env() -> bool {
+        matches!(
+            std::env::var("SIRIUS_CN_ASYNC_SENDER_DISPATCH").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") | Ok("ON")
+        )
+    }
+
+    /// Overrides the bring-up setting; tests use it to exercise the queued path without touching
+    /// the process environment.
+    #[cfg(test)]
+    pub(crate) fn set_async_sender_dispatch(&self, enabled: bool) {
+        self.core
+            .async_sender_dispatch
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queues a sender-only fragment on the dispatch worker. Returns `Ok(false)` when the
+    /// fragment must take the inline path (exchange receiver, RESULT_SINK root, survey mode, or
+    /// the switch is off); descriptor tables are resolved at arrival either way, so the FE's
+    /// per-query descriptor cache protocol sees the same order as before.
+    fn try_dispatch_sender(
+        &self,
+        params: &TExecPlanFragmentParams,
+    ) -> std::result::Result<bool, String> {
+        if !self
+            .core
+            .async_sender_dispatch
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some()
+            || !ServiceCore::receiver_exchanges(params)?.is_empty()
+            || ServiceCore::is_mysql_result_sink(params)?
+        {
+            return Ok(false);
+        }
+        let params = self.core.resolve_descriptor_table(params)?;
+        self.dispatch(ReadyFragment {
+            params,
+            inputs: Vec::new(),
+        })?;
+        Ok(true)
     }
 
     /// Hands a ready receiver to the dispatch worker so this RPC thread returns immediately
@@ -635,6 +702,9 @@ impl SiriusComputeNodeService {
         Self::ensure_binary_protocol(protocol)?;
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
+        if self.try_dispatch_sender(&params)? {
+            return Ok(());
+        }
         self.dispatch_then_join(self.core.process_fragment(&params)?)
     }
 
@@ -1503,6 +1573,12 @@ impl SiriusComputeNodeService {
                 params.resource_info = common.resource_info.clone();
             }
 
+            if self
+                .try_dispatch_sender(&params)
+                .map_err(|err| format!("fragment {idx}: {err}"))?
+            {
+                continue;
+            }
             let outcome = self
                 .core
                 .process_fragment(&params)
@@ -1793,6 +1869,28 @@ mod tests {
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .map_err(|err| format!("gated receiver was never released: {err}"))?;
                 self.receiver_ran.store(true, Ordering::SeqCst);
+            }
+            StubExecutor.run(run)
+        }
+    }
+
+    /// Holds every sender run open until released, so a test can prove the sender's own
+    /// exec_plan_fragment RPC returned before the sender executed.
+    #[derive(Debug)]
+    struct GatedSenderExecutor {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        sender_ran: std::sync::atomic::AtomicBool,
+    }
+
+    impl FragmentExecutor for GatedSenderExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if !is_receiver_run(&run) {
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|err| format!("gated sender was never released: {err}"))?;
+                self.sender_ran.store(true, Ordering::SeqCst);
             }
             StubExecutor.run(run)
         }
@@ -3043,6 +3141,46 @@ mod tests {
         let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
         assert!(!fetched.attachment.is_empty());
         assert!(executor.receiver_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn sender_only_fragment_rpc_returns_before_the_sender_executes() {
+        // A DATA_STREAM_SINK fragment with no exchange input is queued on the dispatch worker;
+        // its exec_plan_fragment returns while the scan is still gated. The FE deploys the first
+        // instance per node in one wave and waits for those RPCs, so an inline sender held every
+        // other node's second-wave instance back for the whole scan.
+        let (release, gate) = std::sync::mpsc::channel();
+        let executor = Arc::new(GatedSenderExecutor {
+            release: Mutex::new(gate),
+            sender_ran: std::sync::atomic::AtomicBool::new(false),
+        });
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_async_sender_dispatch(true);
+        let query_id = TUniqueId::new(41, 1);
+        let receiver_id = TUniqueId::new(41, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(query_id, TUniqueId::new(41, 3));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![local_destination(receiver_id.clone())]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        // The sender RPC returned while the sender itself is still gated.
+        assert!(!executor.sender_ran.load(Ordering::SeqCst));
+
+        release.send(()).unwrap();
+        let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        assert!(executor.sender_ran.load(Ordering::SeqCst));
     }
 
     #[test]
