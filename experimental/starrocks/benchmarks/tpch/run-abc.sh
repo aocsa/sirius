@@ -803,6 +803,30 @@ set_and_verify_pipeline() {
   [ "$got" = "$want" ]
 }
 
+# Same contract for any global session variable: set, read back, publish in $GLOBAL_READBACK.
+set_and_verify_global() {
+  local name=$1 want=$2 got
+  sql "SET GLOBAL $name = $want;" >/dev/null 2>&1
+  got=$("${MYSQL[@]}" -e "SHOW GLOBAL VARIABLES LIKE '$name';" 2>/dev/null |
+        awk -F'\t' 'NR==2 {print tolower($2)}')
+  GLOBAL_READBACK=$got
+  [ "$got" = "$want" ]
+}
+
+# Value of one FE config key (ADMIN SHOW FRONTEND CONFIG: Key, AliasNames, Value, Type, IsMutable,
+# Comment), resolved from the header row. Empty with status 0 when the FE does not know the key;
+# status 1 with the error on stderr when the statement itself failed (same contract as bench.sh).
+frontend_config() {
+  local out
+  if ! out=$("${MYSQL[@]}" -e "ADMIN SHOW FRONTEND CONFIG LIKE '$1';" 2>&1); then
+    echo "ADMIN SHOW FRONTEND CONFIG LIKE '$1' failed: $out" >&2
+    return 1
+  fi
+  printf '%s\n' "$out" | awk -F'\t' '
+    !c { for (i = 1; i <= NF; i++) if ($i == "Value") c = i; next }
+    { print $c }'
+}
+
 # =================================================================================================
 # The A/B query loop
 #
@@ -967,6 +991,23 @@ $BLACKLIST_TXT
     return 1
   fi
   say "  enable_pipeline_engine = $PIPELINE_READBACK (set explicitly and read back)"
+
+  # The patched FE (patches/files-scan-row-count.patch) plans FILES() scans with real row counts;
+  # every plan shape in the A column depends on the knob's state, so record it. With real counts
+  # the CBO can keep a CTE materialised, which emits MULTI_CAST_DATA_STREAM_SINK -- a sink the
+  # Sirius CN refuses by name. cbo_cte_reuse=false reproduces the inline plans every query ran
+  # with before the FE had cardinalities. Engine B is stock StarRocks and keeps its defaults.
+  local files_row_count_knob
+  if ! files_row_count_knob=$(frontend_config files_scan_estimate_row_count); then
+    warn "engine A: could not read the FE config (see above). Aborting."
+    return 1
+  fi
+  say "  files_scan_estimate_row_count = ${files_row_count_knob:-<not exposed by this FE>}"
+  if ! set_and_verify_global cbo_cte_reuse false; then
+    warn "engine A: cbo_cte_reuse read back as '${GLOBAL_READBACK:-<empty>}', wanted 'false'. Aborting."
+    return 1
+  fi
+  say "  cbo_cte_reuse = $GLOBAL_READBACK (set explicitly and read back)"
   return 0
 }
 

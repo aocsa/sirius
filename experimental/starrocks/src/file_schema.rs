@@ -10,8 +10,24 @@ use crate::proto::starrocks::{PScalarType, PSlotDescriptor, PTypeDesc, PTypeNode
 /// Length reported for inferred string/binary columns (StarRocks max VARCHAR length).
 const INFERRED_VARCHAR_LEN: i32 = 1_048_576;
 
-/// Reads a parquet file's footer and maps each top-level column to a StarRocks slot descriptor.
-pub(crate) async fn parquet_file_schema(path: &str) -> Result<Vec<PSlotDescriptor>, String> {
+/// Schema and row total of one FILES() file set, read from the footers `parquet_files_schema`
+/// already opens for the schema.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FilesSchema {
+    /// One slot per top-level column, in file order.
+    pub(crate) slots: Vec<PSlotDescriptor>,
+    /// Number of files the schema and the row total cover.
+    pub(crate) files: usize,
+    /// Sum of `FileMetaData::num_rows` over every file in request order. Exact because every
+    /// footer is read (the whole-set agreement contract on `parquet_files_schema`); a future
+    /// sampling mode must report `None` upstream (`PGetFileSchemaResult.num_rows`) instead of a
+    /// partial sum.
+    pub(crate) num_rows: i64,
+}
+
+/// Reads a parquet file's footer and maps each top-level column to a StarRocks slot descriptor,
+/// with the footer's row count.
+pub(crate) async fn parquet_file_schema(path: &str) -> Result<FilesSchema, String> {
     let local = local_file_path(path)?;
     let file = tokio::fs::File::open(&local)
         .await
@@ -19,6 +35,7 @@ pub(crate) async fn parquet_file_schema(path: &str) -> Result<Vec<PSlotDescripto
     let builder = ParquetRecordBatchStreamBuilder::new(file)
         .await
         .map_err(|err| format!("failed to read parquet metadata from {local}: {err}"))?;
+    let num_rows = builder.metadata().file_metadata().num_rows();
     // Iterate the top-level fields (not physical leaves) so column names and nesting are preserved.
     let slots = builder
         .metadata()
@@ -47,10 +64,14 @@ pub(crate) async fn parquet_file_schema(path: &str) -> Result<Vec<PSlotDescripto
             ));
         }
     }
-    Ok(slots)
+    Ok(FilesSchema {
+        slots,
+        files: 1,
+        num_rows,
+    })
 }
 
-/// Infers one schema for a multi-file FILES() call.
+/// Infers one schema for a multi-file FILES() call and sums the files' footer row counts.
 ///
 /// The schema comes from the first file; every other file must agree on column names
 /// (ASCII case-insensitive, matching StarRocks name resolution) and types. Positional
@@ -58,22 +79,24 @@ pub(crate) async fn parquet_file_schema(path: &str) -> Result<Vec<PSlotDescripto
 ///
 /// Deliberately stricter than native StarRocks, which samples `schema_sample_file_count`
 /// files and promotes conflicting types: the scan reads every file with the inferred
-/// schema, so whole-set agreement is the correct fail-closed contract here.
-pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<Vec<PSlotDescriptor>, String> {
+/// schema, so whole-set agreement is the correct fail-closed contract here. Reading every
+/// footer is also what makes the row total exact rather than a sample.
+pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<FilesSchema, String> {
     let (first, rest) = paths
         .split_first()
         .ok_or_else(|| "no file paths to infer a schema from".to_string())?;
-    let slots = parquet_file_schema(first).await?;
+    let mut schema = parquet_file_schema(first).await?;
+    let slots = &schema.slots;
     for path in rest {
         let other = parquet_file_schema(path).await?;
-        if other.len() != slots.len() {
+        if other.slots.len() != slots.len() {
             return Err(format!(
                 "FILES() schema mismatch: '{path}' has {} columns but '{first}' has {}",
-                other.len(),
+                other.slots.len(),
                 slots.len()
             ));
         }
-        for (idx, (expected, found)) in slots.iter().zip(&other).enumerate() {
+        for (idx, (expected, found)) in slots.iter().zip(&other.slots).enumerate() {
             if !expected.col_name.eq_ignore_ascii_case(&found.col_name) {
                 return Err(format!(
                     "FILES() schema mismatch: column {idx} is named '{}' in '{first}' but '{}' in '{path}'",
@@ -87,8 +110,10 @@ pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<Vec<PSlotDe
                 ));
             }
         }
+        schema.files += 1;
+        schema.num_rows += other.num_rows;
     }
-    Ok(slots)
+    Ok(schema)
 }
 
 /// Resolves a StarRocks file path to a local filesystem path, rejecting remote URIs.
@@ -253,6 +278,7 @@ fn slot_descriptor(idx: i32, name: &str, scalar: PScalarType) -> PSlotDescriptor
 pub(crate) mod test_support {
     use std::sync::Arc;
 
+    use parquet::data_type::Int64Type;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::parser::parse_message_type;
@@ -269,13 +295,36 @@ pub(crate) mod test_support {
             .unwrap();
         path
     }
+
+    /// Writes `rows_per_group.len()` row groups of one `required int64 v` column,
+    /// `rows_per_group[i]` values each, to a unique temp path.
+    pub(crate) fn write_parquet_rows(tag: &str, rows_per_group: &[usize]) -> std::path::PathBuf {
+        let schema = Arc::new(parse_message_type("message m { required int64 v; }").unwrap());
+        let path = std::env::temp_dir().join(format!("sr_cn_{}_{tag}.parquet", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        for &rows in rows_per_group {
+            let values: Vec<i64> = (0..rows as i64).collect();
+            let mut group = writer.next_row_group().unwrap();
+            let mut column = group.next_column().unwrap().unwrap();
+            column
+                .typed::<Int64Type>()
+                .write_batch(&values, None, None)
+                .unwrap();
+            column.close().unwrap();
+            group.close().unwrap();
+        }
+        writer.close().unwrap();
+        path
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use super::test_support::write_parquet;
+    use super::test_support::{write_parquet, write_parquet_rows};
     use super::*;
 
     fn scalar(slot: &PSlotDescriptor) -> &PScalarType {
@@ -297,7 +346,10 @@ mod tests {
                 optional int32 l_amount (DECIMAL(9,2));
             }",
         );
-        let slots = parquet_file_schema(path.to_str().unwrap()).await.unwrap();
+        let slots = parquet_file_schema(path.to_str().unwrap())
+            .await
+            .unwrap()
+            .slots;
         std::fs::remove_file(&path).ok();
 
         let by_name: HashMap<&str, &PSlotDescriptor> =
@@ -339,7 +391,7 @@ mod tests {
             format!("file://{bare}"),
             format!("file://localhost{bare}"),
         ] {
-            let slots = parquet_file_schema(&candidate).await.unwrap();
+            let slots = parquet_file_schema(&candidate).await.unwrap().slots;
             assert_eq!(slots.len(), 1, "{candidate}");
             assert_eq!(slots[0].col_name, "a");
         }
@@ -367,7 +419,10 @@ mod tests {
     #[tokio::test]
     async fn maps_json_to_json_not_varchar() {
         let path = write_parquet("json", "message j { optional binary payload (JSON); }");
-        let slots = parquet_file_schema(path.to_str().unwrap()).await.unwrap();
+        let slots = parquet_file_schema(path.to_str().unwrap())
+            .await
+            .unwrap()
+            .slots;
         std::fs::remove_file(&path).ok();
         assert_eq!(scalar(&slots[0]).r#type, TPrimitiveType::JSON.0);
     }
@@ -398,7 +453,7 @@ mod tests {
     }
 
     /// Runs `parquet_files_schema` over already-written fixture files and removes them.
-    async fn files_schema(paths: &[&std::path::PathBuf]) -> Result<Vec<PSlotDescriptor>, String> {
+    async fn files_schema(paths: &[&std::path::PathBuf]) -> Result<FilesSchema, String> {
         let strings: Vec<String> = paths
             .iter()
             .map(|p| p.to_str().unwrap().to_string())
@@ -417,7 +472,10 @@ mod tests {
         let second = write_parquet("agree_b", message);
         let single = parquet_file_schema(first.to_str().unwrap()).await.unwrap();
         let multi = files_schema(&[&first, &second]).await.unwrap();
-        assert_eq!(multi, single);
+        assert_eq!(multi.slots, single.slots);
+        // Schema-only fixtures: two footers, zero rows between them.
+        assert_eq!(multi.files, 2);
+        assert_eq!(multi.num_rows, 0);
     }
 
     #[tokio::test]
@@ -472,7 +530,7 @@ mod tests {
     async fn multi_file_accepts_case_differing_column_names() {
         let first = write_parquet("case_a", "message m { optional int64 L_ORDERKEY; }");
         let second = write_parquet("case_b", "message m { optional int64 l_orderkey; }");
-        let slots = files_schema(&[&first, &second]).await.unwrap();
+        let slots = files_schema(&[&first, &second]).await.unwrap().slots;
         // The first file wins the spelling, matching StarRocks case-insensitive resolution.
         assert_eq!(slots[0].col_name, "L_ORDERKEY");
     }
@@ -488,6 +546,30 @@ mod tests {
             result.as_ref().is_err_and(|err| err.contains(&missing)),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn schema_only_file_reports_zero_rows() {
+        let path = write_parquet("zero_rows", "message z { optional int64 a; }");
+        let schema = parquet_file_schema(path.to_str().unwrap()).await.unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(schema.num_rows, 0);
+        assert_eq!(schema.files, 1);
+        assert_eq!(schema.slots.len(), 1);
+        assert_eq!(schema.slots[0].col_name, "a");
+    }
+
+    #[tokio::test]
+    async fn multi_file_num_rows_sums_footers() {
+        // Row groups [3, 5] and [7]: the total is the sum over every footer, not the first file's.
+        let first = write_parquet_rows("rows_a", &[3, 5]);
+        let second = write_parquet_rows("rows_b", &[7]);
+        let schema = files_schema(&[&first, &second]).await.unwrap();
+        assert_eq!(schema.num_rows, 15);
+        assert_eq!(schema.files, 2);
+        assert_eq!(schema.slots.len(), 1);
+        assert_eq!(schema.slots[0].col_name, "v");
+        assert_eq!(scalar(&schema.slots[0]).r#type, TPrimitiveType::BIGINT.0);
     }
 
     #[tokio::test]

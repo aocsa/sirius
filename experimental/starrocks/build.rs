@@ -32,7 +32,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", brpc_dir.display());
     println!("cargo:rerun-if-changed={}", proto_dir.display());
 
-    require_exchange_proto_patch(&manifest_dir, &proto_dir)?;
+    require_proto_patch(
+        &manifest_dir,
+        &proto_dir,
+        |contents| contents.contains("message PExchangeNixlMd"),
+        "patches/nixl-exchange-proto.patch",
+        "the Sirius exchange RPCs",
+    )?;
+    require_proto_patch(
+        &manifest_dir,
+        &proto_dir,
+        |contents| message_body(contents, "PGetFileSchemaResult").contains("num_rows"),
+        "patches/files-schema-row-count-proto.patch",
+        "the FILES() schema row total (PGetFileSchemaResult.num_rows)",
+    )?;
 
     let mut protos = BRPC_PROTOS
         .iter()
@@ -56,34 +69,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Fails the build, with the remedy in the message, when the `starrocks` submodule is missing the
-/// Sirius exchange RPCs.
+/// Fails the build, with the remedy in the message, when the `starrocks` submodule's
+/// `internal_service.proto` is missing one of the Sirius-only patches under `patches/`.
 ///
-/// Those RPCs (`PExchangeNixlMd`, `PStagingLeaseRequest`, `PTransmitPackedParams`, …) are
-/// Sirius-only extensions that live in `patches/nixl-exchange-proto.patch`, and nothing applies
-/// the patch automatically. Without it `prost` generates a service that simply lacks three
-/// methods, and the crate fails 200 lines later with `unresolved imports
-/// crate::proto::starrocks::PExchangeNixlMd` and `method exchange_nixl_md is not a member of
-/// trait PInternalService` — errors that name the symptom and give a fresh clone no way to guess
-/// the cause. Checking here turns that into one actionable line.
+/// The exchange RPCs (`PExchangeNixlMd`, `PStagingLeaseRequest`, `PTransmitPackedParams`, …)
+/// and the FILES() schema row total (`PGetFileSchemaResult.num_rows`) are Sirius extensions,
+/// and nothing applies the patches automatically. Without them `prost` generates a service that
+/// simply lacks three methods or a struct that lacks a field, and the crate fails 200 lines
+/// later with `unresolved imports crate::proto::starrocks::PExchangeNixlMd` or `no field
+/// num_rows` — errors that name the symptom and give a fresh clone no way to guess the cause.
+/// Checking here turns that into one actionable line naming the patch.
+///
+/// `applied` decides from the proto text whether `patch_relpath` is present; one representative
+/// token per patch rather than every line, since a patch is applied whole or not at all and a
+/// single name keeps this from breaking when the patch grows.
 ///
 /// Same discipline as `scripts/cn-env.sh`'s missing-nixl check and `nixl_transport.rs`'s
 /// `ENV_HINT`: fail at the earliest point that can name the fix.
-fn require_exchange_proto_patch(
+fn require_proto_patch(
     manifest_dir: &std::path::Path,
     proto_dir: &std::path::Path,
+    applied: impl Fn(&str) -> bool,
+    patch_relpath: &str,
+    what: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let internal_service = proto_dir.join("internal_service.proto");
     // A missing submodule is a different failure with a different fix, so let prost report it.
     let Ok(contents) = std::fs::read_to_string(&internal_service) else {
         return Ok(());
     };
-    // One representative message rather than all of them: the patch is applied whole or not at
-    // all, and matching on a single name keeps this from breaking when the patch grows.
-    if contents.contains("message PExchangeNixlMd") {
+    if applied(&contents) {
         return Ok(());
     }
-    let patch = manifest_dir.join("patches/nixl-exchange-proto.patch");
+    let patch = manifest_dir.join(patch_relpath);
     let submodule = proto_dir
         .parent()
         .and_then(|gensrc| gensrc.parent())
@@ -92,8 +110,9 @@ fn require_exchange_proto_patch(
     // script's error with `Debug`, which would print embedded newlines as literal `\n`.
     eprintln!(
         "\n\
-         {} does not define the Sirius exchange RPCs, so the CN cannot be built.\n\
-         Apply the patch to the starrocks submodule:\n\
+         {} does not define {what}, so the CN cannot be built.\n\
+         Apply the patch to the starrocks submodule (scripts/apply-starrocks-patches.sh applies\n\
+         every patch under patches/):\n\
          \n    git -C {} apply {}\n\n\
          The patch is not applied automatically and is not part of upstream StarRocks. Re-apply\n\
          it after any `git submodule update` that resets the submodule working tree.\n",
@@ -101,7 +120,19 @@ fn require_exchange_proto_patch(
         submodule.display(),
         patch.display(),
     );
-    Err("the starrocks submodule is missing patches/nixl-exchange-proto.patch (see above)".into())
+    Err(format!("the starrocks submodule is missing {patch_relpath} (see above)").into())
+}
+
+/// The text between `message <name> {` and its closing `}`, or empty when the message is absent.
+///
+/// Scoped so the check stays correct if another message ever gains a field of the same name
+/// (`num_rows`, say): only its presence in the named message says whether that patch is applied.
+fn message_body<'a>(contents: &'a str, name: &str) -> &'a str {
+    let Some(start) = contents.find(&format!("message {name} {{")) else {
+        return "";
+    };
+    let body = &contents[start..];
+    body.find('}').map_or(body, |end| &body[..end])
 }
 
 /// Emits an async BRPC/Tower service facade from StarRocks' protobuf service

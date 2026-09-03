@@ -169,10 +169,22 @@ what to run if it is not:
 
 ```bash
 git submodule update --init --recursive experimental/starrocks/starrocks
-# Sirius-only nixl RPCs (not upstream): re-apply after every clean submodule checkout
+# Sirius-only patches (not upstream): re-apply after every clean submodule checkout.
+#   nixl-exchange-proto          the CN's nixl exchange RPCs
+#   files-query-whole-file-ranges whole-file FILES() scan assignment for pinned tables
+#   files-scan-row-count         FILES() scans planned with real row counts instead of 1
+#   files-schema-row-count-proto the CN returns the parquet footer row total with the schema
 experimental/starrocks/scripts/apply-starrocks-patches.sh
 pixi run fe-build    # long
 ```
+
+The row-count patch is on by default; `ADMIN SET FRONTEND CONFIG ("files_scan_estimate_row_count" = "false")`
+restores upstream's 1-row FILES() plans on a running FE (see `docs/TUNABLES.md`). Two consequences of
+real cardinalities outside the bench scripts: run `SET GLOBAL cbo_cte_reuse = false` before a query
+that consumes a CTE more than once (TPC-H q11, q15), otherwise the CBO may keep the CTE materialised
+and emit a MULTI_CAST sink the CN refuses; and the CN must carry the translator's `RIGHT_SEMI_JOIN`
+arm, because the FE now commutes LEFT SEMI joins to RIGHT SEMI when the outer side is the smaller
+one (TPC-H q04, q20). Until that arm is in the CN build, run with the knob `false`.
 
 Everything else — the compute node and the Sirius engine — is built from this worktree by
 `cn-build` → `engine-build`.

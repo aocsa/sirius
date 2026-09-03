@@ -46,6 +46,26 @@ fails. There is no engine default — launchers pick a size per box.
 GPU and host memory carve-outs are CLI flags (`--gpu-memory-limit`,
 `--host-memory-limit`), not env vars — they become the derived Sirius YAML.
 
+## Front end (patched StarRocks)
+
+FE `Config` values added by `patches/*.patch`; set at runtime with
+`ADMIN SET FRONTEND CONFIG ("k" = "v")`, read with `ADMIN SHOW FRONTEND CONFIG LIKE 'k'`.
+
+| Knob | Role |
+|---|---|
+| `files_query_whole_file_ranges` | Whole-file scan assignment for FILES() queries so pinned tables can serve them (`benchmarks/pinned/README.md`). |
+| `files_scan_estimate_row_count` | Plan FILES() scans with the parquet footer row total the CN returns with the schema (or total bytes / row width when it does not) instead of 1 row. `false` reproduces upstream's data-blind plans for an `EXPLAIN COSTS` A/B on one running FE. |
+
+Session variables that start to matter once FILES() has cardinalities: `cbo_cte_reuse`
+(keep `false` until the CN implements `MULTI_CAST_DATA_STREAM_SINK`; the bench sets and
+reads it back at bring-up), `broadcast_row_limit` (15M rows, the broadcast guard),
+`exec_mem_limit` (2 GiB; a broadcast build above it costs x1000).
+
+Landing order for `files_scan_estimate_row_count = true`: with real counts the CBO commutes a
+LEFT SEMI join to RIGHT SEMI once the outer side is the smaller one (TPC-H q04's EXISTS, q20's
+IN subqueries), and a CN whose translator has no `RIGHT_SEMI_JOIN` arm refuses those plans
+with `hash join type is unsupported`. Run the knob `false` against such a CN.
+
 ## Debug
 
 `SIRIUS_CN_DUMP_FRAGMENTS` writes received fragments and translated plans.

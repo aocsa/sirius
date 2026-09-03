@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::file_schema::{self, FilesSchema};
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{
@@ -13,9 +14,8 @@ use crate::proto::starrocks::{
     PCancelPlanFragmentResult, PExchangeNixlMd, PExchangeNixlMdResult,
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
-    PGetFileSchemaResult, PSlotDescriptor, PStagingLeaseRequest, PStagingLeaseResult,
-    PTransmitPackedParams, PTransmitPackedResult, StatusPb,
-    p_internal_service_brpc::PInternalService,
+    PGetFileSchemaResult, PStagingLeaseRequest, PStagingLeaseResult, PTransmitPackedParams,
+    PTransmitPackedResult, StatusPb, p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
@@ -678,21 +678,41 @@ impl PInternalService for SiriusComputeNodeService {
         .into())
     }
 
-    /// Infers the schema of the FILES() target so the FE can resolve the table function.
-    #[instrument(skip_all)]
+    /// Infers the schema of the FILES() target so the FE can resolve the table function, and
+    /// returns the exact row total summed from the same footers so the FE plans the scan with
+    /// its real cardinality (`PGetFileSchemaResult.num_rows`, a Sirius extension; exact-or-absent).
+    #[instrument(skip_all, fields(files, rows))]
     async fn get_file_schema(
         &self,
         _request: PGetFileSchemaRequest,
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PGetFileSchemaResult>, crate::prpc::Error> {
+        let started = std::time::Instant::now();
         let result = match Self::file_schema_from_attachment(&attachment).await {
-            Ok(schema) => PGetFileSchemaResult {
-                status: Self::ok_status(),
-                schema,
-            },
+            Ok(FilesSchema {
+                slots,
+                files,
+                num_rows,
+            }) => {
+                tracing::Span::current()
+                    .record("files", files)
+                    .record("rows", num_rows);
+                tracing::info!(
+                    files,
+                    rows = num_rows,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "get_file_schema: schema and footer row total"
+                );
+                PGetFileSchemaResult {
+                    status: Self::ok_status(),
+                    schema: slots,
+                    num_rows: Some(num_rows),
+                }
+            }
             Err(err) => PGetFileSchemaResult {
                 status: Self::internal_error(err),
                 schema: Vec::new(),
+                num_rows: None,
             },
         };
         Ok(result.into())
@@ -1679,10 +1699,11 @@ impl SiriusComputeNodeService {
     }
 
     /// Extracts the parquet paths from the binary-thrift attachment and infers their common
-    /// schema. The FE sends one request covering every FILES() file, one range per file.
+    /// schema and footer row total. The FE sends one request covering every FILES() file, one
+    /// range per file.
     async fn file_schema_from_attachment(
         attachment: &[u8],
-    ) -> std::result::Result<Vec<PSlotDescriptor>, String> {
+    ) -> std::result::Result<FilesSchema, String> {
         let request = Self::deserialize_binary::<TGetFileSchemaRequest>(attachment)
             .map_err(|err| format!("failed to deserialize TGetFileSchemaRequest: {err}"))?;
         let broker = request.scan_range.broker_scan_range.ok_or_else(|| {
@@ -1704,7 +1725,7 @@ impl SiriusComputeNodeService {
                 Ok(range.path)
             })
             .collect::<std::result::Result<Vec<_>, String>>()?;
-        crate::file_schema::parquet_files_schema(&paths).await
+        file_schema::parquet_files_schema(&paths).await
     }
 
     /// Deserializes a thrift struct using the StarRocks binary attachment protocol.
@@ -1797,7 +1818,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        file_schema::test_support::write_parquet,
+        file_schema::test_support::{write_parquet, write_parquet_rows},
         fragment_executor::{FragmentResult, StubExecutor},
         proto::starrocks::{
             PFetchDataRequest, PUniqueId,
@@ -3633,9 +3654,89 @@ mod tests {
         std::fs::remove_file(&first).ok();
         std::fs::remove_file(&second).ok();
         let schema = schema.unwrap();
-        assert_eq!(schema.len(), 2);
-        assert_eq!(schema[0].col_name, "a");
-        assert_eq!(schema[1].col_name, "b");
+        assert_eq!(schema.slots.len(), 2);
+        assert_eq!(schema.slots[0].col_name, "a");
+        assert_eq!(schema.slots[1].col_name, "b");
+        // Schema-only fixtures carry no row groups.
+        assert_eq!(schema.files, 2);
+        assert_eq!(schema.num_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn get_file_schema_attachment_reports_num_rows() {
+        let first = write_parquet_rows("svc_rows_a", &[3, 5]);
+        let second = write_parquet_rows("svc_rows_b", &[7]);
+        let attachment = serialize_binary(&file_schema_request(vec![
+            broker_range(&first, TFileFormatType::FORMAT_PARQUET),
+            broker_range(&second, TFileFormatType::FORMAT_PARQUET),
+        ]));
+        let schema = SiriusComputeNodeService::file_schema_from_attachment(&attachment).await;
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
+        let schema = schema.unwrap();
+        assert_eq!(schema.slots.len(), 1);
+        assert_eq!(schema.slots[0].col_name, "v");
+        assert_eq!(schema.files, 2);
+        assert_eq!(schema.num_rows, 15);
+    }
+
+    #[test]
+    fn get_file_schema_route_returns_num_rows() {
+        let service = SiriusComputeNodeService::new();
+        let first = write_parquet_rows("svc_route_a", &[3, 5]);
+        let second = write_parquet_rows("svc_route_b", &[7]);
+        let attachment = serialize_binary(&file_schema_request(vec![
+            broker_range(&first, TFileFormatType::FORMAT_PARQUET),
+            broker_range(&second, TFileFormatType::FORMAT_PARQUET),
+        ]));
+        let response = route(
+            &service,
+            methods::GET_FILE_SCHEMA,
+            PGetFileSchemaRequest { pad: None }.encode_to_vec(),
+            attachment,
+        );
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
+        let result = PGetFileSchemaResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(
+            result.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            result.status.error_msgs
+        );
+        assert_eq!(result.schema.len(), 1);
+        assert_eq!(result.schema[0].col_name, "v");
+        // The FE reads this as the exact FILES() row count (PGetFileSchemaResult.num_rows).
+        assert_eq!(result.num_rows, Some(15));
+    }
+
+    #[test]
+    fn get_file_schema_route_error_leaves_num_rows_unset() {
+        let service = SiriusComputeNodeService::new();
+        let first = write_parquet_rows("svc_route_err_a", &[2]);
+        let second = write_parquet_rows("svc_route_err_b", &[4]);
+        let attachment = serialize_binary(&file_schema_request(vec![
+            broker_range(&first, TFileFormatType::FORMAT_PARQUET),
+            broker_range(&second, TFileFormatType::FORMAT_CSV_PLAIN),
+        ]));
+        let response = route(
+            &service,
+            methods::GET_FILE_SCHEMA,
+            PGetFileSchemaRequest { pad: None }.encode_to_vec(),
+            attachment,
+        );
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
+        let result = PGetFileSchemaResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("unsupported file format"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        assert!(result.schema.is_empty());
+        // Exact-or-absent: a failed inference must not hand the FE a partial sum.
+        assert_eq!(result.num_rows, None);
     }
 
     #[tokio::test]
