@@ -1,0 +1,473 @@
+diff --git a/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java b/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
+index 2a8a9b16e07..f72dcbf1af2 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
++++ b/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
+@@ -19,6 +19,7 @@ import com.google.common.base.Splitter;
+ import com.google.common.base.Strings;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Sets;
++import com.starrocks.common.Config;
+ import com.starrocks.common.CsvFormat;
+ import com.starrocks.common.DdlException;
+ import com.starrocks.common.ErrorCode;
+@@ -187,6 +188,10 @@ public class TableFunctionTable extends Table {
+ 
+     private List<TBrokerFileStatus> fileStatuses = Lists.newArrayList();
+ 
++    // Row total the compute node read from the parquet footers along with the schema
++    // (PGetFileSchemaResult.num_rows, a Sirius extension); -1 when it reported none.
++    private long footerRowCount = -1;
++
+     private MisMatchFillValue misMatchFillValue = MisMatchFillValue.NONE;
+ 
+     // for unload data
+@@ -272,6 +277,11 @@ public class TableFunctionTable extends Table {
+ 
+         // set schema
+         setNewFullSchema(columns);
++
++        // One line per statement so a plan can be traced to the cardinality path it was built with.
++        LOG.info("FILES() statistics path={} files={} bytes={} rows={} source={}",
++                path, fileStatuses.size(), getTotalFileBytes(), estimateRowCount(),
++                hasExactRowCount() ? "footer" : "estimated");
+     }
+ 
+     private void checkDuplicateColumns(List<Column> columns) throws DdlException {
+@@ -301,6 +311,55 @@ public class TableFunctionTable extends Table {
+         return fileStatuses;
+     }
+ 
++    /** Bytes of the listed files (directories excluded); the numerator of the row estimate. */
++    public long getTotalFileBytes() {
++        long bytes = 0;
++        for (TBrokerFileStatus f : fileStatuses) {
++            if (!f.isDir) {
++                bytes += Math.max(0L, f.size);
++            }
++        }
++        return bytes;
++    }
++
++    /** The inferred file schema without the trailing columns_from_path entries, which occupy no file bytes. */
++    public List<Column> getFileColumns() {
++        List<Column> all = getFullSchema();
++        int fileColumns = all.size() - columnsFromPath.size();
++        return all.subList(0, Math.max(0, fileColumns));
++    }
++
++    /** True when estimateRowCount() returns the footer total the compute node reported rather than an estimate. */
++    public boolean hasExactRowCount() {
++        return footerRowCount > 0;
++    }
++
++    /**
++     * Row count for the CBO. The footer total the compute node returned with the schema when present, else
++     * HiveStatisticsProvider.getEstimatedRowCount's no-statistics rule (total bytes / sum of the file columns'
++     * type widths), else 1. Each width is floored at 1 so a zero-width type cannot zero the denominator (the one
++     * deviation from the Hive rule). LIST_FILES tables answer one row per directory entry from their own schema
++     * and keep 1; UNLOAD tables list no files and keep 1. Config.files_scan_estimate_row_count = false restores
++     * upstream's 1 row for every FILES() scan.
++     */
++    public long estimateRowCount() {
++        if (!Config.files_scan_estimate_row_count || listFilesOnly || fileStatuses.isEmpty()) {
++            return 1;
++        }
++        if (footerRowCount > 0) {
++            return footerRowCount;
++        }
++        long bytes = getTotalFileBytes();
++        long width = 0;
++        for (Column c : getFileColumns()) {
++            width += Math.max(1, c.getType().getTypeSize());
++        }
++        if (bytes <= 0 || width <= 0) {
++            return 1;
++        }
++        return Math.max(1L, bytes / width);
++    }
++
+     // for list files
+     // must be consistent with list files schema
+     public List<List<String>> listFilesAndDirs() {
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculator.java b/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculator.java
+index f58886ccae4..e342ad25452 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculator.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculator.java
+@@ -32,6 +32,7 @@ import com.starrocks.catalog.PartitionInfo;
+ import com.starrocks.catalog.PartitionKey;
+ import com.starrocks.catalog.RangePartitionInfo;
+ import com.starrocks.catalog.Table;
++import com.starrocks.catalog.TableFunctionTable;
+ import com.starrocks.common.AnalysisException;
+ import com.starrocks.common.Config;
+ import com.starrocks.common.Pair;
+@@ -138,6 +139,7 @@ import com.starrocks.sql.optimizer.operator.physical.PhysicalRepeatOperator;
+ import com.starrocks.sql.optimizer.operator.physical.PhysicalScanOperator;
+ import com.starrocks.sql.optimizer.operator.physical.PhysicalSchemaScanOperator;
+ import com.starrocks.sql.optimizer.operator.physical.PhysicalTableFunctionOperator;
++import com.starrocks.sql.optimizer.operator.physical.PhysicalTableFunctionTableScanOperator;
+ import com.starrocks.sql.optimizer.operator.physical.PhysicalTopNOperator;
+ import com.starrocks.sql.optimizer.operator.physical.PhysicalUnionOperator;
+ import com.starrocks.sql.optimizer.operator.physical.PhysicalValuesOperator;
+@@ -372,7 +374,16 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
+ 
+     @Override
+     public Void visitLogicalTableFunctionTableScan(LogicalTableFunctionTableScanOperator node, ExpressionContext context) {
+-        return computeFileScanNode(node, context, node.getColRefToColumnMetaMap());
++        return computeFileScanNode(node, context, node.getTable(), node.getColRefToColumnMetaMap());
++    }
++
++    // Mirrors the visitLogicalFileScan / visitPhysicalFileScan pair. Today the physical FILES() operator is not
++    // re-derived on the main path (PlanFragmentBuilder reuses the memo statistics), but a future re-derivation
++    // must not silently fall back to OperatorVisitor.visitOperator's 1 row.
++    @Override
++    public Void visitPhysicalTableFunctionTableScan(PhysicalTableFunctionTableScanOperator node,
++                                                     ExpressionContext context) {
++        return computeFileScanNode(node, context, node.getTable(), node.getColRefToColumnMetaMap());
+     }
+ 
+     @Override
+@@ -653,23 +664,34 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
+ 
+     @Override
+     public Void visitLogicalFileScan(LogicalFileScanOperator node, ExpressionContext context) {
+-        return computeFileScanNode(node, context, node.getColRefToColumnMetaMap());
++        return computeFileScanNode(node, context, node.getTable(), node.getColRefToColumnMetaMap());
+     }
+ 
+     @Override
+     public Void visitPhysicalFileScan(PhysicalFileScanOperator node, ExpressionContext context) {
+-        return computeFileScanNode(node, context, node.getColRefToColumnMetaMap());
++        return computeFileScanNode(node, context, node.getTable(), node.getColRefToColumnMetaMap());
+     }
+ 
+-    private Void computeFileScanNode(Operator node, ExpressionContext context,
++    private Void computeFileScanNode(Operator node, ExpressionContext context, Table table,
+                                      Map<ColumnRefOperator, Column> columnRefOperatorColumnMap) {
+-        // Use default statistics for now.
+         Statistics.Builder builder = Statistics.builder();
+         for (ColumnRefOperator columnRefOperator : columnRefOperatorColumnMap.keySet()) {
+             builder.addColumnStatistic(columnRefOperator, ColumnStatistic.unknown());
+         }
+-        // cause we don't know the real schema in file，just use the default Row Count now
+-        builder.setOutputRowCount(1);
++        // Column statistics stay unknown (no footer min/max/NDV). A FILES() scan gets the row total the compute
++        // node read from the parquet footers, else total bytes / row width, else 1 (TableFunctionTable decides).
++        // The external FILE table keeps the historical 1 row.
++        long rows = 1;
++        boolean exact = false;
++        if (table instanceof TableFunctionTable) {
++            TableFunctionTable files = (TableFunctionTable) table;
++            rows = files.estimateRowCount();
++            exact = files.hasExactRowCount();
++        }
++        builder.setOutputRowCount(rows);
++        // Honest only on the bytes / width path; the flag's consumers are already short-circuited by the unknown
++        // column statistics.
++        builder.setTableRowCountMayInaccurate(rows != 1 && !exact);
+         context.setStatistics(builder.build());
+ 
+         return visitOperator(node, context);
+diff --git a/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java b/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
+index 46f81a161c2..847267bb51a 100644
+--- a/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
++++ b/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
+@@ -15,6 +15,7 @@
+ package com.starrocks.catalog;
+ 
+ import com.google.common.collect.Lists;
++import com.starrocks.common.Config;
+ import com.starrocks.common.DdlException;
+ import com.starrocks.common.ExceptionChecker;
+ import com.starrocks.common.StarRocksException;
+@@ -233,6 +234,43 @@ public class TableFunctionTableTest {
+                 () -> new TableFunctionTable(properties));
+     }
+ 
++    @Test
++    public void testEstimateRowCountFromFileBytes() throws Exception {
++        // fake:// lists two files of 1024 and 2048 bytes with the file schema col_int INT, col_string VARCHAR;
++        // newProperties() adds three columns_from_path entries, which occupy no file bytes.
++        TableFunctionTable table = new TableFunctionTable(newProperties());
++        Assertions.assertEquals(3072L, table.getTotalFileBytes());
++        Assertions.assertEquals(2, table.getFileColumns().size());
++        Assertions.assertEquals("col_int", table.getFileColumns().get(0).getName());
++        Assertions.assertEquals("col_string", table.getFileColumns().get(1).getName());
++        // 3072 / (4 + 16). With the three 16 B path columns wrongly in the denominator it would be 3072 / 68 = 45.
++        Assertions.assertEquals(153L, table.estimateRowCount());
++        Assertions.assertFalse(table.hasExactRowCount());
++
++        boolean saved = Config.files_scan_estimate_row_count;
++        try {
++            Config.files_scan_estimate_row_count = false;
++            Assertions.assertEquals(1L, table.estimateRowCount());
++            Assertions.assertFalse(table.hasExactRowCount());
++        } finally {
++            Config.files_scan_estimate_row_count = saved;
++        }
++    }
++
++    @Test
++    public void testEstimateRowCountListFilesOnly() throws Exception {
++        Map<String, String> properties = new HashMap<>();
++        properties.put("path", "fake://some_bucket/some_path/*");
++        properties.put("list_files_only", "true");
++        TableFunctionTable table = new TableFunctionTable(properties);
++        Assertions.assertTrue(table.isListFilesOnly());
++        // LIST_FILES tables answer one row per directory entry from their own schema; the file-bytes rule
++        // does not apply to them even with the knob on.
++        Assertions.assertTrue(Config.files_scan_estimate_row_count);
++        Assertions.assertEquals(1L, table.estimateRowCount());
++        Assertions.assertFalse(table.hasExactRowCount());
++    }
++
+     @Test
+     public void testIllegalDelimiter() throws DdlException {
+         {
+diff --git a/fe/fe-core/src/test/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculatorTest.java b/fe/fe-core/src/test/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculatorTest.java
+index c8419ee7ac4..2d84059cf0f 100644
+--- a/fe/fe-core/src/test/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculatorTest.java
++++ b/fe/fe-core/src/test/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculatorTest.java
+@@ -21,6 +21,8 @@ import com.starrocks.catalog.Column;
+ import com.starrocks.catalog.OlapTable;
+ import com.starrocks.catalog.Partition;
+ import com.starrocks.catalog.Table;
++import com.starrocks.catalog.TableFunctionTable;
++import com.starrocks.common.Config;
+ import com.starrocks.common.FeConstants;
+ import com.starrocks.common.tvr.TvrTableSnapshot;
+ import com.starrocks.qe.ConnectContext;
+@@ -39,11 +41,15 @@ import com.starrocks.sql.optimizer.base.ColumnRefFactory;
+ import com.starrocks.sql.optimizer.base.ColumnRefSet;
+ import com.starrocks.sql.optimizer.base.LogicalProperty;
+ import com.starrocks.sql.optimizer.operator.AggType;
++import com.starrocks.sql.optimizer.operator.Operator;
++import com.starrocks.sql.optimizer.operator.ScanOperatorPredicates;
+ import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
+ import com.starrocks.sql.optimizer.operator.logical.LogicalIcebergScanOperator;
+ import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
+ import com.starrocks.sql.optimizer.operator.logical.LogicalOlapScanOperator;
++import com.starrocks.sql.optimizer.operator.logical.LogicalTableFunctionTableScanOperator;
+ import com.starrocks.sql.optimizer.operator.logical.LogicalUnionOperator;
++import com.starrocks.sql.optimizer.operator.physical.PhysicalTableFunctionTableScanOperator;
+ import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
+ import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
+ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
+@@ -292,6 +298,62 @@ public class StatisticsCalculatorTest {
+         }
+     }
+ 
++    @Test
++    public void testTableFunctionTableScanRowCount() throws Exception {
++        // fake:// lists 1024 + 2048 B with the file schema col_int INT, col_string VARCHAR (no columns_from_path).
++        Map<String, String> props = new HashMap<>();
++        props.put("path", "fake://a/*");
++        props.put("format", "parquet");
++        TableFunctionTable table = new TableFunctionTable(props);
++        Map<ColumnRefOperator, Column> refToColumn = Maps.newHashMap();
++        Map<Column, ColumnRefOperator> columnToRef = Maps.newHashMap();
++        List<Column> columns = table.getFullSchema();
++        for (int i = 0; i < columns.size(); i++) {
++            Column column = columns.get(i);
++            ColumnRefOperator ref = new ColumnRefOperator(i, column.getType(), column.getName(), true);
++            refToColumn.put(ref, column);
++            columnToRef.put(column, ref);
++        }
++
++        // 3072 B / (4 + 16) B per row; every column statistic stays unknown, so the compute size prices
++        // the row by type widths.
++        Statistics stats = estimateScan(new LogicalTableFunctionTableScanOperator(table, refToColumn, columnToRef, -1, null));
++        Assertions.assertEquals(153, stats.getOutputRowCount(), 0.001);
++        for (ColumnRefOperator ref : refToColumn.keySet()) {
++            Assertions.assertTrue(stats.getColumnStatistic(ref).isUnknown(), ref.toString());
++        }
++        Assertions.assertTrue(stats.isTableRowCountMayInaccurate());
++        Assertions.assertEquals(153 * 20, stats.getComputeSize(), 0.001);
++
++        // visitOperator still runs after the leaf estimate: a limit caps the row count.
++        Statistics limited = estimateScan(new LogicalTableFunctionTableScanOperator(table, refToColumn, columnToRef, 100, null));
++        Assertions.assertEquals(100, limited.getOutputRowCount(), 0.001);
++
++        // The physical operator derives the same count instead of falling through to the 1-row default.
++        Statistics physical = estimateScan(new PhysicalTableFunctionTableScanOperator(table, refToColumn,
++                new ScanOperatorPredicates(), -1, null, null));
++        Assertions.assertEquals(153, physical.getOutputRowCount(), 0.001);
++        Assertions.assertTrue(physical.isTableRowCountMayInaccurate());
++
++        boolean saved = Config.files_scan_estimate_row_count;
++        try {
++            Config.files_scan_estimate_row_count = false;
++            Statistics off = estimateScan(new LogicalTableFunctionTableScanOperator(table, refToColumn, columnToRef, -1, null));
++            Assertions.assertEquals(1, off.getOutputRowCount(), 0.001);
++            Assertions.assertFalse(off.isTableRowCountMayInaccurate());
++        } finally {
++            Config.files_scan_estimate_row_count = saved;
++        }
++    }
++
++    private static Statistics estimateScan(Operator scan) {
++        GroupExpression groupExpression = new GroupExpression(scan, Lists.newArrayList());
++        groupExpression.setGroup(new Group(0));
++        ExpressionContext expressionContext = new ExpressionContext(groupExpression);
++        new StatisticsCalculator(expressionContext, columnRefFactory, optimizerContext).estimatorStats();
++        return expressionContext.getStatistics();
++    }
++
+     @Test
+     public void testLogicalIcebergTableScan() {
+         GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
+diff --git a/fe/fe-core/src/test/java/com/starrocks/sql/plan/FilesScanStatisticsTest.java b/fe/fe-core/src/test/java/com/starrocks/sql/plan/FilesScanStatisticsTest.java
+new file mode 100644
+index 00000000000..813d888c6dc
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/sql/plan/FilesScanStatisticsTest.java
+@@ -0,0 +1,130 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.sql.plan;
++
++import com.starrocks.catalog.TableFunctionTable;
++import com.starrocks.fs.HdfsUtil;
++import com.starrocks.sql.StatementPlanner;
++import com.starrocks.sql.ast.StatementBase;
++import com.starrocks.thrift.TExplainLevel;
++import com.starrocks.thrift.THdfsProperties;
++import com.starrocks.utframe.UtFrameUtils;
++import mockit.Invocation;
++import mockit.Mock;
++import mockit.MockUp;
++import org.apache.commons.lang3.StringUtils;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.util.Map;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * FILES() scans reach the CBO with a row count instead of the historical 1 row, so join sides and the
++ * broadcast/shuffle choice are decided from data volume. Column statistics stay unknown.
++ *
++ * Each FILES() scan is named through a CTE, the way the TPC-H bench queries do it
++ * (WITH lineitem AS (SELECT * FROM FILES(...))); consumed once, a CTE is inlined into the plan.
++ */
++public class FilesScanStatisticsTest extends PlanTestBase {
++
++    private static String files(String name) {
++        return name + " as (select * from files('path'='fake://" + name + "/*','format'='parquet'))";
++    }
++
++    /**
++     * EXPLAIN COSTS of one statement. Not getCostExplain(): UtFrameUtils.getPlanAndFragment also prints the
++     * optimizer tree with LogicalPlanPrinter, which has no arm for PhysicalTableFunctionTableScanOperator and
++     * recurses until StackOverflowError (an upstream test-utility gap unrelated to statistics).
++     */
++    private static String costExplain(String sql) throws Exception {
++        connectContext.setThreadLocalInfo();
++        StatementBase statement = UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
++        ExecPlan plan = StatementPlanner.plan(statement, connectContext);
++        return plan.getExplainString(TExplainLevel.COSTS);
++    }
++
++    @BeforeEach
++    public void mockFakeFileSystem() {
++        // fake:// lists its two files inside TableFunctionTable, but building the physical FileScanNode still asks
++        // HDFS for the path's properties, and no Hadoop FileSystem serves the fake scheme.
++        new MockUp<HdfsUtil>() {
++            @Mock
++            public static void getTProperties(String path, Map<String, String> properties, THdfsProperties tProperties) {
++            }
++        };
++    }
++
++    @Test
++    public void testFilesScanCardinalityInExplainCosts() throws Exception {
++        String plan = costExplain("with " + files("a") + ", " + files("b")
++                + " select a.col_int from a join b on a.col_int = b.col_int");
++        // fake:// lists 1024 + 2048 B with the schema col_int INT, col_string VARCHAR: 3072 / 20 = 153 rows per scan.
++        Assertions.assertTrue(StringUtils.countMatches(plan, "cardinality: 153\n") >= 2, plan);
++        Assertions.assertFalse(plan.contains("cardinality: 1\n"), plan);
++    }
++
++    @Test
++    public void testInjectedRowCountsDecideJoinSide() throws Exception {
++        new MockUp<TableFunctionTable>() {
++            @Mock
++            public long estimateRowCount(Invocation inv) {
++                TableFunctionTable table = inv.getInvokedInstance();
++                return table.getPath().contains("big") ? 1_000_000_000L : 10L;
++            }
++        };
++        String with = "with " + files("big") + ", " + files("small") + " ";
++
++        String plan = costExplain(with + "select count(*) from big b join small s on b.col_int = s.col_int");
++        assertContains(plan, "join op: INNER JOIN (BROADCAST)");
++        // The 10-row scan is the build side: it feeds the EXCHANGE that is the join's right child.
++        Assertions.assertTrue(buildSideFragment(plan).contains("cardinality: 10\n"), plan);
++        Assertions.assertTrue(joinFragment(plan).contains("cardinality: 1000000000\n"), plan);
++
++        // With a 10-row outer side the CBO commutes LEFT SEMI to RIGHT SEMI so the small side builds, so a
++        // compute node that consumes these plans has to execute RIGHT_SEMI_JOIN.
++        String semi = costExplain(with + "select count(*) from small s where s.col_int in (select col_int from big)");
++        assertContains(semi, "RIGHT SEMI JOIN");
++    }
++
++    /** Text of the plan fragment holding the HASH JOIN. */
++    private static String joinFragment(String plan) {
++        for (String fragment : plan.split("PLAN FRAGMENT ")) {
++            if (fragment.contains("HASH JOIN")) {
++                return fragment;
++            }
++        }
++        Assertions.fail("no HASH JOIN in plan:\n" + plan);
++        return "";
++    }
++
++    /** Text of the plan fragment whose sink feeds the join's right (build) child EXCHANGE. */
++    private static String buildSideFragment(String plan) {
++        Matcher child = Pattern.compile("\\|----(\\d+):EXCHANGE").matcher(joinFragment(plan));
++        Assertions.assertTrue(child.find(), "join has no EXCHANGE right child:\n" + plan);
++        int exchangeId = Integer.parseInt(child.group(1));
++        // COSTS prints the sink as "OutPut Exchange Id: 02"; NORMAL prints "EXCHANGE ID: 02".
++        Pattern sink = Pattern.compile("(?i)(OutPut Exchange Id|EXCHANGE ID): 0*" + exchangeId + "\\b");
++        for (String fragment : plan.split("PLAN FRAGMENT ")) {
++            if (sink.matcher(fragment).find() && !fragment.contains("HASH JOIN")) {
++                return fragment;
++            }
++        }
++        Assertions.fail("no fragment sinks into exchange " + exchangeId + ":\n" + plan);
++        return "";
++    }
++}
+--- a/fe/fe-core/src/main/java/com/starrocks/common/Config.java
++++ b/fe/fe-core/src/main/java/com/starrocks/common/Config.java
+@@ -2275,6 +2275,16 @@
+             "including auto analyze job and analyze jobs created by user")
+     public static boolean enable_statistic_collect = true;
+ 
++    /**
++     * When true, FILES() query scans are planned with a real row-count estimate: the parquet footer total the
++     * compute node returns with the file schema, else total file bytes divided by the typed row width of the
++     * inferred schema (the Hive no-statistics rule). Column statistics stay unknown. Upstream plans every FILES()
++     * scan at 1 row, which makes every join side, broadcast and CTE decision data-blind. Mutable so EXPLAIN COSTS
++     * can compare both plans on one running FE: ADMIN SET FRONTEND CONFIG ("files_scan_estimate_row_count" = "false").
++     */
++    @ConfField(mutable = true)
++    public static boolean files_scan_estimate_row_count = true;
++
+     @ConfField(mutable = true, comment = "enable auto collect internal statistics in the background")
+     public static boolean enable_auto_collect_statistics = true;
+ 

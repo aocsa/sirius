@@ -169,10 +169,16 @@ what to run if it is not:
 
 ```bash
 git submodule update --init --recursive experimental/starrocks/starrocks
-# Sirius-only nixl RPCs (not upstream): re-apply after every clean submodule checkout
+# Sirius-only patches (not upstream): re-apply after every clean submodule checkout.
+#   nixl-exchange-proto          the CN's nixl exchange RPCs
+#   files-query-whole-file-ranges whole-file FILES() scan assignment for pinned tables
+#   files-scan-row-count         FILES() scans planned with real row counts instead of 1
 experimental/starrocks/scripts/apply-starrocks-patches.sh
 pixi run fe-build    # long
 ```
+
+The row-count patch is on by default; `ADMIN SET FRONTEND CONFIG ("files_scan_estimate_row_count" = "false")`
+restores upstream's 1-row FILES() plans on a running FE (see `docs/TUNABLES.md`).
 
 Everything else — the compute node and the Sirius engine — is built from this worktree by
 `cn-build` → `engine-build`.
