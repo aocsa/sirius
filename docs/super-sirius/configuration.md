@@ -32,6 +32,16 @@ Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **requ
 export SIRIUS_DISABLE=1
 ```
 
+### `SIRIUS_QUERY_WATCHDOG_SECS`
+
+Opt-in query watchdog, **off by default**. Unset or `0` leaves `sirius_engine::execute()` blocking on the query future exactly as before. Set to `N` and the engine thread instead polls the future every 250 ms and fails the query — through the scheduler's completion handler, with a named `sirius query watchdog` error the client sees — once **no pipeline has made any scheduling progress** (no task created or completed, no pipeline finished) for `N` seconds. A wedged query becomes a loud failure in `N` seconds instead of a silent hang; in-flight GPU work is not cancelled, and a query that completes concurrently keeps its real outcome (first call wins).
+
+The watchdog watches scheduling counters, not GPU activity, so a single long-running kernel looks like a stall to it. Pick a value well above the longest single kernel or operator runtime the deployment can see, and below the client-side query timeout so the client receives the engine's error rather than its own. The multi-CN cluster environment uses `60`. The value must be a plain non-negative integer no larger than `86400` (one day); anything else — a sign, whitespace, a non-digit, or a larger number — is rejected when the query starts. The C++ integration tests that run under the watchdog (`watchdog_guard` in `test/cpp/exec/test_streaming_fragment.cpp`) hard-wire a threshold sized for a fast GPU; export `SIRIUS_TEST_WATCHDOG_SECS` to raise it on a slow CI machine.
+
+```bash
+export SIRIUS_QUERY_WATCHDOG_SECS=60
+```
+
 ### Byte Suffixes
 
 Any integer config value that represents bytes supports human-readable suffixes:
@@ -556,6 +566,25 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
+### Exchange Staging Arena
+
+Environment variables read once at engine bring-up (`exchange_staging_arena::from_env`), not
+`sirius_config`/`SET` knobs. The arena is one device region allocated *outside* the RMM pool that
+a cross-node exchange packs batches into on the send side and lands them in on the receive side,
+so a transport registers exactly one memory region. It is plain `cudaMalloc` by design: UCX's
+`cuda_ipc` path cannot export `cudaMallocAsync` (pool) memory and silently degrades ~220x to
+staged host copies — correct bytes, no error.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIRIUS_EXCHANGE_STAGING_BYTES` | unset | Arena capacity, with the [byte suffixes](#byte-suffixes) `sirius::yaml::parse_bytes` accepts (`512MiB`, `1Gi`, ...). Unset means **no arena**: every staging call fails loudly with a message naming this variable instead of degrading to a slow path. Capacity bounds *concurrently live* lease bytes, not lifetime totals — leases come from an address-ordered, coalescing free list, so released space is immediately reusable. `0` and unparsable values are rejected at bring-up. |
+| `SIRIUS_EXCHANGE_STAGING_ARENA` | `cudamalloc` | How the region is allocated. `cudamalloc` is correct for every single-host deployment and is the only path the unit tests exercise. `fabric` is opt-in and only needed when peers live on **different hosts**: it allocates through the CUDA driver VMM API with `CU_MEM_HANDLE_TYPE_FABRIC`, the only handle a peer on another host can map (`cudaMalloc`'s IPC handle is node-local, so a cross-host exchange over it falls back to a 0.32-0.43 GB/s host bounce; the fabric path measured 765 GB/s on a two-host GB200 MNNVL pair). Requires a live IMEX domain (`nvidia-imex`) and access to `/dev/nvidia-caps-imex-channels`; `cuMemCreate` fails loudly at bring-up otherwise. Any other value is rejected. |
+
+The arena logs its granted size at construction and its peak live bytes (plus any leaked leases)
+at teardown; those two `INFO` lines are the sizing feedback, since the slab appears in no pool
+accounting. No in-tree component constructs the arena yet; the fragment FFI that packs batches
+into a lease is a follow-up.
+
 ### Expression Evaluation
 
 **File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
@@ -759,6 +788,7 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | File | Purpose |
 |------|---------|
 | `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/include/exec/exchange_staging_arena.hpp` | `SIRIUS_EXCHANGE_STAGING_BYTES` / `SIRIUS_EXCHANGE_STAGING_ARENA` (exchange staging arena) |
 | `src/include/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |

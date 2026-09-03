@@ -31,8 +31,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -501,6 +505,261 @@ TEST_CASE_METHOD(fragment_fixture,
                             << " tasks_completed=" << completed);
 
     REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-10: declared stream cardinalities steer the hash-join build side.
+// A stream source binds with no backing rows, so without a declared count
+// DuckDB's optimizer sees cardinality 1 on every stream and picks build sides
+// blind — on the 2-CN q07 it built on a multi-GB lineitem-derived stream while
+// the 2-row nation stream probed (14.8s -> 164s at SF500). The receiver's CN
+// already holds every input before build(), so it can declare exact counts;
+// this pins that a declared tiny stream becomes the build side (children[1],
+// DuckDB's convention) in BOTH directions, and that the undeclared path still
+// plans and runs (backward compatibility).
+// ============================================================================
+
+namespace {
+
+sirius::op::sirius_physical_operator* find_first_hash_join(
+  sirius::op::sirius_physical_operator& node)
+{
+  if (node.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) { return &node; }
+  for (auto& child : node.children) {
+    if (auto* join = find_first_hash_join(*child)) { return join; }
+  }
+  return nullptr;
+}
+
+bool subtree_contains(const sirius::op::sirius_physical_operator& node,
+                      const sirius::op::sirius_physical_operator* target)
+{
+  if (&node == target) { return true; }
+  for (const auto& child : node.children) {
+    if (subtree_contains(*child, target)) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-10: declared stream cardinalities pick the hash-join build side",
+                 "[integration][streaming_fragment][stream_cardinality]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  constexpr const char* kJoinQuery =
+    "SELECT l.a, r.b FROM sirius_stream_source(0) l JOIN sirius_stream_source(1) r ON l.a = r.b";
+
+  // The declared counts alone drive the optimizer; the actual pushed volume (5 rows per side)
+  // never reaches the planner. Both directions are covered so the assertion cannot pass by the
+  // optimizer's accidental default order.
+  std::optional<stream_id_t> small_stream;
+  SECTION("stream 1 declared tiny -> stream 1 builds") { small_stream = 1; }
+  SECTION("stream 0 declared tiny -> stream 0 builds") { small_stream = 0; }
+  SECTION("no declared cardinality still plans and runs") { small_stream = std::nullopt; }
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&]() {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+      spec.outputs     = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+
+    auto int_types = [] {
+      return sirius::from_duckdb_vec(
+        duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+    };
+
+    auto left  = make_sender();
+    auto right = make_sender();
+    for (auto* sender : {left.get(), right.get()}) {
+      query_window sender_window(*sirius_ctx, *con->context, "frag10_sender");
+      sender->build(sender_window.query_id());
+      sender->run();
+      sender_window.finish();
+    }
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(kJoinQuery);
+    receiver_spec.inputs[0]   = stream_input_spec{{"a"}, int_types(), {0}, std::nullopt};
+    receiver_spec.inputs[1]   = stream_input_spec{{"b"}, int_types(), {0}, std::nullopt};
+    if (small_stream.has_value()) {
+      stream_id_t const big_stream                       = *small_stream == 1 ? 0 : 1;
+      receiver_spec.inputs[*small_stream].estimated_rows = 2;
+      receiver_spec.inputs[big_stream].estimated_rows    = 100'000;
+    }
+    receiver_spec.outputs = {2};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag10_receiver");
+    receiver.build(receiver_window.query_id());
+
+    // Plan-shape assertion, straight off the built physical tree: DuckDB's build side is the
+    // join's second child, and it must be the subtree reading the stream declared tiny.
+    auto* root = receiver.engine().sirius_physical_plan.get();
+    REQUIRE(root != nullptr);
+    auto* join = find_first_hash_join(*root);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->children.size() == 2);
+    if (small_stream.has_value()) {
+      stream_id_t const big_stream = *small_stream == 1 ? 0 : 1;
+      // catalog_for, not the fixture's member: the transparent path already registered a catalog
+      // when the connection opened (RegisteredStateManager::Insert never overwrites), so the
+      // fixture's own object is only a fallback and the fragment binds through the live one.
+      auto live_catalog  = catalog_for(*con->context);
+      auto* small_source = live_catalog->get(*small_stream).built;
+      auto* big_source   = live_catalog->get(big_stream).built;
+      REQUIRE(small_source != nullptr);
+      REQUIRE(big_source != nullptr);
+      // The declared counts must have reached the lowered sources verbatim...
+      REQUIRE(small_source->estimated_cardinality == 2);
+      REQUIRE(big_source->estimated_cardinality == 100'000);
+      // ...and flipped the build side onto the tiny stream.
+      REQUIRE(subtree_contains(*join->children[1], small_source));
+      REQUIRE(subtree_contains(*join->children[0], big_source));
+    } else {
+      // The pre-fix blindness this feature exists for, pinned as documentation: with nothing
+      // declared, every stream source estimates cardinality 1 and the optimizer cannot tell a
+      // 2-row nation stream from a multi-GB lineitem stream.
+      auto live_catalog = catalog_for(*con->context);
+      REQUIRE(live_catalog->get(0).built->estimated_cardinality <= 1);
+      REQUIRE(live_catalog->get(1).built->estimated_cardinality <= 1);
+    }
+
+    // The plan is not just well-shaped — it still runs and joins correctly. CN arrival order:
+    // all pushes, then all closes, then run().
+    for (auto [sender, stream] :
+         {std::pair{left.get(), stream_id_t{0}}, std::pair{right.get(), stream_id_t{1}}}) {
+      std::size_t relayed = 0;
+      while (auto batch = sender->session().pull(0)) {
+        REQUIRE(receiver.session().push(stream, *batch));
+        ++relayed;
+      }
+      REQUIRE(relayed > 0);
+      receiver.session().close_input(stream, 0);
+    }
+
+    receiver.run();
+    receiver_window.finish();
+
+    // Both sides carry 1..5, so the equi-join yields exactly the 5 matches whichever side built.
+    REQUIRE(drain_row_count(receiver, 2) == kLeafRows);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-11: a fragment over an input stream that closes empty before run().
+// A hash fan-out gives one CN zero keys: its exchange input closes with zero
+// batches before run(), so the pipeline finishes between build() and run() —
+// before the query's completion handler exists — and no task is ever created
+// to carry the completion. run() must still return, with an empty result.
+//
+// This pins behaviour dev already has since #1624: the manager loop re-statuses
+// the scheduled head's pipeline once the query is live, and
+// update_pipeline_status() signals completion for a finished query-terminal
+// pipeline. It is the C++ mirror of the CN suite's
+// fragment_over_an_empty_input_stream_terminates; the watchdog guard turns a
+// regression into a named failure in seconds instead of a hung suite.
+// ============================================================================
+
+namespace {
+
+//! Turns a wedged run() into a loud failure: the engine-side scheduling watchdog
+//! (SIRIUS_QUERY_WATCHDOG_SECS) fails a query with no scheduling progress, and
+//! streaming_fragment::run() rethrows it — so a hang fails in seconds instead of
+//! blocking the suite forever. `secs` is the test's own threshold, sized for a fast
+//! GPU; a non-empty SIRIUS_TEST_WATCHDOG_SECS in the environment overrides it so a
+//! slow CI machine can raise every guarded test at once without editing the tests.
+//! Restores whatever the environment held before.
+struct watchdog_guard {
+  explicit watchdog_guard(const char* secs)
+  {
+    if (const char* previous = std::getenv("SIRIUS_QUERY_WATCHDOG_SECS")) { _previous = previous; }
+    const char* override_secs = std::getenv("SIRIUS_TEST_WATCHDOG_SECS");
+    setenv("SIRIUS_QUERY_WATCHDOG_SECS",
+           (override_secs != nullptr && *override_secs != '\0') ? override_secs : secs,
+           1);
+  }
+  ~watchdog_guard()
+  {
+    if (_previous) {
+      setenv("SIRIUS_QUERY_WATCHDOG_SECS", _previous->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_QUERY_WATCHDOG_SECS");
+    }
+  }
+  watchdog_guard(const watchdog_guard&)            = delete;
+  watchdog_guard& operator=(const watchdog_guard&) = delete;
+
+ private:
+  std::optional<std::string> _previous;
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-11: a fragment over an input stream that closes empty before run() "
+                 "terminates",
+                 "[integration][streaming_fragment]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  // The query does no GPU work at all, so 20 s of zero scheduling progress is a wedge, not a
+  // slow kernel: a regression fails here in seconds instead of hanging the suite. On a slow CI
+  // GPU, export SIRIUS_TEST_WATCHDOG_SECS to raise the threshold without touching the test.
+  watchdog_guard watchdog("20");
+
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+    spec.inputs[0]   = stream_input_spec{
+        {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+        {0}};
+    spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(spec));
+
+    query_window window(*sirius_ctx, *con->context, "frag11_receiver");
+    receiver.build(window.query_id());
+
+    // No sender ever parked a batch for this partition; the stream just ends, before run().
+    receiver.session().close_input(0, 0);
+
+    receiver.run();
+    window.finish();
+
+    // The premise, not just the outcome: nothing was scheduled, so no task epilogue could have
+    // carried the completion signal that let run() return.
+    std::size_t created = 0, completed = 0;
+    for (const auto& p : receiver.engine().sirius_pipelines) {
+      created += p->get_tasks_created();
+      completed += p->get_tasks_completed();
+    }
+    INFO("pipelines=" << receiver.engine().sirius_pipelines.size() << " tasks_created=" << created
+                      << " tasks_completed=" << completed);
+    REQUIRE(created == 0);
+    REQUIRE(completed == 0);
+
+    // An empty stream yields no rows — but it must yield.
+    REQUIRE(drain_row_count(receiver, 1) == 0);
 
     con->Rollback();
   } catch (...) {

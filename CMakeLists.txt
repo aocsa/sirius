@@ -291,6 +291,7 @@ set(EXTENSION_SOURCES
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
     src/exec/batch_stream.cpp
+    src/exec/exchange_staging_arena.cpp
     src/exec/stream_session.cpp
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
@@ -337,6 +338,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
+    src/op/scan/parquet_byte_range.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_filter_analysis.cpp
@@ -417,6 +419,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/planner/substrait_scan_ranges.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
     src/scan_manager/insert_delta_job.cpp
@@ -691,6 +694,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_staging_arena.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -743,6 +747,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
+    test/cpp/integration/test_pin_table_file_subset.cpp
     test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_mvcc_insert.cpp
@@ -874,6 +879,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
+    test/cpp/scan/test_parquet_byte_range.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
@@ -943,7 +949,13 @@ target_include_directories(
     # landed.
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
-)
+    # test/cpp/exec/test_sirius_ffi_fragment.cpp builds the Substrait plan it
+    # hands to Fragment::build() with the bundled protobuf (substrait/*.pb.h):
+    # the same two header roots from_substrait.hpp needs on the extension
+    # targets above. The generated code itself is already linked in through
+    # sirius_extension.
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")
