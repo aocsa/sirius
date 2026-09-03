@@ -814,11 +814,17 @@ set_and_verify_global() {
 }
 
 # Value of one FE config key (ADMIN SHOW FRONTEND CONFIG: Key, AliasNames, Value, Type, IsMutable,
-# Comment), resolved from the header row; empty when the FE does not know the key.
+# Comment), resolved from the header row. Empty with status 0 when the FE does not know the key;
+# status 1 with the error on stderr when the statement itself failed (same contract as bench.sh).
 frontend_config() {
-  "${MYSQL[@]}" -e "ADMIN SHOW FRONTEND CONFIG LIKE '$1';" 2>/dev/null | awk -F'\t' '
-    NR == 1 { for (i = 1; i <= NF; i++) if ($i == "Value") c = i; next }
-    c { print $c }'
+  local out
+  if ! out=$("${MYSQL[@]}" -e "ADMIN SHOW FRONTEND CONFIG LIKE '$1';" 2>&1); then
+    echo "ADMIN SHOW FRONTEND CONFIG LIKE '$1' failed: $out" >&2
+    return 1
+  fi
+  printf '%s\n' "$out" | awk -F'\t' '
+    !c { for (i = 1; i <= NF; i++) if ($i == "Value") c = i; next }
+    { print $c }'
 }
 
 # =================================================================================================
@@ -991,7 +997,12 @@ $BLACKLIST_TXT
   # the CBO can keep a CTE materialised, which emits MULTI_CAST_DATA_STREAM_SINK -- a sink the
   # Sirius CN refuses by name. cbo_cte_reuse=false reproduces the inline plans every query ran
   # with before the FE had cardinalities. Engine B is stock StarRocks and keeps its defaults.
-  say "  files_scan_estimate_row_count = $(frontend_config files_scan_estimate_row_count)"
+  local files_row_count_knob
+  if ! files_row_count_knob=$(frontend_config files_scan_estimate_row_count); then
+    warn "engine A: could not read the FE config (see above). Aborting."
+    return 1
+  fi
+  say "  files_scan_estimate_row_count = ${files_row_count_knob:-<not exposed by this FE>}"
   if ! set_and_verify_global cbo_cte_reuse false; then
     warn "engine A: cbo_cte_reuse read back as '${GLOBAL_READBACK:-<empty>}', wanted 'false'. Aborting."
     return 1

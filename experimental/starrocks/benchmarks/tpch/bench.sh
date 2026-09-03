@@ -156,17 +156,24 @@ fi
 echo "cluster: $ALIVE_CN alive compute nodes + $ALIVE_BE alive backends (MIN_BACKENDS=$MIN_BACKENDS)"
 
 # Value of one FE config key, resolved from the header row of ADMIN SHOW FRONTEND CONFIG (Key,
-# AliasNames, Value, Type, IsMutable, Comment); empty when the FE does not know the key.
+# AliasNames, Value, Type, IsMutable, Comment). Empty output with status 0 means the FE does not
+# know the key (a stock front end); a failed statement returns 1 with the error on stderr, so a
+# patched FE that refuses the query is never mistaken for a stock one.
 frontend_config() {
-  $MYSQL -e "ADMIN SHOW FRONTEND CONFIG LIKE '$1';" 2>/dev/null | awk -F'\t' '
-    NR == 1 { for (i = 1; i <= NF; i++) if ($i == "Value") c = i; next }
-    c { print $c }'
+  local out
+  if ! out=$($MYSQL -e "ADMIN SHOW FRONTEND CONFIG LIKE '$1';" 2>&1); then
+    echo "ADMIN SHOW FRONTEND CONFIG LIKE '$1' failed: $out" >&2
+    return 1
+  fi
+  printf '%s\n' "$out" | awk -F'\t' '
+    !c { for (i = 1; i <= NF; i++) if ($i == "Value") c = i; next }
+    { print $c }'
 }
 
 # Global session variables persist in FE metadata, so whatever the last run left behind is what
-# the next run gets: set explicitly and READ IT BACK (run-abc.sh does the same for the pipeline
-# engine).
-set_global_and_verify() {
+# the next run gets: set explicitly and READ IT BACK (run-abc.sh has the same helper under the
+# same name).
+set_and_verify_global() {
   local name=$1 want=$2 got
   $MYSQL -e "SET GLOBAL $name = $want;" >/dev/null 2>&1
   got=$($MYSQL -e "SHOW GLOBAL VARIABLES LIKE '$name';" 2>/dev/null | awk -F'\t' 'NR == 2 {print tolower($2)}')
@@ -183,10 +190,10 @@ set_global_and_verify() {
 # sink the Sirius CN refuses by name. cbo_cte_reuse=false reproduces the inline plans every
 # query ran with before the FE had cardinalities. A stock FE (engine B) has no such knob and
 # keeps its own defaults.
-FILES_ROW_COUNT_KNOB=$(frontend_config files_scan_estimate_row_count)
+FILES_ROW_COUNT_KNOB=$(frontend_config files_scan_estimate_row_count) || exit 1
 if [ -n "$FILES_ROW_COUNT_KNOB" ]; then
   echo "files_scan_estimate_row_count = $FILES_ROW_COUNT_KNOB (patched FE)"
-  set_global_and_verify cbo_cte_reuse false || exit 1
+  set_and_verify_global cbo_cte_reuse false || exit 1
 else
   echo "files_scan_estimate_row_count: not exposed by this FE (stock front end); cbo_cte_reuse left at its default"
 fi

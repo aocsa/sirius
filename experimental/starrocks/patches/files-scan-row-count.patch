@@ -1,5 +1,5 @@
 diff --git a/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java b/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
-index 2a8a9b16e07..0bae94e02fa 100644
+index 2a8a9b16e07..d719a1a1f2d 100644
 --- a/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
 +++ b/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
 @@ -19,6 +19,7 @@ import com.google.common.base.Splitter;
@@ -22,19 +22,18 @@ index 2a8a9b16e07..0bae94e02fa 100644
      private MisMatchFillValue misMatchFillValue = MisMatchFillValue.NONE;
  
      // for unload data
-@@ -272,6 +278,11 @@ public class TableFunctionTable extends Table {
+@@ -272,6 +278,10 @@ public class TableFunctionTable extends Table {
  
          // set schema
          setNewFullSchema(columns);
 +
 +        // One line per statement so a plan can be traced to the cardinality path it was built with.
 +        LOG.info("FILES() statistics path={} files={} bytes={} rows={} source={}",
-+                path, fileStatuses.size(), getTotalFileBytes(), estimateRowCount(),
-+                hasExactRowCount() ? "footer" : "estimated");
++                path, fileStatuses.size(), getTotalFileBytes(), estimateRowCount(), rowCountSource());
      }
  
      private void checkDuplicateColumns(List<Column> columns) throws DdlException {
-@@ -301,6 +312,55 @@ public class TableFunctionTable extends Table {
+@@ -301,6 +311,75 @@ public class TableFunctionTable extends Table {
          return fileStatuses;
      }
  
@@ -49,16 +48,36 @@ index 2a8a9b16e07..0bae94e02fa 100644
 +        return bytes;
 +    }
 +
-+    /** The inferred file schema without the trailing columns_from_path entries, which occupy no file bytes. */
++    /**
++     * The inferred file schema without the columns_from_path entries, which occupy no file bytes. Matched by name
++     * (case-insensitive, as checkDuplicateColumns compares) rather than by trailing position: the full-schema
++     * push-down of INSERT ... SELECT FROM FILES() rebuilds the schema from the SELECT list and may drop or reorder
++     * the path columns.
++     */
 +    public List<Column> getFileColumns() {
-+        List<Column> all = getFullSchema();
-+        int fileColumns = all.size() - columnsFromPath.size();
-+        return all.subList(0, Math.max(0, fileColumns));
++        Set<String> pathColumns = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
++        pathColumns.addAll(columnsFromPath);
++        return getFullSchema().stream()
++                .filter(c -> !pathColumns.contains(c.getName()))
++                .collect(Collectors.toList());
++    }
++
++    /** False when estimateRowCount() answers 1 by rule: knob off, LIST_FILES table, or no files listed. */
++    private boolean rowCountEstimated() {
++        return Config.files_scan_estimate_row_count && !listFilesOnly && !fileStatuses.isEmpty();
 +    }
 +
 +    /** True when estimateRowCount() returns the footer total the compute node reported rather than an estimate. */
 +    public boolean hasExactRowCount() {
-+        return footerRowCount > 0;
++        return rowCountEstimated() && footerRowCount > 0;
++    }
++
++    /** Which path estimateRowCount() took, for the per-statement INFO line: footer, estimated or disabled. */
++    private String rowCountSource() {
++        if (hasExactRowCount()) {
++            return "footer";
++        }
++        return rowCountEstimated() ? "estimated" : "disabled";
 +    }
 +
 +    /**
@@ -70,10 +89,10 @@ index 2a8a9b16e07..0bae94e02fa 100644
 +     * upstream's 1 row for every FILES() scan.
 +     */
 +    public long estimateRowCount() {
-+        if (!Config.files_scan_estimate_row_count || listFilesOnly || fileStatuses.isEmpty()) {
++        if (!rowCountEstimated()) {
 +            return 1;
 +        }
-+        if (footerRowCount > 0) {
++        if (hasExactRowCount()) {
 +            return footerRowCount;
 +        }
 +        long bytes = getTotalFileBytes();
@@ -90,7 +109,7 @@ index 2a8a9b16e07..0bae94e02fa 100644
      // for list files
      // must be consistent with list files schema
      public List<List<String>> listFilesAndDirs() {
-@@ -722,6 +782,12 @@ public class TableFunctionTable extends Table {
+@@ -722,6 +801,12 @@ public class TableFunctionTable extends Table {
              throw new DdlException("failed to get file schema, path: " + path + ", error: " + result.status.errorMsgs);
          }
  
@@ -183,7 +202,7 @@ index f58886ccae4..e342ad25452 100644
  
          return visitOperator(node, context);
 diff --git a/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java b/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
-index 46f81a161c2..f6f8694cceb 100644
+index 46f81a161c2..8fca3536364 100644
 --- a/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
 +++ b/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
 @@ -15,13 +15,22 @@
@@ -239,7 +258,7 @@ index 46f81a161c2..f6f8694cceb 100644
  
  public class TableFunctionTableTest {
  
-@@ -233,6 +251,135 @@ public class TableFunctionTableTest {
+@@ -233,6 +251,169 @@ public class TableFunctionTableTest {
                  () -> new TableFunctionTable(properties));
      }
  
@@ -264,6 +283,17 @@ index 46f81a161c2..f6f8694cceb 100644
 +        } finally {
 +            Config.files_scan_estimate_row_count = saved;
 +        }
++
++        // The full-schema push-down of INSERT ... SELECT FROM FILES() rebuilds the schema from the SELECT list, so
++        // the path columns may be reordered or dropped: they are excluded by name, not by trailing position. Here
++        // col_path1 leads and col_path2/col_path3 are gone; a trailing-position rule would leave 0 file columns.
++        List<Column> all = table.getFullSchema();
++        table.setNewFullSchema(Lists.newArrayList(all.get(2), all.get(1), all.get(0)));
++        Assertions.assertEquals("col_path1", table.getFullSchema().get(0).getName());
++        Assertions.assertEquals(2, table.getFileColumns().size());
++        Assertions.assertEquals("col_string", table.getFileColumns().get(0).getName());
++        Assertions.assertEquals("col_int", table.getFileColumns().get(1).getName());
++        Assertions.assertEquals(153L, table.estimateRowCount());
 +    }
 +
 +    @Test
@@ -355,6 +385,29 @@ index 46f81a161c2..f6f8694cceb 100644
 +            Assertions.assertEquals((long) (Long) c[1], table.estimateRowCount(), "numRows=" + c[0]);
 +            Assertions.assertEquals((boolean) (Boolean) c[2], table.hasExactRowCount(), "numRows=" + c[0]);
 +        }
++
++        // With the knob off the footer total is not used either, and hasExactRowCount() says so: the INFO line
++        // must not read rows=1 source=footer.
++        PGetFileSchemaResult result = new PGetFileSchemaResult();
++        result.status = new StatusPB();
++        result.status.statusCode = TStatusCode.OK.getValue();
++        result.schema = Lists.newArrayList(intSlot("col_int"));
++        result.numRows = 1000L;
++        reply.set(result);
++        Map<String, String> properties = new HashMap<>();
++        properties.put("path", "hdfs://127.0.0.1:9000/dir/*");
++        properties.put("format", "parquet");
++        TableFunctionTable table = new TableFunctionTable(properties);
++        Assertions.assertTrue(table.hasExactRowCount());
++        boolean saved = Config.files_scan_estimate_row_count;
++        try {
++            Config.files_scan_estimate_row_count = false;
++            Assertions.assertEquals(1L, table.estimateRowCount());
++            Assertions.assertFalse(table.hasExactRowCount());
++        } finally {
++            Config.files_scan_estimate_row_count = saved;
++        }
++        Assertions.assertEquals(1000L, table.estimateRowCount());
 +    }
 +
 +    /** One INT slot as the compute node reports it (TypeDeserializer.fromProtobuf reads types[0].scalarType.type). */

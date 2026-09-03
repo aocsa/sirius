@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::file_schema::{self, FilesSchema};
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{
@@ -688,7 +689,7 @@ impl PInternalService for SiriusComputeNodeService {
     ) -> Result<crate::prpc::Reply<PGetFileSchemaResult>, crate::prpc::Error> {
         let started = std::time::Instant::now();
         let result = match Self::file_schema_from_attachment(&attachment).await {
-            Ok(crate::file_schema::FilesSchema {
+            Ok(FilesSchema {
                 slots,
                 files,
                 num_rows,
@@ -1702,7 +1703,7 @@ impl SiriusComputeNodeService {
     /// range per file.
     async fn file_schema_from_attachment(
         attachment: &[u8],
-    ) -> std::result::Result<crate::file_schema::FilesSchema, String> {
+    ) -> std::result::Result<FilesSchema, String> {
         let request = Self::deserialize_binary::<TGetFileSchemaRequest>(attachment)
             .map_err(|err| format!("failed to deserialize TGetFileSchemaRequest: {err}"))?;
         let broker = request.scan_range.broker_scan_range.ok_or_else(|| {
@@ -1724,7 +1725,7 @@ impl SiriusComputeNodeService {
                 Ok(range.path)
             })
             .collect::<std::result::Result<Vec<_>, String>>()?;
-        crate::file_schema::parquet_files_schema(&paths).await
+        file_schema::parquet_files_schema(&paths).await
     }
 
     /// Deserializes a thrift struct using the StarRocks binary attachment protocol.

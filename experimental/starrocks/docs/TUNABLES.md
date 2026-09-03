@@ -61,6 +61,11 @@ Session variables that start to matter once FILES() has cardinalities: `cbo_cte_
 reads it back at bring-up), `broadcast_row_limit` (15M rows, the broadcast guard),
 `exec_mem_limit` (2 GiB; a broadcast build above it costs x1000).
 
+Landing order for `files_scan_estimate_row_count = true`: with real counts the CBO commutes a
+LEFT SEMI join to RIGHT SEMI once the outer side is the smaller one (TPC-H q04's EXISTS, q20's
+IN subqueries), and a CN whose translator has no `RIGHT_SEMI_JOIN` arm refuses those plans
+with `hash join type is unsupported`. Run the knob `false` against such a CN.
+
 ## Debug
 
 `SIRIUS_CN_DUMP_FRAGMENTS` writes received fragments and translated plans.

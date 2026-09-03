@@ -125,8 +125,8 @@ fn require_proto_patch(
 
 /// The text between `message <name> {` and its closing `}`, or empty when the message is absent.
 ///
-/// Scoped lookups matter because a field name such as `num_rows` appears in several messages;
-/// only its presence in the named message says whether that patch is applied.
+/// Scoped so the check stays correct if another message ever gains a field of the same name
+/// (`num_rows`, say): only its presence in the named message says whether that patch is applied.
 fn message_body<'a>(contents: &'a str, name: &str) -> &'a str {
     let Some(start) = contents.find(&format!("message {name} {{")) else {
         return "";
