@@ -39,11 +39,12 @@ RESTART_CMD='pkill -f "[s]irius-starrocks-cn"; pkill -f "[S]tarRocksFE"; sleep 5
   ./bench.sh /tmp/bench/A/timings.csv 3
 ```
 
-**Caveat (as of 2026-08-07):** the CN does not implement `cancel_plan_fragment`, so a
-hung or mid-execution-failed query strands its fragments; the stranded fragments
-eventually starve the CNs and the FE reports "No available backends" for everything
-after. `RESTART_CMD` is therefore mandatory for A — without it, every measurement
-after the first failure is invalid.
+**Caveat:** the CN's `cancel_plan_fragment` retires a cancelled query's parked output
+and rendezvous state and refuses its later fragments, but it cannot abort a fragment
+already inside the engine's `run()`; a query wedged there still strands that fragment
+until it ends, and the stranded fragment starves the CN (the FE reports "No available
+backends" for everything after). `RESTART_CMD` therefore stays mandatory for A —
+without it, every measurement after a wedge is invalid.
 
 ## Engine B (stock StarRocks baseline)
 

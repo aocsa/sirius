@@ -816,7 +816,7 @@ Notes, each grounded:
 * **`runs` is positional and mandatory before a query subset.** `bench.sh out.csv q05` sets
   `RUNS=q05` (`bench.sh:73-74`). Always write `bench.sh out.csv 3 q05`.
 * **No `RESTART_CMD`.** Stock BEs clean up after a failed query; that variable exists for engine A,
-  whose CN has no `cancel_plan_fragment`.
+  whose CN cannot abort a fragment already running inside the engine.
 * Run 0 is discarded unless `--cold`; `runs 3` therefore executes 4 mysql invocations per query.
 * Output: the CSV goes exactly where argv points; raw per-run mysql output lands in
   `<dirname>/qNN.rN.out`. Header is `query,run,phase,status,ms,rows`.

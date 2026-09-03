@@ -10,6 +10,7 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+pub use crate::parked_registry::RetireTrigger;
 use crate::result_store::FragmentInstanceId;
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
@@ -220,6 +221,20 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         let _ = slot;
         Err("this fragment executor parks nothing to drop".to_string())
+    }
+
+    /// Drops every parked output of `query_id` and refuses later runs for it. Non-blocking and
+    /// idempotent. Called when the CN learns the query is over: a fragment failed before the engine
+    /// ran it, or the FE cancelled. Unlike `drop_parked` this is a sweep, not an exactly-once
+    /// release, so an executor that parks nothing succeeds trivially.
+    fn retire_query(
+        &self,
+        query_id: FragmentInstanceId,
+        trigger: RetireTrigger,
+        cause: &str,
+    ) -> Result<(), String> {
+        let _ = (query_id, trigger, cause);
+        Ok(())
     }
 
     /// Pins a table into the engine's scan cache (`CALL pin_table` semantics). Blocks for the

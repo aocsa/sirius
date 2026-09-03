@@ -377,8 +377,8 @@ Engine B (stock StarRocks 3.5.20, 1 BE per host, same files) for comparison: 21/
 no `ERROR` on line 1. Row counts are recorded and **never compared**. A query returning 1 row
 instead of 100,000 registers as a fast win. Oracle every quoted query against DuckDB.
 
-**The staging-lease leak cascades — this is the big one.** A failed query strands its staging
-leases (there is no `cancel_plan_fragment`), and the arena never recovers:
+**The staging-lease leak cascades — this is the big one.** A failed query stranded its staging
+leases (`cancel_plan_fragment` did not release them at the time), and the arena never recovered:
 
 ```
 q08:  OOM at operator HASH_JOIN (index 0)                    <- real, 165.8 s, 100 retries

@@ -41,7 +41,8 @@ That build side is **real, not a bad estimate**:
 The `× 10⁶` is simply SF100's supplier row count. The join OOMs after 100 retries, and
 `engine.rs`'s blanket `parked.clear()` then wipes every parked sender output — so the FE reported
 the collateral `no parked sender output to export for SenderSlot` error and the real cause was
-discarded. (That masking is fixed separately; the wipe now records and reports the true cause.)
+discarded. (That masking is fixed separately; the wipe now records and reports the true cause, and
+it is scoped to the failing query: another query's parked output is never collateral.)
 
 Reordering so every adjacent pair shares a predicate removes the cross join entirely: 0 NESTLOOP,
 7 HASH JOIN for q08. **No session variables are required** — with `cardinality: 1` everywhere the

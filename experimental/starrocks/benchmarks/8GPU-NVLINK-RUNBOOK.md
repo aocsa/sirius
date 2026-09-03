@@ -432,10 +432,10 @@ Arguments and environment:
 | `RESTART_CMD` | full cluster restart after a wedge |
 | `FE_PORT` | default 9030 |
 
-`RESTART_CMD` is **mandatory for engine A.** The CN does not implement `cancel_plan_fragment`,
-so a hung or mid-execution-failed query strands its fragments; the stranded fragments starve
-the CNs and the FE then answers "No available backends" for everything after. Without the
-restart, every measurement following the first failure is invalid.
+`RESTART_CMD` is **mandatory for engine A.** The CN's `cancel_plan_fragment` cannot abort a
+fragment already running inside the engine, so a hung query strands that fragment; the stranded
+fragment starves the CN and the FE then answers "No available backends" for everything after.
+Without the restart, every measurement following a wedge is invalid.
 
 Note the `[s]irius-starrocks-cn` bracket pattern — it stops `pkill` matching its own command
 line and killing your shell. The CN binary is `sirius-starrocks-cn`, not
@@ -528,8 +528,8 @@ If q09-style queries fail with a staging-arena error, raise
 
 ## 14. Known limitations of engine A
 
-- No `cancel_plan_fragment` — hung queries strand fragments; `RESTART_CMD` is mandatory.
-- No cancel/GC path generally.
+- `cancel_plan_fragment` cannot abort a running fragment — hung queries strand it;
+  `RESTART_CMD` is mandatory.
 - `DISTINCT` aggregation is refused.
 - q02 hangs (engine-thread wedge, needs an engine-side abort/watchdog).
 - q15 flakes to an empty result ~1 run in 4.
