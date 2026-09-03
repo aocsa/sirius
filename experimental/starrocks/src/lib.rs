@@ -69,7 +69,7 @@ pub use brpc::BrpcServer;
 pub use compute_node_service::ExchangeIdentity;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
-pub use engine_settings::{EngineSettings, derive_sirius_config_yaml};
+pub use engine_settings::{EngineSettings, TelemetrySettings, derive_sirius_config_yaml};
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
 pub use gpu_affinity::{GpuSocket, cpu_affinity_for_gpu, gpu_socket};
 pub use nixl_transport::NixlTransport;

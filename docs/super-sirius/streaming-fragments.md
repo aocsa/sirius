@@ -137,8 +137,16 @@ struct fragment_spec {
   std::map<stream_id_t, stream_input_spec> inputs;     // schema + expected senders per input
   std::vector<stream_id_t> outputs;                    // positional: outputs[i] = partition i
   std::optional<op::partition_spec> partitioning;       // absent = single destination
+  std::optional<std::string> query_label;              // Quent Query instance_name
+  std::optional<std::string> session_label;            // Quent QueryGroup selector
 };
 ```
+
+`query_label` / `session_label` name the fragment's telemetry query (see
+[Quent telemetry](quent-telemetry.md#query-labels)): absent, the engine reports
+`sirius_streaming_fragment` in its default query group. The FFI's `Fragment::set_query_label`
+fills them, and passes the same `query_label` as the execution-window label so the engine log's
+window lines and the Quent Query agree.
 
 **Construction validates the spec eagerly:** a plan source is required, at least one output stream
 is required (a fragment with none is not this class's job — see the FFI's *result fragment* below),

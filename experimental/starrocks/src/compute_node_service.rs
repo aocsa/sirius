@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex, mpsc};
 
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
-use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot, StagedBatch};
+use crate::fragment_executor::{
+    FragmentExecutor, FragmentLabel, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
+};
 use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment, SenderSource};
 use crate::nixl_transport::{DrainTicket, NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
@@ -74,6 +76,12 @@ impl ExchangeIdentity {
     /// compares both), which is exactly what makes two CNs on one host see each other as remote.
     fn matches(&self, addr: &TNetworkAddress) -> bool {
         addr.hostname == self.host && addr.port == i32::from(self.brpc_port)
+    }
+
+    /// `host:brpc_port` — the name peers address this CN by (its nixl agent name) and the
+    /// `engine_name` its Quent telemetry reports, so a log line and a telemetry session agree.
+    fn endpoint(&self) -> String {
+        format!("{}:{}", self.host, self.brpc_port)
     }
 }
 
@@ -691,13 +699,26 @@ impl SiriusComputeNodeService {
             })
         };
         tracing::debug!(
-            exchange = ?key,
+            receiver_fragment_instance_id = %key.fragment_instance_id,
+            stream_id = key.node_id,
             sender_id,
             seq,
             eos,
             batch_bytes = batch.as_ref().map(|batch| batch.len),
+            rows = batch.as_ref().and_then(|batch| batch.rows),
             "received remote exchange frame"
         );
+        if eos {
+            // The receiver-side stitch for the sender's "transmitted batches via nixl" line: the
+            // eos frame's seq is the number of batch frames that preceded it on this stream.
+            info!(
+                receiver_fragment_instance_id = %key.fragment_instance_id,
+                stream_id = key.node_id,
+                sender_id,
+                frames = seq,
+                "remote exchange stream ended"
+            );
+        }
         if let Some(ready) = self.core.exchanges.push_remote_frame(
             key,
             sender_id,
@@ -938,15 +959,18 @@ impl ServiceCore {
                 "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
             })?;
             let result = self
-                .executor
-                .run(FragmentRun {
-                    plan: &translated,
-                    inputs: inputs.clone(),
-                    remote_inputs,
-                    outputs: Vec::new(),
-                    broadcast: false,
-                    hash_keys: Vec::new(),
-                })?
+                .run_labeled(
+                    "result",
+                    FragmentRun {
+                        plan: &translated,
+                        inputs: inputs.clone(),
+                        remote_inputs,
+                        outputs: Vec::new(),
+                        broadcast: false,
+                        hash_keys: Vec::new(),
+                        label: Self::fragment_label(params),
+                    },
+                )?
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
             self.results.insert(id, batch);
@@ -1079,14 +1103,18 @@ impl ServiceCore {
 
         // The sender's rows stay on the GPU, parked once with one output stream per
         // destination; only rendezvous bookkeeping and packed exports leave the engine thread.
-        self.executor.run(FragmentRun {
-            plan: &translated,
-            inputs,
-            remote_inputs,
-            outputs: slots.clone(),
-            broadcast,
-            hash_keys,
-        })?;
+        self.run_labeled(
+            "sender",
+            FragmentRun {
+                plan: &translated,
+                inputs,
+                remote_inputs,
+                outputs: slots.clone(),
+                broadcast,
+                hash_keys,
+                label: Self::fragment_label(params),
+            },
+        )?;
 
         // Local destinations first: their rendezvous is immediate bookkeeping and fails fast.
         let mut ready_receivers = Vec::new();
@@ -1127,6 +1155,7 @@ impl ServiceCore {
                     brpc_port: *brpc_port,
                     slot: *slot,
                     names: translated.output_names.clone(),
+                    label: Self::fragment_label(params),
                 };
                 match transport.start_fragment(spec) {
                     Ok(ticket) => drains.push(ticket),
@@ -1431,6 +1460,62 @@ impl ServiceCore {
             other => return format!("unknown (wire value {})", other.0),
         };
         name.to_string()
+    }
+
+    /// Runs one fragment on the executor, bracketed by this CN's start/finish lines. Those lines
+    /// carry the StarRocks query id, the fragment instance id, and this CN's exchange endpoint —
+    /// the same three names the engine's Quent Query label (`<query id>:<fragment instance id>`
+    /// in the group `<query id>`, engine `<endpoint>`) and the transport's transmit line use — so
+    /// one query's halves on different CNs can be stitched from logs and telemetry alike.
+    fn run_labeled(
+        &self,
+        role: &'static str,
+        run: FragmentRun<'_>,
+    ) -> std::result::Result<Option<FragmentResult>, String> {
+        let (query_id, fragment_instance_id) = run.label.log_ids();
+        let cn = self.identity.endpoint();
+        let inputs = run.inputs.len() + run.remote_inputs.len();
+        let outputs = run.outputs.len();
+        info!(
+            %query_id,
+            %fragment_instance_id,
+            %cn,
+            role,
+            inputs,
+            outputs,
+            "fragment run started"
+        );
+        let started = std::time::Instant::now();
+        let result = self.executor.run(run);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => info!(
+                %query_id,
+                %fragment_instance_id,
+                %cn,
+                role,
+                elapsed_ms,
+                "fragment run finished"
+            ),
+            Err(error) => info!(
+                %query_id,
+                %fragment_instance_id,
+                %cn,
+                role,
+                elapsed_ms,
+                %error,
+                "fragment run failed"
+            ),
+        }
+        result
+    }
+
+    /// The telemetry identity of a dispatched fragment: its query id and instance id.
+    fn fragment_label(params: &TExecPlanFragmentParams) -> FragmentLabel {
+        FragmentLabel {
+            query_id: Self::query_id(params),
+            fragment_instance_id: Self::fragment_instance_id(params),
+        }
     }
 
     /// Renders the ids that let an operator tie an error back to one FE-dispatched fragment.

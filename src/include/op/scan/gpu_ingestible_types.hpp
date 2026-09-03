@@ -18,8 +18,10 @@
 
 #include <io/sirius_datasource.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -84,6 +86,18 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   virtual ~scan_info() = default;
 
   virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
+
+  /// One storage object this split reads, for telemetry (telemetry::emit_scan_split_read).
+  /// `row_groups` are the format's row-group indices within `path`; `compressed_bytes` is what
+  /// the read is expected to fetch, 0 when the format does not account for it.
+  struct source_read {
+    std::string path;
+    std::vector<std::int64_t> row_groups;
+    std::size_t compressed_bytes = 0;
+  };
+
+  /// Storage reads this split issues; empty for splits that read nothing from storage.
+  [[nodiscard]] virtual std::vector<source_read> source_reads() const { return {}; }
 
   /**
    * @brief Estimated decoded bytes for projected data columns before row filtering.

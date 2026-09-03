@@ -45,7 +45,7 @@ use super::two_node_harness::{
     send_text, tune_socket,
 };
 use crate::engine::SiriusEngine;
-use crate::engine_settings::{EngineSettings, derive_sirius_config_yaml};
+use crate::engine_settings::{EngineSettings, TelemetrySettings, derive_sirius_config_yaml};
 use crate::fragment_executor::FragmentExecutor;
 
 /// 1 MiB, 16 MiB, 256 MiB: a fragment-sized payload, a large one, and one big enough that
@@ -362,6 +362,12 @@ fn bring_up_engine(config: &Config) -> Endpoint {
         None,
         &config.engine_dir,
         None,
+        // No telemetry: this harness times the transport, and a Quent session per run would
+        // only add engine work and files under the engine dir.
+        &TelemetrySettings {
+            enable_quent: false,
+            engine_name: "nixl-echo".to_string(),
+        },
     )
     .expect("a gpu memory limit yields a derived config");
     let config_path = config.engine_dir.join("sirius-echo.yaml");

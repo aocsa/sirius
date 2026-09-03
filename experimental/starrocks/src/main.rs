@@ -13,7 +13,8 @@ use sirius_starrocks_cn::{
 };
 #[cfg(feature = "sirius-engine")]
 use sirius_starrocks_cn::{
-    EngineSettings, SiriusEngine, cpu_affinity_for_gpu, derive_sirius_config_yaml,
+    EngineSettings, SiriusEngine, TelemetrySettings, cpu_affinity_for_gpu,
+    derive_sirius_config_yaml,
 };
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -93,6 +94,14 @@ struct EngineConfig {
     /// `sirius-cn-<brpc_port>` under the current working directory.
     #[arg(long)]
     engine_dir: Option<PathBuf>,
+
+    /// Emit Quent telemetry for this CN into `<engine-dir>/telemetry` (the derived config's
+    /// `sirius.telemetry.enable_quent`). Off by default so wall-clock runs write nothing;
+    /// `SIRIUS_CN_ENABLE_QUENT=1` is the environment equivalent. Only decorates a derived
+    /// config (a memory carve-out flag must be set); a `--sirius-config` file decides telemetry
+    /// itself, so the flag conflicts with it.
+    #[arg(long, conflicts_with = "sirius_config")]
+    enable_quent: bool,
 }
 
 /// Validates the shape of a byte-size flag: `^[0-9]+(\.[0-9]+)?\s*(B|[KMGT]i?B?)?$`. Only the
@@ -264,12 +273,19 @@ impl EngineConfig {
         // CN's GPU and its `numa_alloc_onnode` host arena. `None` (undiscoverable, or switched
         // off with SIRIUS_CN_CPU_AFFINITY) leaves them free-floating, as before.
         let cpu_affinity = cpu_affinity_for_gpu(self.gpu_device);
+        // Quent is named after this CN's exchange identity so its sessions, the transport's
+        // `dest` fields, and the FE's view of the node all say the same thing.
+        let telemetry = TelemetrySettings::resolve(
+            self.enable_quent,
+            format!("{}:{}", compute_node.advertise_host, compute_node.brpc_port),
+        );
         let config = match derive_sirius_config_yaml(
             self.gpu_memory_limit.as_deref(),
             self.gpu_memory_fraction,
             self.host_memory_limit.as_deref(),
             &engine_dir,
             cpu_affinity.as_deref(),
+            &telemetry,
         ) {
             Some(yaml) => {
                 std::fs::create_dir_all(&engine_dir).map_err(|err| {
@@ -285,10 +301,26 @@ impl EngineConfig {
                         path.display()
                     )
                 })?;
-                info!(config = %path.display(), "wrote derived Sirius config");
+                info!(
+                    config = %path.display(),
+                    enable_quent = telemetry.enable_quent,
+                    engine_name = %telemetry.engine_name,
+                    "wrote derived Sirius config"
+                );
                 Some(path)
             }
-            None => self.sirius_config.clone(),
+            None => {
+                if telemetry.enable_quent {
+                    // Without a derived config the YAML (or the engine's built-in defaults, which
+                    // keep Quent ON) decides; say so rather than let the switch vanish.
+                    warn!(
+                        "--enable-quent / SIRIUS_CN_ENABLE_QUENT only decorates a derived \
+                         config; with --sirius-config or no memory carve-out flag the engine \
+                         config decides telemetry"
+                    );
+                }
+                self.sirius_config.clone()
+            }
         };
         Ok(EngineSettings {
             config,
@@ -373,6 +405,7 @@ fn warn_engine_disabled(engine: &EngineConfig) {
         gpu_device,
         host_memory_limit,
         engine_dir,
+        enable_quent,
     } = engine;
     if sirius_config.is_some()
         || gpu_memory_limit.is_some()
@@ -380,11 +413,12 @@ fn warn_engine_disabled(engine: &EngineConfig) {
         || gpu_device.is_some()
         || host_memory_limit.is_some()
         || engine_dir.is_some()
+        || *enable_quent
     {
         warn!(
             "engine flags (--sirius-config / --gpu-memory-limit / --gpu-memory-fraction / \
-             --gpu-device / --host-memory-limit / --engine-dir) ignored: built without the \
-             `sirius-engine` feature"
+             --gpu-device / --host-memory-limit / --engine-dir / --enable-quent) ignored: built \
+             without the `sirius-engine` feature"
         );
     }
 }
@@ -775,6 +809,27 @@ mod tests {
                 .expect_err("memory flags must conflict with --sirius-config");
             assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
         }
+    }
+
+    /// A config file decides telemetry itself; the derived-config switch must not pretend to
+    /// override it.
+    #[test]
+    fn enable_quent_conflicts_with_sirius_config() {
+        let err = parse(&["--sirius-config", "sirius.yaml", "--enable-quent"])
+            .expect_err("--enable-quent must conflict with --sirius-config");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    /// Quent is off unless asked; the flag turns it on for a derived config.
+    #[test]
+    fn enable_quent_is_off_by_default() {
+        assert!(!parse(&[]).expect("no flags").engine.enable_quent);
+        assert!(
+            parse(&["--gpu-memory-limit", "8GiB", "--enable-quent"])
+                .expect("flag parses")
+                .engine
+                .enable_quent
+        );
     }
 
     /// `--gpu-device` is env-level (not a YAML key), so it composes with a config file.

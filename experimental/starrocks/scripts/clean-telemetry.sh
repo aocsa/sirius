@@ -8,6 +8,8 @@
 # exactly like a healthy one. Mixing them is how a distribution measurement gets contaminated.
 #
 # So: clean BEFORE every measured run, not after. One run in, one uuid per CN out.
+# (A CN only writes telemetry when started with --enable-quent / SIRIUS_CN_ENABLE_QUENT=1; the
+# derived config keeps it off otherwise.)
 #
 # Usage:
 #   ./scripts/clean-telemetry.sh              # wipe telemetry + logs under .cn*/ (refuses if live)

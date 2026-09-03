@@ -175,6 +175,17 @@ mod ffi {
         fn declare_output_broadcast(self: Pin<&mut Fragment>) -> Result<()>;
         fn declare_output_hash_key(self: Pin<&mut Fragment>, column_index: u32) -> Result<()>;
 
+        /// Name the fragment's query for telemetry and logs: `query_label` is
+        /// the Quent Query `instance_name` and execution-window label,
+        /// `session_label` the QueryGroup it joins (empty = the engine's
+        /// default group). Fallible: after `build` or on an empty
+        /// `query_label`.
+        fn set_query_label(
+            self: Pin<&mut Fragment>,
+            query_label: &CxxString,
+            session_label: &CxxString,
+        ) -> Result<()>;
+
         /// Plan `substrait_plan` against the declared streams and open the
         /// fragment's query lifecycle.
         fn build(self: Pin<&mut Fragment>, substrait_plan: &CxxString) -> Result<()>;

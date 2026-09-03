@@ -60,6 +60,12 @@ struct fragment_spec {
   std::vector<stream_id_t> outputs;
   /// Absent = gather (single destination, no partitioning).
   std::optional<op::partition_spec> partitioning;
+  /// Telemetry identity of the fragment's query: `query_label` becomes the Quent Query
+  /// `instance_name` (absent = "sirius_streaming_fragment"), `session_label` selects the
+  /// QueryGroup it joins (absent = the engine's default group). An embedding sets both to the
+  /// distributed query's ids so fragments on different processes line up under one label.
+  std::optional<std::string> query_label;
+  std::optional<std::string> session_label;
 };
 
 /// Owns repos/engine/session for one fragment.

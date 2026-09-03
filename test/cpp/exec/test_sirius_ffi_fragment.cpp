@@ -25,6 +25,7 @@
 // through the public API: that end_lifecycle() leaves the connection able to start and fail a
 // second, independent Fragment cleanly.
 
+#include "sirius/exception.hpp"
 #include "sirius_ffi.hpp"
 
 #include <catch.hpp>
@@ -100,6 +101,29 @@ TEST_CASE("Fragment destroyed between a failed build() and reuse also closes the
     declare_unresolvable_column(*first, "not_a_real_type_xyz");
     REQUIRE_THROWS(first->build(""));
   }
+
+  auto second = sirius::ffi::make_fragment(*context);
+  declare_unresolvable_column(*second, "also_not_a_real_type_xyz");
+  require_build_fails_without_transaction_exception(*second);
+}
+
+TEST_CASE("Fragment::set_query_label() rejects an empty label and leaves a failed build() clean",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+
+  auto labeled = sirius::ffi::make_fragment(*context);
+  // The label is the Quent Query instance_name and the engine window label; an empty one would
+  // silently fall back to the anonymous default, so it is refused instead.
+  REQUIRE_THROWS_AS(labeled->set_query_label("", "q42"), sirius::invalid_input_exception);
+  REQUIRE_NOTHROW(labeled->set_query_label("q42:frag7", "q42"));
+  // An empty session label means the engine's default query group, not an error.
+  REQUIRE_NOTHROW(labeled->set_query_label("q42:frag7", ""));
+
+  // Labeling must not disturb end_lifecycle(): a labeled fragment whose build() fails still
+  // leaves the connection able to start and fail a second fragment cleanly.
+  declare_unresolvable_column(*labeled, "not_a_real_type_xyz");
+  REQUIRE_THROWS(labeled->build(""));
 
   auto second = sirius::ffi::make_fragment(*context);
   declare_unresolvable_column(*second, "also_not_a_real_type_xyz");

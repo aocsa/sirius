@@ -307,6 +307,44 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
   });
 }
 
+void batch_telemetry_registry::on_stream_hop(const std::shared_ptr<cucascade::data_batch>& batch,
+                                             const batch_origin origin)
+{
+  if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
+
+  auto snap = snapshot(batch);
+  if (!snap) { return; }
+  auto tier_resource_id = impl_->tier_resource_id(snap->tier, snap->device_id);
+
+  // No consumer pipeline or port yet: the receiver's pipelines are built after the hop (relay and
+  // push_packed sit between build() and run()). The claiming task adopts this placement.
+  auto& shard = impl_->shard_of(snap->batch_id);
+  std::lock_guard lock(shard.mutex);
+  auto handle =
+    quent::batch_placement::create(impl_->context->context(),
+                                   {
+                                     .instance_name       = std::format("batch-{}", snap->batch_id),
+                                     .batch_id            = snap->batch_id,
+                                     .pipeline_uuid       = uuid::new_nil(),
+                                     .port_uuid           = uuid::new_nil(),
+                                     .origin              = std::string(to_string_view(origin)),
+                                     .tier_resource_id    = tier_resource_id,
+                                     .tier_capacity_bytes = snap->bytes,
+                                   });
+  handle->batch_queued({
+    .tier_resource_id    = tier_resource_id,
+    .tier_capacity_bytes = snap->bytes,
+  });
+  shard.placements[snap->batch_id].push_back(impl::placement{
+    .handle           = std::move(handle),
+    .pipeline_uuid    = uuid::new_nil(),
+    .task_uuid        = uuid::new_nil(),
+    .state            = impl::placement_state::queued,
+    .tier_resource_id = tier_resource_id,
+    .bytes            = snap->bytes,
+  });
+}
+
 void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
                                            uuid::UUID consumer_pipeline_uuid,
                                            uuid::UUID task_uuid)
@@ -332,6 +370,18 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
     for (auto& p : placements) {
       if (p.pipeline_uuid == consumer_pipeline_uuid && p.state != impl::placement_state::queued) {
         target = &p;
+        break;
+      }
+    }
+  }
+
+  if (target == nullptr) {
+    // A stream hop (relay_from / push_packed) queued this batch before any consumer pipeline
+    // existed; the first claimant adopts it so the hop time starts its queued span.
+    for (auto& p : placements) {
+      if (p.pipeline_uuid == uuid::new_nil() && p.state == impl::placement_state::queued) {
+        p.pipeline_uuid = consumer_pipeline_uuid;
+        target          = &p;
         break;
       }
     }

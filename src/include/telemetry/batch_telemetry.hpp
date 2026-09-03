@@ -43,6 +43,8 @@ enum class batch_origin : uint8_t {
   operator_output,          ///< pushed into a consumer port's repository
   partition_output,         ///< received by a partition consumer operator
   reschedule_intermediate,  ///< lazily registered at task claim
+  stream_relayed,  ///< moved into a receiver fragment's input stream by Fragment::relay_from
+  stream_pushed,   ///< unpacked from a staging lease into an input stream by Fragment::push_packed
 };
 
 constexpr std::string_view to_string_view(batch_origin origin)
@@ -51,6 +53,8 @@ constexpr std::string_view to_string_view(batch_origin origin)
     case batch_origin::operator_output: return "operator_output";
     case batch_origin::partition_output: return "partition_output";
     case batch_origin::reschedule_intermediate: return "reschedule_intermediate";
+    case batch_origin::stream_relayed: return "stream_relayed";
+    case batch_origin::stream_pushed: return "stream_pushed";
   }
   return "unknown";
 }
@@ -101,6 +105,13 @@ class batch_telemetry_registry {
   void on_published(const std::shared_ptr<cucascade::data_batch>& batch,
                     const cucascade::shared_data_repository* repo,
                     batch_origin origin);
+
+  /// A batch entered a receiver fragment's input stream through a stream hop
+  /// (`Fragment::relay_from`, `Fragment::push_packed`) before the consuming
+  /// pipeline exists: registered -> queued with nil pipeline and port. The first
+  /// task that claims the batch adopts the placement (see on_packaged), so the
+  /// hop's timestamp is where that consumer's queued span starts.
+  void on_stream_hop(const std::shared_ptr<cucascade::data_batch>& batch, batch_origin origin);
 
   /// A task claimed `batch` as input: queued -> packaged (re-claims re-emit
   /// packaged; unseen batches are lazily registered).

@@ -40,6 +40,7 @@ fails. There is no engine default — launchers pick a size per box.
 |---|---|
 | `SIRIUS_CN_USE_SIRIUS_DATASOURCE` | Scan backend. Default is the uring path; `false` selects kvikio/cudf. |
 | `SIRIUS_CN_CPU_AFFINITY` | Pin engine thread pools to a cpulist, or `off` to leave them free. Unset discovers the GPU's socket from sysfs. |
+| `SIRIUS_CN_ENABLE_QUENT` | Quent telemetry under `<engine-dir>/telemetry`, same as `--enable-quent`. Off unless set: the derived config always writes `enable_quent`, so a wall-clock run emits nothing. Only decorates a derived config; a `--sirius-config` file decides for itself. |
 | `SIRIUS_QUERY_WATCHDOG_SECS` | Kill a wedged statement so it does not poison the CN. `0` / unset is off. |
 
 GPU and host memory carve-outs are CLI flags (`--gpu-memory-limit`,
