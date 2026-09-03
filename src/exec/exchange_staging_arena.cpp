@@ -18,6 +18,7 @@
 
 #include "log/logging.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/staging_arena_telemetry.hpp"
 #include "yaml_reader.hpp"  // sirius::yaml::parse_bytes
 
 #include <cuda.h>
@@ -236,6 +237,7 @@ std::uint64_t exchange_staging_arena::lease(std::uint64_t len)
     leases_.emplace(offset, aligned);
     live_bytes_ += aligned;
     peak_live_bytes_ = std::max(peak_live_bytes_, live_bytes_);
+    if (probe_) { probe_->on_lease(offset, aligned); }
     return offset;
   }
 
@@ -269,6 +271,7 @@ void exchange_staging_arena::release(std::uint64_t offset)
   const auto len = it->second;
   leases_.erase(it);
   live_bytes_ -= len;
+  if (probe_) { probe_->on_release(offset); }
 
   // Insert and coalesce with both neighbours, so the free list never holds two adjacent blocks
   // and released space is reusable regardless of the order releases arrive in. Merge forward
@@ -289,6 +292,13 @@ void exchange_staging_arena::release(std::uint64_t offset)
       free_.erase(ins);
     }
   }
+}
+
+void exchange_staging_arena::attach_probe(
+  std::shared_ptr<sirius::telemetry::staging_arena_telemetry> probe)
+{
+  std::lock_guard lock(mutex_);
+  probe_ = std::move(probe);
 }
 
 std::uint64_t exchange_staging_arena::total_free_locked() const

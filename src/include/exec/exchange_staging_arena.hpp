@@ -21,6 +21,10 @@
 #include <memory>
 #include <mutex>
 
+namespace sirius::telemetry {
+class staging_arena_telemetry;
+}  // namespace sirius::telemetry
+
 namespace sirius::exec {
 
 /// One device staging region for the cross-node exchange: packed batches are gathered into a
@@ -119,6 +123,17 @@ class exchange_staging_arena {
   /// Sum of all free blocks.
   [[nodiscard]] std::uint64_t total_free() const;
 
+  /// Attach the Quent view of this arena (telemetry::staging_arena_telemetry); null detaches.
+  /// Every lease/release afterwards is reported, and the FFI reports pack/unpack transfers
+  /// through probe(). Off by default: without an attached probe the arena is telemetry-free.
+  void attach_probe(std::shared_ptr<sirius::telemetry::staging_arena_telemetry> probe);
+
+  /// The attached Quent view, or null.
+  [[nodiscard]] sirius::telemetry::staging_arena_telemetry* probe() const noexcept
+  {
+    return probe_.get();
+  }
+
  private:
   void* base_             = nullptr;
   std::uint64_t capacity_ = 0;
@@ -137,6 +152,8 @@ class exchange_staging_arena {
   std::map<std::uint64_t, std::uint64_t> leases_;  // offset -> aligned length
   std::uint64_t live_bytes_      = 0;
   std::uint64_t peak_live_bytes_ = 0;
+  //! Quent view; null until attach_probe(). Read under `mutex_` by lease()/release().
+  std::shared_ptr<sirius::telemetry::staging_arena_telemetry> probe_;
 
   //! Total free bytes and the largest single contiguous free block. Both are reported on
   //! exhaustion: the gap between them IS the external fragmentation, and it is the number that

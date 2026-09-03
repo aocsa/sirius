@@ -34,7 +34,8 @@ use tracing::{info, warn};
 
 use crate::engine_settings::EngineSettings;
 use crate::fragment_executor::{
-    FragmentExecutor, FragmentResult, FragmentRun, PinTableSpec, SenderSlot, StagedBatch,
+    FragmentExecutor, FragmentLabel, FragmentResult, FragmentRun, PinTableSpec, SenderSlot,
+    StagedBatch,
 };
 
 /// A sender fragment's parked output, shared by its destinations: stream i belongs to
@@ -67,6 +68,8 @@ struct ExecuteRequest {
     broadcast: bool,
     /// Hash-partition key columns for a hash fan-out (empty otherwise).
     hash_keys: Vec<usize>,
+    /// Telemetry identity: the engine's Quent Query label and this thread's log span.
+    label: FragmentLabel,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
 }
@@ -432,6 +435,20 @@ fn run_fragment<'ctx>(
     next_park_id: &mut u64,
     request: &ExecuteRequest,
 ) -> Result<Option<FragmentResult>, String> {
+    // Every engine-thread line of this run (relay, remote push, cardinality, lease sweep) carries
+    // the StarRocks ids; the span's close event is the engine-side elapsed time of the run.
+    let span = tracing::info_span!(
+        "fragment",
+        query_id = tracing::field::Empty,
+        fragment_instance_id = tracing::field::Empty
+    );
+    if let Some(id) = request.label.query_id {
+        span.record("query_id", tracing::field::display(id));
+    }
+    if let Some(id) = request.label.fragment_instance_id {
+        span.record("fragment_instance_id", tracing::field::display(id));
+    }
+    let _entered = span.enter();
     let mut released = std::collections::HashSet::new();
     let result = run_fragment_inner(
         context,
@@ -478,6 +495,15 @@ fn run_fragment_inner<'ctx>(
     let mut fragment = context
         .fragment()
         .map_err(|err| format!("failed to create fragment: {err}"))?;
+
+    // Name the engine's Quent Query after the StarRocks ids before build() opens it, so the
+    // telemetry of this fragment and of its peers on other CNs share one query group.
+    if let Some(query_label) = request.label.query_label() {
+        let session_label = request.label.session_label().unwrap_or_default();
+        fragment
+            .set_query_label(&query_label, &session_label)
+            .map_err(|err| format!("failed to label fragment {query_label}: {err}"))?;
+    }
 
     for schema in &request.stream_inputs {
         let stream_id = stream_id_of(schema.node_id)?;
@@ -659,6 +685,7 @@ fn run_fragment_inner<'ctx>(
             stream_id,
             sender_id,
             batches = batches.len(),
+            bytes = batches.iter().map(|batch| batch.len).sum::<u64>(),
             "received remote batches"
         );
     }
@@ -757,6 +784,7 @@ impl FragmentExecutor for SiriusEngine {
                 outputs: run.outputs,
                 broadcast: run.broadcast,
                 hash_keys: run.hash_keys,
+                label: run.label,
                 respond,
             })
         })
@@ -964,6 +992,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("execute fragment on GPU")
             .expect("a result fragment returns rows")
@@ -1063,6 +1092,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
                 respond: respond_tx,
             }))
             .unwrap();
@@ -1155,6 +1185,7 @@ mod tests {
                 outputs: vec![slot],
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("run the sender fragment");
 
@@ -1180,6 +1211,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("execute the remote-fed receiver on GPU")
             .expect("a result fragment returns rows");
@@ -1300,6 +1332,7 @@ mod tests {
                     outputs: vec![slot],
                     broadcast: false,
                     hash_keys: Vec::new(),
+                    label: FragmentLabel::default(),
                 })
                 .expect("run the sender fragment")
                 .is_none(),
@@ -1315,6 +1348,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("execute exchange receiver on GPU")
             .expect("a result fragment returns rows");

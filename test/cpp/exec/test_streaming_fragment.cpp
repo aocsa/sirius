@@ -20,6 +20,7 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "sirius_engine.hpp"
+#include "sirius_interface.hpp"
 
 #include <catch.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -1109,5 +1110,51 @@ TEST_CASE_METHOD(fragment_fixture,
   } catch (...) {
     con->Rollback();
     throw;
+  }
+}
+
+// ============================================================================
+// FRAG-L: fragment_spec labels reach the engine's interface — the fields quent::query::Init reads
+// ============================================================================
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-L: fragment_spec labels name the fragment's telemetry query",
+                 "[integration][streaming_fragment][telemetry]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  // (query_label, session_label) -> what the engine's sirius_interface must carry after build().
+  struct labeling {
+    std::optional<std::string> query_label;
+    std::optional<std::string> session_label;
+    std::string expected_query_label;
+  };
+  const auto expected_default = std::string("sirius_streaming_fragment");
+  for (const auto& [query_label, session_label, expected_query_label] :
+       {labeling{"q42:frag7", "q42", "q42:frag7"},
+        labeling{std::nullopt, std::nullopt, expected_default}}) {
+    fragment_spec spec;
+    spec.plan_source   = sirius::test::sql_plan_source(kLeafQuery);
+    spec.outputs       = {0};
+    spec.query_label   = query_label;
+    spec.session_label = session_label;
+
+    con->BeginTransaction();
+    try {
+      streaming_fragment fragment(*con->context, std::move(spec));
+      query_window window(*sirius_ctx, *con->context, "frag_l");
+      fragment.build(window.query_id());
+      // sirius_engine's constructor read these into quent::query::Init.instance_name and
+      // query_group_id_for(session_label); the unlabeled fragment keeps the anonymous default.
+      REQUIRE(fragment.engine().sirius_iface.query_label == expected_query_label);
+      REQUIRE(fragment.engine().sirius_iface.session_label == session_label);
+      fragment.run();
+      window.finish();
+      REQUIRE(drain_row_count(fragment, 0) == kLeafRows);
+      con->Rollback();
+    } catch (...) {
+      con->Rollback();
+      throw;
+    }
   }
 }

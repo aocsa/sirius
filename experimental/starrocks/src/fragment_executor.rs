@@ -48,6 +48,41 @@ pub struct SenderSlot {
     pub sender_id: i32,
 }
 
+/// Telemetry identity of one fragment run, shared by everything that reports on it.
+///
+/// The engine reports the fragment as the Quent Query `<query id>:<fragment instance id>` inside
+/// the QueryGroup `<query id>` (see `sirius::Fragment::set_query_label`), and the CN's own
+/// start/finish and transmit log lines carry the same two ids next to the CN's exchange endpoint,
+/// so the halves of one StarRocks query running on different CNs line up under one label.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FragmentLabel {
+    /// StarRocks query id, shared by every fragment instance of the query.
+    pub query_id: Option<FragmentInstanceId>,
+    /// The fragment instance the FE dispatched.
+    pub fragment_instance_id: Option<FragmentInstanceId>,
+}
+
+impl FragmentLabel {
+    /// Quent Query `instance_name`: `<query id>:<fragment instance id>`. `None` when the dispatch
+    /// carried no ids (translate-only fixtures), leaving the engine's anonymous default.
+    pub fn query_label(&self) -> Option<String> {
+        Some(format!("{}:{}", self.query_id?, self.fragment_instance_id?))
+    }
+
+    /// QueryGroup selector: the StarRocks query id.
+    pub fn session_label(&self) -> Option<String> {
+        self.query_id.map(|id| id.to_string())
+    }
+
+    /// The two ids as log-line text, `-` where the dispatch carried none.
+    pub fn log_ids(&self) -> (String, String) {
+        let text = |id: Option<FragmentInstanceId>| {
+            id.map_or_else(|| "-".to_string(), |id| id.to_string())
+        };
+        (text(self.query_id), text(self.fragment_instance_id))
+    }
+}
+
 /// One packed batch sitting in an exchange staging arena as cudf packed bytes.
 ///
 /// The neutral wire shape of the nixl tier: on the sender it names a lease in the *local* arena
@@ -126,6 +161,8 @@ pub struct FragmentRun<'a> {
     /// Hash-partition key columns (output column indices, in the exchange's shared
     /// partition-expression order). Non-empty exactly for a hash-partitioned fan-out.
     pub hash_keys: Vec<usize>,
+    /// Telemetry identity the engine labels this run's query with.
+    pub label: FragmentLabel,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
@@ -278,5 +315,27 @@ mod tests {
     fn stub_executor_handles_empty_output() {
         let result = StubExecutor.execute(&plan_with_outputs(&[])).unwrap();
         assert!(result.batches.is_empty());
+    }
+
+    /// The engine label is `<query id>:<fragment instance id>` in the group `<query id>`; a
+    /// dispatch without ids labels nothing (the engine keeps its default) but still logs `-`.
+    #[test]
+    fn fragment_label_renders_query_and_instance() {
+        let label = FragmentLabel {
+            query_id: Some(FragmentInstanceId::from_halves(1, 2)),
+            fragment_instance_id: Some(FragmentInstanceId::from_halves(1, 3)),
+        };
+        let (query, instance) = label.log_ids();
+        assert_eq!(
+            label.query_label().as_deref(),
+            Some(format!("{query}:{instance}").as_str())
+        );
+        assert_eq!(label.session_label().as_deref(), Some(query.as_str()));
+        assert_ne!(query, instance);
+
+        let unlabeled = FragmentLabel::default();
+        assert_eq!(unlabeled.query_label(), None);
+        assert_eq!(unlabeled.session_label(), None);
+        assert_eq!(unlabeled.log_ids(), ("-".to_string(), "-".to_string()));
     }
 }

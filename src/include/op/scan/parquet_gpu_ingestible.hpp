@@ -186,6 +186,23 @@ class parquet_split_info : public scan_info {
     return total;
   }
 
+  /// One entry per row-group slice: the file, its row groups, and the compressed column-chunk
+  /// bytes the read fetches for them.
+  [[nodiscard]] std::vector<source_read> source_reads() const override
+  {
+    std::vector<source_read> reads;
+    reads.reserve(rg_slices.size());
+    for (auto const& s : rg_slices) {
+      reads.push_back(source_read{
+        .path = s.file_path,
+        .row_groups =
+          std::vector<std::int64_t>(s.row_group_indices.begin(), s.row_group_indices.end()),
+        .compressed_bytes = s.reserved_compressed_bytes,
+      });
+    }
+    return reads;
+  }
+
   /// One fadvise_entry per row-group slice: the slice's datasource paired with
   /// the column-chunk byte ranges the read will fetch for that file's row groups
   /// (computed via @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring

@@ -310,6 +310,23 @@ impl Fragment<'_> {
         self.inner.pin_mut().declare_output_hash_key(column_index)
     }
 
+    /// Name this fragment's query for telemetry and logs. `query_label` becomes the Quent Query
+    /// `instance_name` and the engine's execution-window label (e.g. `<query id>:<fragment
+    /// instance id>`); `session_label` selects the QueryGroup it joins (e.g. the distributed
+    /// query id; empty = the engine's default group). Unlabeled fragments report as `sirius_ffi`.
+    /// Errs after [`build`](Fragment::build) or on an empty `query_label`.
+    pub fn set_query_label(
+        &mut self,
+        query_label: &str,
+        session_label: &str,
+    ) -> Result<(), Exception> {
+        let_cxx_string!(query_label = query_label);
+        let_cxx_string!(session_label = session_label);
+        self.inner
+            .pin_mut()
+            .set_query_label(&query_label, &session_label)
+    }
+
     /// Plan `substrait_plan` against the declared streams and open the fragment's query lifecycle.
     pub fn build(&mut self, substrait_plan: &[u8]) -> Result<(), Exception> {
         let_cxx_string!(plan = substrait_plan);
@@ -768,6 +785,51 @@ mod tests {
             let result = receiver.into_arrow().unwrap();
             assert_eq!(rows(&result), expected, "stream {output_stream}");
         }
+    }
+
+    /// The telemetry label rides the fragment into `build`: accepted before it (the C++ side
+    /// hands it to the engine as the Quent Query name), refused after, and refused when empty --
+    /// an empty label would silently fall back to the anonymous default. Requires a GPU.
+    #[test]
+    fn set_query_label_is_a_pre_build_declaration() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut fragment = ctx.fragment().unwrap();
+        assert!(
+            fragment.set_query_label("", "query-1").is_err(),
+            "an empty query label must be refused"
+        );
+        fragment
+            .set_query_label("query-1:instance-7", "query-1")
+            .expect("label before build");
+        fragment.build(&plan).unwrap();
+        assert!(
+            fragment
+                .set_query_label("query-1:instance-8", "query-1")
+                .is_err(),
+            "the label is read at build(); relabeling afterwards must be refused"
+        );
+        fragment.run().unwrap();
+        let result = fragment.into_arrow().unwrap();
+        assert_eq!(
+            rows(&result),
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ],
+            "a labeled fragment runs like an unlabeled one"
+        );
     }
 
     /// Hash-partitioned fan-out: two output streams partition the rows by key -- disjoint,

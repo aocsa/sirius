@@ -241,6 +241,14 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build(), or from build() itself when fewer than two outputs are declared.
   void declare_output_hash_key(std::uint32_t column_index);
 
+  /// Name this fragment's query for telemetry and logs. `query_label` becomes the Quent Query
+  /// `instance_name` and the engine's execution-window label (e.g. `<query id>:<fragment
+  /// instance id>`); `session_label` selects the QueryGroup the query joins (e.g. the
+  /// distributed query id; empty = the engine's default group). Unlabeled fragments report as
+  /// `sirius_ffi` in the default group.
+  /// @throws after build() or on an empty `query_label`.
+  void set_query_label(const std::string& query_label, const std::string& session_label);
+
   /// Lower and plan `substrait_plan` against the declared streams; open the query lifecycle.
   /// Creates a view `sirius_stream_<id>` for each declared input stream.
   /// @throws on translation/planning failure or if already built.

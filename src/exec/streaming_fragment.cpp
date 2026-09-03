@@ -180,7 +180,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
 
   // Engine owns the plan; fragment owns the engine so the sink stays pullable after run().
   _iface = std::make_unique<sirius::sirius_interface>(
-    _context, std::optional<std::string>(kFragmentQueryLabel));
+    _context, _spec.query_label.value_or(kFragmentQueryLabel), _spec.session_label);
   _engine = std::make_unique<sirius::sirius_engine>(_context, *_iface, query_id);
   _engine->initialize(std::move(sink));
 

@@ -440,6 +440,8 @@ set(EXTENSION_SOURCES
     src/telemetry/batch_telemetry.cpp
     src/telemetry/telemetry_context.cpp
     src/telemetry/memory_context.cpp
+    src/telemetry/scan_telemetry.cpp
+    src/telemetry/staging_arena_telemetry.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
@@ -887,6 +889,9 @@ set(TEST_SOURCES
     test/cpp/scan/test_stream_lineage_item5.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
+    test/cpp/telemetry/test_batch_stream_hop_telemetry.cpp
+    test/cpp/telemetry/test_scan_split_read_telemetry.cpp
+    test/cpp/telemetry/test_staging_arena_telemetry.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp

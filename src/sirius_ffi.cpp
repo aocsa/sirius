@@ -53,6 +53,8 @@
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_extension.hpp"  // duckdb::SiriusExtension (pin_table registration)
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
+#include "telemetry/batch_telemetry.hpp"          // sirius::telemetry::batch_telemetry_registry
+#include "telemetry/staging_arena_telemetry.hpp"  // sirius::telemetry::staging_arena_telemetry
 
 #include <cudf/contiguous_split.hpp>           // cudf::chunked_pack, cudf::unpack
 #include <cudf/table/table.hpp>                // cudf::table
@@ -218,6 +220,15 @@ struct Context::Impl {
     // After engine bring-up so the arena's cudaMalloc comes out of the headroom the operator
     // left beside the pool budget, not out of memory the pool then misses.
     staging_arena = sirius::exec::exchange_staging_arena::from_env();
+    if (staging_arena != nullptr) {
+      // The arena sits outside every cucascade memory space, so the engine's memory_context
+      // never sees it; give it its own Quent Memory and report leases and pack/unpack transfers
+      // as DataBatch transitions. Null telemetry context leaves the arena telemetry-free.
+      if (auto telemetry_context = context->get_telemetry_context()) {
+        staging_arena->attach_probe(std::make_shared<sirius::telemetry::staging_arena_telemetry>(
+          std::move(telemetry_context), &context->get_memory_manager(), staging_arena->capacity()));
+      }
+    }
 
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
@@ -433,6 +444,11 @@ struct Fragment::Impl {
   bool broadcast_outputs{false};
   std::vector<int> hash_key_columns;
 
+  // Telemetry identity (see Fragment::set_query_label): the Quent Query instance_name / window
+  // label, and the QueryGroup selector (nullopt = the engine's default group).
+  std::string query_label{kQueryLabel};
+  std::optional<std::string> session_label;
+
   // Resolved at build() time; kept so the hop entry points (relay_from, push_packed) can
   // validate an arriving batch against the schema the plan was bound against — a disagreement
   // there would otherwise reinterpret cudf columns silently.
@@ -604,6 +620,21 @@ void Fragment::declare_output_hash_key(std::uint32_t column_index)
   impl_->hash_key_columns.push_back(static_cast<int>(column_index));
 }
 
+void Fragment::set_query_label(const std::string& query_label, const std::string& session_label)
+{
+  impl_->require_not_built("set_query_label");
+  if (query_label.empty()) {
+    throw sirius::invalid_input_exception(
+      "Fragment: set_query_label needs a non-empty query_label");
+  }
+  impl_->query_label = query_label;
+  if (session_label.empty()) {
+    impl_->session_label.reset();
+  } else {
+    impl_->session_label = session_label;
+  }
+}
+
 void Fragment::build(const std::string& substrait_plan)
 {
   impl_->require_not_built("build");
@@ -628,7 +659,7 @@ void Fragment::build(const std::string& substrait_plan)
   // Open lifecycle (StandaloneQueryScope acquires the slot and begins the window).
   auto& client     = *impl_->ctx.conn->context;
   impl_->lifecycle = std::make_unique<duckdb::SiriusContext::StandaloneQueryScope>(
-    *impl_->ctx.context, client, kQueryLabel);
+    *impl_->ctx.context, client, impl_->query_label);
 
   try {
     // A routing mode needs at least two destinations to mean anything: with 0 or 1 declared
@@ -664,8 +695,10 @@ void Fragment::build(const std::string& substrait_plan)
       sirius::exec::fragment_spec spec;
       spec.plan_source = [plan = substrait_plan, conn = impl_->ctx.conn.get()](
                            duckdb::ClientContext&) { return lower_substrait(*conn, plan).plan; };
-      spec.inputs  = std::move(resolved);
-      spec.outputs = impl_->outputs;
+      spec.inputs        = std::move(resolved);
+      spec.outputs       = impl_->outputs;
+      spec.query_label   = impl_->query_label;
+      spec.session_label = impl_->session_label;
 
       if (impl_->broadcast_outputs && impl_->outputs.size() > 1) {
         sirius::op::partition_spec broadcast;
@@ -746,6 +779,10 @@ std::size_t Fragment::relay_from(Fragment& source,
 
   std::size_t moved = 0;
   while (auto batch = source.impl_->session().pull(source_stream_id)) {
+    // Registered before the push so the placement's `queued` precedes the receiver's `packaged`;
+    // this is where the batch's park on the sender's output stream ends.
+    telemetry::batch_telemetry_registry::instance().on_stream_hop(
+      *batch, telemetry::batch_origin::stream_relayed);
     if (!impl_->session().push(input_stream_id, *batch)) {
       throw sirius::invalid_input_exception("Fragment: input stream " +
                                             std::to_string(input_stream_id) +
@@ -817,6 +854,12 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
   // Each next() span is a full chunk long and starts where the previous copy ended, so the
   // final span can reach up to one chunk past the payload — hence the slack.
   const auto lease_offset = arena.lease(total + kPackChunkBytes);
+  // GPU pool -> staging lease as a DataBatch in_transit on the lease; a throw below releases
+  // the lease, which settles and destructs it.
+  auto* arena_probe = arena.probe();
+  if (arena_probe != nullptr) {
+    arena_probe->on_pack_started(lease_offset, space->get_id(), total);
+  }
   std::unique_ptr<std::vector<std::uint8_t>> metadata;
   try {
     auto* lease         = reinterpret_cast<std::uint8_t*>(arena.base()) + lease_offset;
@@ -834,6 +877,7 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
     metadata = packer->build_metadata();
     // The caller transmits from the lease the moment this returns.
     stream.synchronize();
+    if (arena_probe != nullptr) { arena_probe->on_pack_completed(lease_offset); }
   } catch (...) {
     arena.release(lease_offset);
     throw;
@@ -907,13 +951,28 @@ void Fragment::push_packed(std::uint64_t stream_id,
   // Copy-out-on-arrival: the batch the engine keeps lives in ordinary pool memory, so the lease
   // is reusable the moment this call returns and the batch is fully accounted and spillable
   // like any other.
+  // Staging lease -> GPU pool as a DataBatch in_transit on the lease. A metadata-only frame
+  // (length == 0) holds no lease, so offset 0 would name someone else's lease: skip it.
+  auto* arena_probe = length > 0 ? arena.probe() : nullptr;
+  if (arena_probe != nullptr) {
+    arena_probe->on_unpack_started(offset, gpu_space->get_id(), length);
+  }
   auto stream = cudf::get_default_stream();
   auto table  = std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
   stream.synchronize();
+  if (arena_probe != nullptr) { arena_probe->on_unpack_completed(offset); }
 
-  // A wire batch has no local producing operator, so there is no telemetry lineage to thread.
-  auto data_batch = sirius::make_data_batch(
-    std::move(table), *gpu_space, stream, telemetry::batch_telemetry_info{});
+  // A wire batch has no local producing pipeline (nil), but it is a real GPU-resident batch:
+  // probe it so it appears as a DataBatch, and register the hop so the receiver task's claim
+  // adopts the placement instead of lazily inventing one.
+  auto data_batch =
+    sirius::make_data_batch(std::move(table),
+                            *gpu_space,
+                            stream,
+                            telemetry::batch_telemetry_info{
+                              impl_->ctx.context->get_telemetry_context().get(), uuid::new_nil()});
+  telemetry::batch_telemetry_registry::instance().on_stream_hop(
+    data_batch, telemetry::batch_origin::stream_pushed);
   if (!impl_->session().push(stream_id, std::move(data_batch))) {
     throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
                                           " refused a packed batch; it had already ended");
@@ -938,9 +997,9 @@ void Fragment::run()
   try {
     if (impl_->is_result()) {
       auto& client = *impl_->ctx.conn->context;
-      sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
+      sirius::sirius_interface iface(client, impl_->query_label, impl_->session_label);
       impl_->result = iface.sirius_execute_query(client,
-                                                 kQueryLabel,
+                                                 impl_->query_label,
                                                  impl_->result_plan,
                                                  duckdb::PendingQueryParameters{},
                                                  impl_->lifecycle->query_id());

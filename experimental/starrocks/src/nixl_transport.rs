@@ -17,7 +17,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::fragment_executor::SenderSlot;
+use crate::fragment_executor::{FragmentLabel, SenderSlot};
 use crate::prpc_client::PrpcClient;
 
 /// Bring-up pre-establishment of the peer sessions; see the module for why it exists.
@@ -52,6 +52,8 @@ pub(crate) struct RemoteSendSpec {
     pub(crate) slot: SenderSlot,
     /// Sender fragment output column names, repeated on every frame (pack metadata carries none).
     pub(crate) names: Vec<String>,
+    /// The sender fragment's StarRocks ids, for the transmit summary line.
+    pub(crate) label: FragmentLabel,
 }
 
 /// One message to the transport thread.
@@ -702,6 +704,11 @@ mod agent_tier {
             let mut seq: i64 = 0;
             let mut batches: u64 = 0;
             let mut bytes: u64 = 0;
+            // The drain's time budget, split into the two parts an operator can act on: waiting
+            // for the peer's lease (its engine thread may be busy) and the WRITEs themselves.
+            let started = Instant::now();
+            let mut lease_time = Duration::ZERO;
+            let mut write_time = Duration::ZERO;
 
             while let Some(mut batch) = self.executor.export_packed_next(spec.slot)? {
                 // A metadata-only empty batch carries no payload: no peer lease, no WRITE, and
@@ -709,8 +716,10 @@ mod agent_tier {
                 let metadata = std::mem::take(&mut batch.metadata);
                 let sent = (|| {
                     let (remote_offset, length) = if batch.len > 0 {
+                        let lease_started = Instant::now();
                         let lease = rpc_request_lease(&mut session.client, batch.len)?;
-                        write_and_wait(
+                        lease_time += lease_started.elapsed();
+                        write_time += write_and_wait(
                             &self.agent,
                             &session.remote_agent,
                             self.staging_base + batch.offset,
@@ -779,12 +788,28 @@ mod agent_tier {
                 Vec::new(),
             )?;
             self.executor.drop_parked(spec.slot)?;
+            // The transport-side stitch: the sender's StarRocks ids (its Quent Query label is
+            // `<query_id>:<fragment_instance_id>`), the receiver instance the frames addressed,
+            // and where the drain's time went. `write_gbps` is payload bytes over WRITE time only.
+            let (query_id, fragment_instance_id) = spec.label.log_ids();
+            let write_gbps = if write_time.is_zero() {
+                0.0
+            } else {
+                bytes as f64 / write_time.as_secs_f64() / 1e9
+            };
             info!(
+                %query_id,
+                %fragment_instance_id,
+                receiver_fragment_instance_id = %spec.slot.fragment_instance_id,
                 stream_id = spec.slot.node_id,
                 sender_id = spec.slot.sender_id,
                 dest = %session.client.peer(),
                 batches,
                 bytes,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                lease_ms = lease_time.as_millis() as u64,
+                write_ms = write_time.as_millis() as u64,
+                write_gbps = format!("{write_gbps:.1}"),
                 "transmitted batches via nixl"
             );
             Ok(())

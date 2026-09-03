@@ -32,6 +32,7 @@
 #include <scan_manager/split_connector.hpp>
 #include <sirius/exception.hpp>
 #include <sirius_context.hpp>
+#include <telemetry/scan_telemetry.hpp>
 
 // cudf
 #include <cudf/binaryop.hpp>
@@ -51,10 +52,12 @@
 
 // standard library
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -436,6 +439,36 @@ scan_manager::split_connector& sirius_gpu_scan_operator::get_split_connector()
   return *_split_connector;
 }
 
+namespace {
+
+/// `path[rg,rg];path[rg]` over a split's storage reads plus the compressed-byte total, for the
+/// scan_split_read telemetry event. String work over a handful of slices.
+struct source_summary {
+  std::string sources;
+  std::uint64_t files{};
+  std::uint64_t compressed_bytes{};
+};
+
+source_summary summarize_sources(sirius::op::scan::scan_info const& info)
+{
+  source_summary summary;
+  for (auto const& read : info.source_reads()) {
+    if (!summary.sources.empty()) { summary.sources += ';'; }
+    summary.sources += read.path;
+    summary.sources += '[';
+    for (std::size_t i = 0; i < read.row_groups.size(); ++i) {
+      if (i > 0) { summary.sources += ','; }
+      summary.sources += std::to_string(read.row_groups[i]);
+    }
+    summary.sources += ']';
+    ++summary.files;
+    summary.compressed_bytes += read.compressed_bytes;
+  }
+  return summary;
+}
+
+}  // namespace
+
 //===----------------------------------------------------------------------===//
 // execute()
 //===----------------------------------------------------------------------===//
@@ -459,6 +492,11 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   // scan asks.
   std::unique_ptr<cudf::column> survivors;
   auto const wants_survivors = !deferred_output().empty();
+  // Set only for storage-backed splits: brackets materialize_table (I/O + decode) for the
+  // scan_split_read telemetry event. Resident/cached splits read nothing and stay unreported.
+  using probe_clock = std::chrono::steady_clock;
+  std::optional<probe_clock::time_point> read_started;
+  probe_clock::time_point read_completed{};
 
   // Only prepare_for_processing arms pending (pipeline contract: prepare runs before execute on
   // the same task), so a non-candidate split skips the builder lambda entirely. A
@@ -495,8 +533,10 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     // normalize the resulting owned table.
     auto const like_swar_fastpath = like_swar_fastpath_enabled();
     auto like_pattern_cache       = like_cache();
+    if (scan_input->has_scan_metadata()) { read_started = probe_clock::now(); }
     auto materialized_table =
       _ingestible->materialize_table(*scan_input, stream, like_swar_fastpath, like_pattern_cache);
+    read_completed = probe_clock::now();
     if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
       // Elide the deferred columns from the projection: realizing the batch would
       // copy values this scan is about to replace with a rowid.
@@ -561,6 +601,34 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     std::lock_guard<std::mutex> guard(_emitted_mutex);
     _emitted_rows += emitted_rows;
     _emitted_bytes += emitted_bytes;
+  }
+
+  // One Operator statistics event per storage-backed split, on this scan's pipeline; the
+  // executor thread it carries joins it to the Task Computing(GPU_SCAN) span it ran inside.
+  if (read_started.has_value()) {
+    if (auto const telemetry_info = batch_telemetry(); telemetry_info.context != nullptr) {
+      auto const finished = probe_clock::now();
+      auto const ns       = [](probe_clock::duration d) {
+        return static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+      };
+      auto const& info   = scan_input->get_scan_info();
+      auto const summary = summarize_sources(info);
+      telemetry::emit_scan_split_read(
+        telemetry_info,
+        telemetry::scan_split_read{
+          .device_id              = mem_space->get_id().device_id,
+          .operator_id            = static_cast<std::uint64_t>(get_operator_id()),
+          .sources                = summary.sources,
+          .source_files           = summary.files,
+          .compressed_bytes       = summary.compressed_bytes,
+          .estimated_output_bytes = static_cast<std::uint64_t>(info.estimated_bytes()),
+          .rows                   = static_cast<std::uint64_t>(emitted_rows),
+          .output_bytes           = static_cast<std::uint64_t>(emitted_bytes),
+          .materialize_ns         = ns(read_completed - *read_started),
+          .finish_ns              = ns(finished - read_completed),
+        });
+    }
   }
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));

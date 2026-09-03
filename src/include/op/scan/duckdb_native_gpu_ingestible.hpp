@@ -148,6 +148,21 @@ class duckdb_native_scan_info : public op::scan::scan_info {
     }
     return total;
   }
+
+  /// The .db file and the row groups this unit decodes from it; empty when nothing is read from
+  /// the file. Compressed bytes are not accounted for this format.
+  [[nodiscard]] std::vector<source_read> source_reads() const override
+  {
+    if (host_backed_only || datasource == nullptr) { return {}; }
+    source_read read{.path = datasource->io_object().object_path()};
+    read.row_groups.reserve(row_groups.size());
+    for (auto const& rg : row_groups) {
+      read.row_groups.push_back(static_cast<std::int64_t>(rg.row_group_index));
+    }
+    std::vector<source_read> reads;
+    reads.push_back(std::move(read));
+    return reads;
+  }
 };
 
 //===----------------------------------------------------------------------===//
