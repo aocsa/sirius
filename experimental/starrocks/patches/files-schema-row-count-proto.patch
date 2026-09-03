@@ -1,0 +1,13 @@
+--- a/gensrc/proto/internal_service.proto
++++ b/gensrc/proto/internal_service.proto
+@@ -647,6 +647,10 @@
+ message PGetFileSchemaResult {
+     required StatusPB status = 1;
+     repeated PSlotDescriptor schema = 2;
++    // Sirius extension: exact row total over every file in the request, summed from the parquet
++    // footers the node opened for the schema. Exact-or-absent: a node that samples files
++    // (schema_sample_file_count) must not set it.
++    optional int64 num_rows = 3;
+ };
+ 
+ message PMVMaintenanceTaskRequest {

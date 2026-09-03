@@ -173,6 +173,7 @@ git submodule update --init --recursive experimental/starrocks/starrocks
 #   nixl-exchange-proto          the CN's nixl exchange RPCs
 #   files-query-whole-file-ranges whole-file FILES() scan assignment for pinned tables
 #   files-scan-row-count         FILES() scans planned with real row counts instead of 1
+#   files-schema-row-count-proto the CN returns the parquet footer row total with the schema
 experimental/starrocks/scripts/apply-starrocks-patches.sh
 pixi run fe-build    # long
 ```

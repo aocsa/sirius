@@ -1,5 +1,5 @@
 diff --git a/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java b/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
-index 2a8a9b16e07..f72dcbf1af2 100644
+index 2a8a9b16e07..0bae94e02fa 100644
 --- a/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
 +++ b/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunctionTable.java
 @@ -19,6 +19,7 @@ import com.google.common.base.Splitter;
@@ -10,18 +10,19 @@ index 2a8a9b16e07..f72dcbf1af2 100644
  import com.starrocks.common.CsvFormat;
  import com.starrocks.common.DdlException;
  import com.starrocks.common.ErrorCode;
-@@ -187,6 +188,10 @@ public class TableFunctionTable extends Table {
+@@ -187,6 +188,11 @@ public class TableFunctionTable extends Table {
  
      private List<TBrokerFileStatus> fileStatuses = Lists.newArrayList();
  
 +    // Row total the compute node read from the parquet footers along with the schema
 +    // (PGetFileSchemaResult.num_rows, a Sirius extension); -1 when it reported none.
++    // Set only by getFileSchema().
 +    private long footerRowCount = -1;
 +
      private MisMatchFillValue misMatchFillValue = MisMatchFillValue.NONE;
  
      // for unload data
-@@ -272,6 +277,11 @@ public class TableFunctionTable extends Table {
+@@ -272,6 +278,11 @@ public class TableFunctionTable extends Table {
  
          // set schema
          setNewFullSchema(columns);
@@ -33,7 +34,7 @@ index 2a8a9b16e07..f72dcbf1af2 100644
      }
  
      private void checkDuplicateColumns(List<Column> columns) throws DdlException {
-@@ -301,6 +311,55 @@ public class TableFunctionTable extends Table {
+@@ -301,6 +312,55 @@ public class TableFunctionTable extends Table {
          return fileStatuses;
      }
  
@@ -89,6 +90,19 @@ index 2a8a9b16e07..f72dcbf1af2 100644
      // for list files
      // must be consistent with list files schema
      public List<List<String>> listFilesAndDirs() {
+@@ -722,6 +782,12 @@ public class TableFunctionTable extends Table {
+             throw new DdlException("failed to get file schema, path: " + path + ", error: " + result.status.errorMsgs);
+         }
+ 
++        // Sirius extension, exact-or-absent; a stock BE leaves it unset. <= 0 counts as absent so the result is
++        // the same whether jprotobuf boxed the field (null when absent) or not (0 when absent).
++        if (result.numRows != null && result.numRows > 0) {
++            footerRowCount = result.numRows;
++        }
++
+         List<Column> columns = new ArrayList<>();
+         for (PSlotDescriptor slot : result.schema) {
+             columns.add(new Column(slot.colName, TypeDeserializer.fromProtobuf(slot.slotType), true));
 diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculator.java b/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculator.java
 index f58886ccae4..e342ad25452 100644
 --- a/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/statistics/StatisticsCalculator.java
@@ -169,10 +183,10 @@ index f58886ccae4..e342ad25452 100644
  
          return visitOperator(node, context);
 diff --git a/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java b/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
-index 46f81a161c2..847267bb51a 100644
+index 46f81a161c2..f6f8694cceb 100644
 --- a/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
 +++ b/fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java
-@@ -15,6 +15,7 @@
+@@ -15,13 +15,22 @@
  package com.starrocks.catalog;
  
  import com.google.common.collect.Lists;
@@ -180,7 +194,52 @@ index 46f81a161c2..847267bb51a 100644
  import com.starrocks.common.DdlException;
  import com.starrocks.common.ExceptionChecker;
  import com.starrocks.common.StarRocksException;
-@@ -233,6 +234,43 @@ public class TableFunctionTableTest {
+ import com.starrocks.common.jmockit.Deencapsulation;
+ import com.starrocks.fs.HdfsUtil;
++import com.starrocks.proto.PGetFileSchemaResult;
++import com.starrocks.proto.PScalarType;
++import com.starrocks.proto.PSlotDescriptor;
++import com.starrocks.proto.PTypeDesc;
++import com.starrocks.proto.PTypeNode;
++import com.starrocks.proto.StatusPB;
+ import com.starrocks.qe.SessionVariable;
+ import com.starrocks.qe.SqlModeHelper;
++import com.starrocks.rpc.BackendServiceClient;
++import com.starrocks.rpc.PGetFileSchemaRequest;
+ import com.starrocks.server.GlobalStateMgr;
+ import com.starrocks.server.RunMode;
+ import com.starrocks.sql.analyzer.AstToSQLBuilder;
+@@ -31,6 +40,11 @@ import com.starrocks.sql.ast.StatementBase;
+ import com.starrocks.sql.parser.SqlParser;
+ import com.starrocks.system.Backend;
+ import com.starrocks.system.SystemInfoService;
++import com.starrocks.thrift.THdfsProperties;
++import com.starrocks.thrift.TNetworkAddress;
++import com.starrocks.thrift.TPrimitiveType;
++import com.starrocks.thrift.TStatusCode;
++import com.starrocks.thrift.TTypeNodeType;
+ import com.starrocks.type.IntegerType;
+ import com.starrocks.type.StringType;
+ import com.starrocks.type.VarcharType;
+@@ -39,6 +53,7 @@ import mockit.Mock;
+ import mockit.MockUp;
+ import mockit.Mocked;
+ import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.Path;
+ import org.junit.jupiter.api.Assertions;
+ import org.junit.jupiter.api.Test;
+ 
+@@ -49,6 +64,9 @@ import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.Future;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ public class TableFunctionTableTest {
+ 
+@@ -233,6 +251,135 @@ public class TableFunctionTableTest {
                  () -> new TableFunctionTable(properties));
      }
  
@@ -219,6 +278,98 @@ index 46f81a161c2..847267bb51a 100644
 +        Assertions.assertTrue(Config.files_scan_estimate_row_count);
 +        Assertions.assertEquals(1L, table.estimateRowCount());
 +        Assertions.assertFalse(table.hasExactRowCount());
++    }
++
++    @Test
++    public void testFooterRowCountPreferred(@Mocked GlobalStateMgr globalStateMgr,
++                                            @Mocked SystemInfoService systemInfoService) throws Exception {
++        // Two listed files of 1024 and 2048 bytes; the schema RPC is answered by a mocked compute node.
++        new MockUp<HdfsUtil>() {
++            @Mock
++            public static List<FileStatus> listFileMeta(String path, Map<String, String> properties, boolean skipDir) {
++                return Lists.newArrayList(
++                        new FileStatus(1024, false, 1, 1024, 0, new Path("hdfs://127.0.0.1:9000/dir/a.parquet")),
++                        new FileStatus(2048, false, 1, 2048, 0, new Path("hdfs://127.0.0.1:9000/dir/b.parquet")));
++            }
++
++            @Mock
++            public static void getTProperties(String path, Map<String, String> properties, THdfsProperties tProperties) {
++            }
++        };
++        new MockUp<RunMode>() {
++            @Mock
++            public RunMode getCurrentRunMode() {
++                return RunMode.SHARED_DATA;
++            }
++        };
++        Backend backend = new Backend(1L, "192.168.1.1", 9050);
++        backend.setBrpcPort(8050);
++        new Expectations() {
++            {
++                globalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
++                result = systemInfoService;
++                minTimes = 0;
++
++                systemInfoService.getBackendIds(anyBoolean);
++                result = Lists.newArrayList(1L);
++                minTimes = 0;
++
++                systemInfoService.getComputeNodeIds(anyBoolean);
++                result = new ArrayList<>();
++                minTimes = 0;
++
++                systemInfoService.getBackendOrComputeNode(anyLong);
++                result = backend;
++                minTimes = 0;
++            }
++        };
++        AtomicReference<PGetFileSchemaResult> reply = new AtomicReference<>();
++        new MockUp<BackendServiceClient>() {
++            @Mock
++            public Future<PGetFileSchemaResult> getFileSchema(TNetworkAddress address, PGetFileSchemaRequest request) {
++                return CompletableFuture.completedFuture(reply.get());
++            }
++        };
++
++        // numRows -> (estimateRowCount, hasExactRowCount). The fallback is 3072 B / one 4 B INT column.
++        Object[][] cases = {
++                {1000L, 1000L, true},
++                {null, 768L, false},
++                {0L, 768L, false},
++                {-5L, 768L, false},
++        };
++        for (Object[] c : cases) {
++            PGetFileSchemaResult result = new PGetFileSchemaResult();
++            result.status = new StatusPB();
++            result.status.statusCode = TStatusCode.OK.getValue();
++            result.schema = Lists.newArrayList(intSlot("col_int"));
++            result.numRows = (Long) c[0];
++            reply.set(result);
++
++            Map<String, String> properties = new HashMap<>();
++            properties.put("path", "hdfs://127.0.0.1:9000/dir/*");
++            properties.put("format", "parquet");
++            TableFunctionTable table = new TableFunctionTable(properties);
++            Assertions.assertEquals(1, table.getFileColumns().size(), "numRows=" + c[0]);
++            Assertions.assertEquals(3072L, table.getTotalFileBytes(), "numRows=" + c[0]);
++            Assertions.assertEquals((long) (Long) c[1], table.estimateRowCount(), "numRows=" + c[0]);
++            Assertions.assertEquals((boolean) (Boolean) c[2], table.hasExactRowCount(), "numRows=" + c[0]);
++        }
++    }
++
++    /** One INT slot as the compute node reports it (TypeDeserializer.fromProtobuf reads types[0].scalarType.type). */
++    private static PSlotDescriptor intSlot(String name) {
++        PScalarType scalar = new PScalarType();
++        scalar.type = TPrimitiveType.INT.getValue();
++        PTypeNode node = new PTypeNode();
++        node.type = TTypeNodeType.SCALAR.getValue();
++        node.scalarType = scalar;
++        PTypeDesc type = new PTypeDesc();
++        type.types = Lists.newArrayList(node);
++        PSlotDescriptor slot = new PSlotDescriptor();
++        slot.colName = name;
++        slot.slotType = type;
++        return slot;
 +    }
 +
      @Test
