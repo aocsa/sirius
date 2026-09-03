@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -220,6 +221,17 @@ void throw_if_int64_sum_could_overflow(const cudf::column_view& input,
         hi);
     }
   }
+}
+
+bool canonical_float_sums_enabled()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("SIRIUS_CANONICAL_FLOAT_SUMS");
+    if (value == nullptr) { return false; }
+    const std::string_view v(value);
+    return v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON";
+  }();
+  return enabled;
 }
 
 bool is_order_sensitive_sum(cudf::aggregation::Kind kind, cudf::data_type values_type)

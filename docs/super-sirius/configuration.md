@@ -24,6 +24,14 @@ Sirius searches for a config file in this order:
 
 If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
 
+### `SIRIUS_CANONICAL_FLOAT_SUMS`
+
+Off by default. Set `SIRIUS_CANONICAL_FLOAT_SUMS=1` to make the local grouped aggregate gather
+each input batch into a canonical row order before a `FLOAT`/`DOUBLE` `SUM`, so the partial sum is
+bit-stable for a given row multiset. The gather is a full sort of every batch; with FP64 partial
+sums (the StarRocks compute-node path lowers decimal sums to FP64) it cost about 10x the aggregate
+itself on TPC-H q01. The merge-side canonicalization of partial states is always on.
+
 ### `SIRIUS_DISABLE`
 
 Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks.

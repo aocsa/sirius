@@ -161,7 +161,10 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       float_sum_value_cols.push_back(col_idx);
     }
   }
-  const bool use_canonical_sorted_groupby = !float_sum_value_cols.empty();
+  // Opt-in (SIRIUS_CANONICAL_FLOAT_SUMS=1): the gather below sorts every input batch, which
+  // costs about 10x the aggregate itself when the partial sums are FP64.
+  const bool use_canonical_sorted_groupby =
+    canonical_float_sums_enabled() && !float_sum_value_cols.empty();
   std::unique_ptr<cudf::table> canonical_input;
   if (use_canonical_sorted_groupby) {
     std::vector<cudf::size_type> sort_cols(group_idx.begin(), group_idx.end());

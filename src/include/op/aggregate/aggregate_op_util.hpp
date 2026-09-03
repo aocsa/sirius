@@ -126,6 +126,14 @@ void throw_if_int64_sum_could_overflow(const cudf::column_view& input,
 bool is_order_sensitive_sum(cudf::aggregation::Kind kind, cudf::data_type values_type);
 
 /**
+ * @brief True when the local aggregate should gather each input batch into canonical row order
+ * before a floating-point SUM (`SIRIUS_CANONICAL_FLOAT_SUMS=1`). Off by default: the gather is a
+ * full sort of every batch and, when partial sums are FP64 (decimal lowered to FP64 on the
+ * StarRocks CN path), it dominated q01 by 10x. The merge-side canonicalization is unaffected.
+ */
+bool canonical_float_sums_enabled();
+
+/**
  * @brief Gather `input` into a canonical row order so floating-point sums are bit-stable.
  *
  * Sorts rows by `sort_col_indices` (all ascending, nulls last), which must cover the group key
