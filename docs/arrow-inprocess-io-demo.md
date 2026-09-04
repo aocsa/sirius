@@ -19,7 +19,8 @@ PCIe legs at 128 MiB, 512 MiB and 2 GiB; (M3) a third input kind in the StarRock
 totals of 5.1.
 
 Expected outcomes: a tested path for a CPU host (a Doris BE, a StarRocks BE or CN) to feed a GPU fragment without
-device pointers or pack metadata (in hand); a documented answer on the threading contract (section 3, in hand);
+device pointers or pack metadata (in hand); the widened threading contract, `start()`/`join()` and the thread-safe
+input handle (section 3, in hand);
 numbers for what the Arrow path pays (D2H, host copies, H2D, all PCIe-bound) against what NIXL pays (one
 device-to-device write at 48-56 GB/s here). The per-leg numbers are measured: 10 GB/s in, 1.1-1.2 GB/s out today. The
 end-to-end arms are not run yet.
@@ -99,21 +100,26 @@ returning, so the caller may release the Arrow structs at once. It does not clos
 `sirius_ffi.hpp` still needs no Arrow headers. `sender_id` stays explicit: several producers can feed one stream, and
 `close_input` stays the per-sender end-of-stream, idempotent as today. The signature is the proposal's, unchanged.
 
-The header's throw list (`:299-301`) is longer than the proposal's: before `build()`, an unknown input stream, a
-sender not declared for the stream, null addresses or already-released structs, a schema mismatch, a stream that
-already ended. The sender rule is new against the proposal (2.3); it is a membership check, since the batch carries no
-sender identity past the call, so a push from a sender that already closed is refused only once every sender has
-closed (`:284-287`). A slice taken on the struct itself (its `offset`/`length`) is honoured (`:281-283`, 2.4).
+The header's throw list is longer than the proposal's: before `build()`, an unknown input stream, a sender not
+declared for the stream, null addresses or already-released structs, a schema mismatch, a stream that already ended.
+The sender rule is new against the proposal (2.3); it is a membership check, since the batch carries no sender
+identity past the call, so a push from a sender that already closed is refused only once every sender has closed. A
+slice taken on the struct itself (its `offset`/`length`) is honoured (2.4).
+
+The same call exists twice: `Fragment::push_arrow` for the thread that owns the fragment, and
+`FragmentInput::push_arrow` (same four arguments, `const`) on the handle `Fragment::input_handle()` returns after
+`build()`, for any other thread. `close_input` has the same pair. Section 3 has the threading contract; 2.2 the body,
+shared by both.
 
 ### 2.2 What the body does, step by step
 
 | Step | `push_packed` (`src/sirius_ffi.cpp:788-863`) | `push_arrow` (`:865-922`) |
 |---|---|---|
 | 1 | `built` guard, throws "build() must run before push_packed()" (`:794-796`); an absent `resolved_inputs` entry is tolerated and the session throws later (`:817`) | same guard (`:870-872`); a null `array_addr` or `schema_addr` throws (`:873-876`); `resolved_inputs[stream_id]` must exist, else "target input stream N was never declared on this fragment" (`:879-884`); `sender_id` must be in its `expected_senders`, else "from sender M, which was not declared for it" (`:886-892`) |
-| 2 | `exchange_staging_arena::require`, metadata and bounds guards (`:797-807`); `cudf::unpack(metadata, base()+offset)`, a view aliasing the lease (`:809-812`) | no arena; the helper `sirius::import_arrow_host_table` (`src/helper/arrow_host_import.cpp:260-338`) windows a struct slice into the children (`:312-313`), then runs `cudf::from_arrow(schema, array, stream, mr)` (`:318`): device memory is allocated and every host buffer of the window is copied (the H2D copy) |
-| 3 | inline schema guard: column count, then `get_cudf_type(declared.types[i]) != column.type()` throws naming the column (`:814-841`) | the same rule in the helper, before the copy from the format string (`:300-310`) and after it on the imported table (`:319-328`), plus the reconciliation rules of 2.4. `push_packed` keeps its inline copy; folding it onto the helper is a follow-up |
-| 4 | GPU memory space `get_memory_space(Tier::GPU, 0)`, null throws (`:843-847`); `cudf::get_default_stream()`, a deep copy of the unpacked view into `gpu_space->get_default_allocator()`, `stream.synchronize()` (`:852-854`) | same space (`:894-898`); import on `cudf::get_default_stream()` into `gpu_space->get_default_allocator()` (`:904-912`), then `stream.synchronize()` (`:913`); on an error after the copy started the helper synchronizes before it throws (`arrow_host_import.cpp:329-336`). 2.3 covers `acquire_stream()` and `make_reservation_or_null()` |
-| 5 | `sirius::make_data_batch(std::move(table), *gpu_space, stream, batch_telemetry_info{})` (`:857-858`); `session().push(stream_id, batch)`, `false` throws "refused a packed batch; it had already ended" (`:859-862`); return, the caller releases its lease | same (`:916-917`); same, "refused an Arrow batch; it had already ended" (`:918-921`); return, the caller may release the Arrow structs at once (the copy is complete) |
+| 2 | `exchange_staging_arena::require`, metadata and bounds guards (`:797-807`); `cudf::unpack(metadata, base()+offset)`, a view aliasing the lease (`:809-812`) | no arena; `sirius::estimate_arrow_import_footprint` (`src/helper/arrow_host_import.cpp`) validates the structs and sizes the import from the host buffers (the table at the declared widths plus one column at its arriving width); `sirius::arrow_transfer_reservation` reserves that many bytes in the GPU space (`make_reservation_or_null`, attached to the copy stream's allocation tracker; warn-and-proceed when refused); then `sirius::import_arrow_host_table` imports one child at a time with `cudf::from_arrow_column(schema->children[i], &window, stream, mr)`, the struct window pushed into each child first: device memory is allocated and every host buffer of the window is copied (the H2D copy) |
+| 3 | inline schema guard: column count, then `get_cudf_type(declared.types[i]) != column.type()` throws naming the column (`:814-841`) | the same rule in the helper, before the copy from the format string and after it on each imported column, plus the reconciliation rules of 2.4; a decimal128 column is narrowed to the declared width before the next column is imported. `push_packed` keeps its inline copy |
+| 4 | GPU memory space `get_memory_space(Tier::GPU, 0)`, null throws (`:843-847`); `cudf::get_default_stream()`, a deep copy of the unpacked view into `gpu_space->get_default_allocator()`, `stream.synchronize()` (`:852-854`) | the same space, resolved once at `build()` and held by the handle; the copy, the casts and the synchronize run on `gpu_space->acquire_stream()` (a stream from the space's pool, never cudf's default stream), into `gpu_space->get_default_allocator()`; on an error after the copy started the helper synchronizes before it throws |
+| 5 | `sirius::make_data_batch(std::move(table), *gpu_space, stream, batch_telemetry_info{})` (`:857-858`); `session().push(stream_id, batch)`, `false` throws "refused a packed batch; it had already ended" (`:859-862`); return, the caller releases its lease | same, with the copy stream as the batch's writer stream; same, "refused an Arrow batch; it had already ended"; return, the caller may release the Arrow structs at once (the copy is complete); the reservation is released here, the batch owning its memory as ordinary pool bytes |
 
 Zero changes in `stream_session`, `streaming_source` and cuCascade, as the proposal predicted. The branch diff against
 `281b13bc` touches `src/sirius_ffi.{hpp,cpp}`, the new helper, `CMakeLists.txt` (one source line, `:438`), the Catch2
@@ -129,12 +135,17 @@ push is `push_packed`'s choice: synchronize, return, the caller frees, and Siriu
 Per item: the assumption (proposal or draft reply); what the tree has; the resolution on this branch.
 
 1. Stream and reservation. Assumed: `push_packed` picks a GPU space, then `acquire_stream()`, then
-   `make_reservation_or_null()`. Tree: it uses `cudf::get_default_stream()` and the space's default allocator
-   (`sirius_ffi.cpp:852-853`) and calls neither (both exist,
-   `cucascade/include/cucascade/memory/memory_space.hpp:102,105`); the FFI hops do not reserve, the result collector
-   (`sirius_physical_result_collector.cpp:169-178`) and `lock_or_prepare_batch` (`batch_lock_utils.hpp:158-172`) do,
-   warn-and-proceed. Resolution: `push_arrow` mirrors `push_packed`, so an oversized host batch is an rmm allocation
-   error from `cudf::from_arrow`, not a degrade; reservation for both hops is M5.
+   `make_reservation_or_null()`. Tree at the base: it uses `cudf::get_default_stream()` and the space's default
+   allocator and calls neither (both exist, `cucascade/include/cucascade/memory/memory_space.hpp:102,105`); the FFI
+   hops did not reserve, the result collector (`sirius_physical_result_collector.cpp:169-178`) and
+   `lock_or_prepare_batch` (`batch_lock_utils.hpp:158-172`) do, warn-and-proceed. Resolution: `push_arrow` does
+   both. It reserves the footprint `estimate_arrow_import_footprint` computes from the host structs, attaches the
+   reservation to the copy stream's allocation tracker so the copies are charged against it rather than counted a
+   second time, and releases it once the batch is in the session (the batch then owns its memory as ordinary pool
+   bytes); a refused reservation is logged and the copy proceeds unreserved, the collector's degrade. The copy runs
+   on `acquire_stream()`. `export_arrow` reserves `cudf::to_arrow_host`'s device scratch (decimal widening, bool
+   packing) the same way. `push_packed` and `export_packed` are unchanged: they use the default stream and reserve
+   nothing.
 2. The Arrow C structs. Assumed: nanoarrow 0.7.0 arrives through cudf's vcpkg port. Tree: no nanoarrow package and no
    `find_package(Arrow)` (`CMakeLists.txt:90-98`); `cudf/interop.hpp:24-38` only forward-declares the structs;
    `arrow/c/abi.h` reaches the default pixi env only through `pyarrow` (`pixi.toml:59`, feature `dev-libs`) and,
@@ -156,8 +167,9 @@ Per item: the assumption (proposal or draft reply); what the tree has; the resol
    imported strings (`test_sirius_ffi_fragment.cpp:833-865`).
 5. The multi-shot source. Assumed: "the multi-shot source (#836) was meant to be fed while running". Tree: no "#836"
    or "multi-shot" reference exists; `STREAMING_SOURCE` has a persistent `on_data` hook that re-nominates itself on
-   every push (`streaming-sessions.md`, "Task-hint lifecycle"). Resolution: the producer-thread test between `build()`
-   and `run()` exists (`:1000-1024`); a push while `run()` blocks is the test of section 3, still to do.
+   every push (`streaming-sessions.md`, "Task-hint lifecycle"). Resolution: that hook is what makes a push during the
+   run work. Both tests exist: the producer thread between `build()` and `run()`, and the producer thread pushing
+   through `FragmentInput` while the owner blocks in `join()` (section 3).
 6. `sender_id`. Assumed: the body "mirrors `push_packed`". Tree: `push_packed` has no sender parameter; the resolved
    spec carries `expected_senders` (`sirius_ffi.cpp:429-430`). Resolution: `push_arrow` validates against it
    (`:886-892`), since an undeclared sender could never close the stream; no `declare_input_sender` means sender `0`
@@ -242,21 +254,9 @@ CPU. Two facts for it: cudf writes decimal32/64 out as decimal128 at the widest 
   (`MULTI-CN-PLAN.md:170`, section 6; designed, never shipped), decoded on the CN into `RecordBatch`es and fed as
   `arrow_inputs`. No `arrow-ipc` crate is in the tree; not scheduled here.
 
-## 3. The threading contract question
+## 3. The threading contract
 
-What is true in this tree today. `Fragment::run()` blocks (`sirius_ffi.cpp:932-970`, through
-`streaming_fragment::run()` to `sirius_engine::execute()`, which waits on the `start_query` future). `push_packed` and
-`push_arrow` are legal only between `build()` and `run()`, and the CN's engine thread is the only caller of either.
-The header adds one fact for `push_arrow` (`sirius_ffi.hpp:289-298`): besides the stream session and immutable
-post-`build()` state, the call touches the GPU memory space's default allocator and `cudf::get_default_stream()` (on
-which it copies, casts and synchronizes), never the DuckDB connection or the query lifecycle, so a producer thread
-other than the one that owns the `Context` may call it in that window today. The Rust `Fragment` takes `&mut self` for
-`run` and for every push (`rust/crates/sirius/src/lib.rs:316,406,434`) and borrows a `!Send`/`!Sync` `SiriusContext`,
-so no second thread can hold the fragment while `run()` blocks. The CN funnels every fragment verb through one mpsc
-channel to the engine thread; only staging leases bypass it (`engine.rs:16-21`). Nothing in headers, docs or the CN
-reflects "any thread during run()".
-
-What the project's draft reply to #1590 commits to:
+What the draft reply to #1590 commits to:
 
 ```text
 push_arrow and close_input may be called from any thread once build() has returned, including
@@ -266,34 +266,65 @@ lifecycle.
 Every other Fragment and Context method keeps today's single-threaded rule.
 The Fragment must outlive its producers. Destroying it while a producer is inside push_arrow is
 undefined, exactly as for any other object.
-A push after the stream ended throws. There is no backpressure yet: the queue is unbounded and a
+A push after the stream ended throws. There is no backpressure: the queue is unbounded and a
 producer that outruns the query grows the GPU and host tiers.
 ```
 
-and, on the fallback: "we would fall back to the store-and-forward first cut you offered, with the same signature, so
-nothing changes on your side when the contract relaxes." This branch is that first cut.
+What this branch delivers, and under which conditions (`src/include/sirius_ffi.hpp`, classes `FragmentInput` and
+`Fragment`; `docs/super-sirius/streaming-fragments.md`, "`FragmentInput`, `start()` / `join()`"):
 
-Why the widening is plausible per the code. The push body reads `built` (set at the end of `build()`, stable during
-`run()`) and `resolved_inputs` (immutable after `build()`); `session().push` forwards to `batch_stream::push` under
-the stream's one mutex (S1); it never touches `ctx.conn`, `lifecycle` or `result`. The streaming source's producer
-side is labelled "any thread", and its `on_data` hook, `task_creator::schedule(head)`, is a pure enqueue safe from any
-thread ("The live re-arm").
+- `Fragment::start()` begins execution exactly as `run()` does and returns once the query is started;
+  `Fragment::join()` blocks until the pipelines finish, closes the lifecycle and, on failure, poisons every output
+  and throws the execution error. `run()` is `start()` followed by `join()`. The split runs through every layer:
+  `sirius_engine::start()`/`join()` (the `create_query` + `start_query()` future, then the wait with the watchdog,
+  `wait_for_completion()` and the drain on error), `streaming_fragment::start()`/`join()` for an intermediate
+  fragment, `sirius_interface::sirius_start_query()`/`sirius_join_query()` for a result fragment. A fragment destroyed
+  between `start()` and `join()` joins first.
+- `Fragment::input_handle()` returns `std::shared_ptr<FragmentInput>` after `build()`, the same object every call.
+  The handle holds only the fragment's stream session, the input schemas and senders resolved at `build()`, and the
+  GPU memory space: nothing of the DuckDB connection, the lifecycle or the result. `FragmentInput::push_arrow` and
+  `FragmentInput::close_input` are legal from any thread, concurrently, from the moment `build()` returned until
+  `join()` (or `run()`) returned, including while `join()` blocks on another thread. `Fragment::push_arrow` and
+  `Fragment::close_input` stay the owning thread's entry points and share the implementation.
+- The copy is not a device-wide barrier: `push_arrow` copies, casts and synchronizes on a stream from the GPU memory
+  space's pool (`memory_space::acquire_stream()`), never on `cudf::get_default_stream()`, and that stream is recorded
+  as the batch's writer stream. `push_packed` keeps the default stream.
+- Beyond the draft reply: a push after the fragment finished does not fall into the undefined case. The fragment
+  detaches the handle when it joins and when it is destroyed, under the exclusive side of a `std::shared_mutex` whose
+  shared side every push holds, so a push that races the fragment's teardown completes or throws ("after the
+  fragment has finished"), never faults; `FragmentInput::is_open()` reports the state. The Rust `FragmentInput` is
+  `Send + Sync` on that argument (`rust/crates/sirius/src/lib.rs`, next to `StagingArena`'s), the `!Send`
+  `Fragment` never crosses a thread, and `Fragment::start()`/`join()`/`input_handle()` are bound.
+- Unchanged: every other `Fragment` and `Context` method is single-threaded by contract; `push_packed` and
+  `relay_from` are legal only between `build()` and `run()` on the owning thread; exactly one fragment sits between
+  its own `build()` and `run()`/`join()`; there is no backpressure, the queue is unbounded and a producer that
+  outruns the query grows the GPU tier until the downgrade executor spills; no runtime owning-thread assertion
+  exists in C++.
 
-Why it is not free: (a) `run()` blocks its caller, so a push during `run()` needs a second thread, which the Rust
-wrapper's `&mut self` plus the `!Send` fragment forbid; a `Send` push handle that shares the session, as
-`StagingArena` shares the arena, is the missing piece. (b) The copy runs and synchronizes on cudf's default stream
-next to engine kernels, a device-wide barrier when that is the legacy default stream; the header names a dedicated
-copy stream (`memory_space::acquire_stream()`) as the prerequisite. (c) No backpressure: a fast producer grows the GPU
-tier until the downgrade executor spills. (d) The CN's engine thread is inside `run()`; an RPC thread would push
-through the handle. (e) No test pushes while `run()` blocks; the one threaded test
-(`test_sirius_ffi_fragment.cpp:1000-1024`) pushes and closes from a `std::thread` between `build()` and `run()`, the
-window the header grants.
+Why it holds per the code. The push body reads the handle's copy of the resolved schemas (immutable after `build()`),
+reserves and allocates in the GPU memory space, and calls `session().push`, which forwards to `batch_stream::push`
+under the stream's one mutex (S1) and fires the source's `on_data` hook, a `task_creator::schedule(head)` that only
+enqueues ("The live re-arm", `streaming-sessions.md`). It never touches `ctx.conn`, `lifecycle` or `result`. The
+engine thread inside `join()` waits on the scheduler's future; the executors run the pipelines; the producer thread
+runs the H2D copy on its own pool stream.
 
-Recommended sequencing. Store-and-forward first (M1 to M3) with the final signature, so a Doris host can start today.
-Then one PR that widens the header contract, adds the `Send` push handle, the dedicated copy stream and the draft
-reply's test (start `run()` on one thread, push the first batch only after execution began, push the rest with pauses,
-close, compare with the pre-materialized run), and lands the `start()/join()` split with a bounded or blocking push. A
-hole in the source is fixed in the engine, not by narrowing the contract.
+Tests. C++ (`test/cpp/exec/test_sirius_ffi_fragment.cpp`, `[isolated_context][sirius_ffi]`): a result fragment and
+an intermediate fragment are `start()`ed, a producer `std::thread` waits until the owner is inside `join()`, pushes
+two batches with pauses, closes the sender, and the rows equal a fragment fed before `run()` (the intermediate one
+drained through `relay_from` after `join()`); the handle refuses after `join()` and after the fragment is destroyed;
+a started fragment destroyed before `join()` is joined by its destructor and the next fragment builds; `run()` after
+`start()`, `join()` before `start()` and `input_handle()` before `build()` throw. Rust
+(`start_join_takes_arrow_pushes_from_another_thread_while_join_blocks`): the handle is moved into a `std::thread`
+that pushes while the main thread blocks in `join()`; the rows equal the pre-materialized run; a push after `join()`
+is an `Err` naming the finished fragment. The `[sirius_ffi]` suite is 18 cases, 619 assertions; the Rust suite 20
+tests.
+
+Measured. The pool-stream copy costs nothing against the default-stream copy: the hidden `[sirius_ffi_bench]` case
+gives `push_arrow` on the 512 MiB batch 0.055 s / 9.81 GB/s before and 0.053 s / 10.20 GB/s after (128 MiB 7.80 to
+10.08, 2 GiB 9.92 to 10.23 GB/s, one run each, same box, GPU 1). The transient device peak of the declared-width
+import, measured through an rmm statistics adaptor on six decimal128 columns of 2^18 rows declared DECIMAL(15,2), is
+one wide column (4 MiB) over the 12 MiB table: 16 MiB, where importing the batch wide and casting afterwards held
+24 MiB of wide columns plus the first cast.
 
 Sequencing against T5b (the proposal's second question). The proposal asks that `push_arrow` go on top of T5b (the
 `push_packed` FFI layer from sirius-db/sirius#1644) or the `stream/*` stack rather than race the reshaping of
@@ -425,12 +456,12 @@ Reading. The device-to-device WRITE moves the same bytes at 48-56 GB/s (5.1); th
 end to end, about 180x slower, far below the sum of its per-leg costs in 5.2 (D2H 4 GB/s, H2D 10 GB/s): the sender
 exports, IPC-encodes and ships 64 MiB frames sequentially on the drain thread, the receiver decodes and pushes
 sequentially on the engine thread, and every frame is one brpc round trip. Two defects surfaced: q04 ran out of pool
-memory (arriving Arrow batches are copied into the 60 GiB pool with no reservation accounting, the M5 follow-up
-already listed), and q07 crashed a CN (not yet reproduced; the last CN log lines are the lineitem fragment's
-translation, then the segfault). Conclusion for the design question: for CN-to-CN exchange on one host NIXL stays;
+memory (at this run, arriving Arrow batches were copied into the 60 GiB pool with no reservation accounting; 2.3
+item 1 has the accounting that now exists), and q07 crashed a CN (not yet reproduced; the last CN log lines are the
+lineitem fragment's translation, then the segfault). Conclusion for the design question: for CN-to-CN exchange on one host NIXL stays;
 the Arrow path is the host-input contract for a CPU-side producer (its intended role), and needs pipelining
-(overlap export, encode, send, decode, push), reservation accounting and the crash fix before it can be measured
-against NIXL on equal terms. Evidence: `starrocks-tools/evidence/rtxpro6000-fix4/X-nixl`, `X-arrow`, `arrow-vs-nixl.md`.
+(overlap export, encode, send, decode, push) and the crash fix before it can be measured against NIXL on equal
+terms; the reservation accounting is in (2.3). Evidence: `starrocks-tools/evidence/rtxpro6000-fix4/X-nixl`, `X-arrow`, `arrow-vs-nixl.md`.
 
 ## 5. Performance comparison against NIXL
 
