@@ -120,6 +120,36 @@ const WARMUP_PEERS: PeerList = PeerList {
     name: "SIRIUS_CN_NIXL_WARMUP_PEERS",
 };
 
+/// Encode-and-send workers per remote Arrow drain (`arrow_exchange.rs`, `send_fragment`).
+///
+/// A drain exports parked batches on the engine thread and hands each chunk of at most 64 MiB
+/// to one of these workers, which IPC-encodes it and ships it over its own connection while the
+/// others do the same: N frames in flight per destination instead of one round trip at a time
+/// (the first SF1000 run moved 0.29 GB/s per stream that way). The receiver reorders frames that
+/// overtake each other. `1` is the sequential wire shape. Host memory per drain is bounded by
+/// about three chunks per worker.
+const ARROW_SEND_WORKERS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_ARROW_SEND_WORKERS",
+    default: 4,
+    min: 1,
+    max: 64,
+};
+
+/// Threads of the brpc server's tokio runtime (`main.rs`, `BrpcRuntime`).
+///
+/// `1` is the current-thread runtime the CN has always used: every connection's frames are
+/// read and decoded on that one thread, and handlers run on the blocking pool. The Arrow
+/// exchange transport's receiver reads 64 MiB frames from several sender connections at once,
+/// and one thread caps that at about 1.1 GB/s on loopback here; 4 threads lifted a 4-worker
+/// drain to 1.45 GB/s and an 8-worker one to 2.1 GB/s. The default stays 1 because it changes
+/// the threading of every RPC the CN serves, FE traffic included.
+const BRPC_IO_THREADS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_BRPC_IO_THREADS",
+    default: 1,
+    min: 1,
+    max: 64,
+};
+
 /// One environment-backed knob: where it is read from, what it is when unset, and the range
 /// outside which a value is an error rather than a clamp.
 struct Knob<T> {
@@ -433,6 +463,10 @@ pub struct Tunables {
     pub(crate) fusion_mode: FusionMode,
     /// See [`ExchangeTransport`].
     pub(crate) exchange_transport: ExchangeTransport,
+    /// See [`ARROW_SEND_WORKERS`].
+    pub arrow_send_workers: usize,
+    /// See [`BRPC_IO_THREADS`].
+    pub brpc_io_threads: usize,
 }
 
 impl Tunables {
@@ -449,6 +483,8 @@ impl Tunables {
         warmup_peers: None,
         fusion_mode: FusionMode::DEFAULT,
         exchange_transport: ExchangeTransport::DEFAULT,
+        arrow_send_workers: ARROW_SEND_WORKERS.default as usize,
+        brpc_io_threads: BRPC_IO_THREADS.default as usize,
     };
 
     /// Reads and validates every knob without touching the global.
@@ -474,6 +510,8 @@ impl Tunables {
             warmup_peers: WARMUP_PEERS.read()?,
             fusion_mode: FusionMode::read()?,
             exchange_transport: ExchangeTransport::read()?,
+            arrow_send_workers: ARROW_SEND_WORKERS.read()? as usize,
+            brpc_io_threads: BRPC_IO_THREADS.read()? as usize,
         })
     }
 
@@ -512,6 +550,8 @@ impl Tunables {
             warmup_peers = ?published.warmup_peers,
             fusion_mode = ?published.fusion_mode,
             exchange_transport = ?published.exchange_transport,
+            arrow_send_workers = published.arrow_send_workers,
+            brpc_io_threads = published.brpc_io_threads,
             "resolved CN transport tunables"
         );
         Ok(published)
@@ -585,6 +625,8 @@ pub(crate) mod tests {
                 (WARMUP_PEERS.name, None),
                 (FUSION_MODE_NAME, None),
                 (EXCHANGE_TRANSPORT_NAME, None),
+                (ARROW_SEND_WORKERS.name, None),
+                (BRPC_IO_THREADS.name, None),
             ],
             Tunables::from_env,
         )
@@ -601,6 +643,43 @@ pub(crate) mod tests {
         assert_eq!(resolved.warmup_peers, None);
         assert_eq!(resolved.fusion_mode, FusionMode::Leaf);
         assert_eq!(resolved.exchange_transport, ExchangeTransport::Nixl);
+        assert_eq!(resolved.arrow_send_workers, 4);
+        assert_eq!(resolved.brpc_io_threads, 1);
+    }
+
+    /// The brpc I/O thread count: unset is 1 (the current-thread runtime), a value in 1..=64 is
+    /// taken, `0` fails the whole resolution naming the variable.
+    #[test]
+    fn brpc_io_threads_takes_a_count_and_rejects_zero() {
+        let four = with_env(&[(BRPC_IO_THREADS.name, Some("4"))], Tunables::from_env)
+            .expect("four threads resolve");
+        assert_eq!(four.brpc_io_threads, 4);
+        let error = with_env(&[(BRPC_IO_THREADS.name, Some("0"))], Tunables::from_env)
+            .expect_err("zero threads cannot serve");
+        assert!(error.contains(BRPC_IO_THREADS.name), "{error}");
+    }
+
+    /// The Arrow send-worker count: unset is 4, a value in 1..=64 is taken, `0` (no worker could
+    /// ever send) and anything unparsable fail the whole resolution naming the variable.
+    #[test]
+    fn arrow_send_workers_takes_a_count_and_rejects_zero() {
+        let one = with_env(&[(ARROW_SEND_WORKERS.name, Some("1"))], Tunables::from_env)
+            .expect("one worker resolves");
+        assert_eq!(one.arrow_send_workers, 1);
+        let eight = with_env(
+            &[(ARROW_SEND_WORKERS.name, Some(" 8 "))],
+            Tunables::from_env,
+        )
+        .expect("eight workers resolve");
+        assert_eq!(eight.arrow_send_workers, 8);
+        for bad in ["0", "65", "four"] {
+            let error = with_env(&[(ARROW_SEND_WORKERS.name, Some(bad))], Tunables::from_env)
+                .expect_err("not an accepted worker count");
+            assert!(
+                error.contains(ARROW_SEND_WORKERS.name) && error.contains(bad),
+                "{error}"
+            );
+        }
     }
 
     /// The fusion knob: unset is `leaf`; the off spellings, case and whitespace are tolerated;

@@ -578,6 +578,7 @@ fn run_fragment_inner<'ctx>(
         let mut arrow_batches = 0usize;
         let mut arrow_ipc_bytes = 0u64;
         let mut arrow_host_bytes = 0usize;
+        let pushing = std::time::Instant::now();
         for batch in batches {
             if let Some(arrow) = &batch.arrow {
                 arrow_ipc_bytes += batch.ipc_bytes;
@@ -630,7 +631,9 @@ fn run_fragment_inner<'ctx>(
         );
         // `bytes` is the IPC payload the sender's `transmitted batches via arrow` line counts
         // (the two totals match per stream and sender); `host_bytes` is the decoded footprint
-        // this CN held in host RAM for these batches from their arrival until now.
+        // this CN held in host RAM for these batches from their arrival until now; `push_ms`
+        // is the time the engine thread spent copying them onto the GPU (`push_arrow`) and
+        // closing the sender.
         if arrow_batches > 0 {
             info!(
                 stream_id,
@@ -638,6 +641,7 @@ fn run_fragment_inner<'ctx>(
                 batches = arrow_batches,
                 bytes = arrow_ipc_bytes,
                 host_bytes = arrow_host_bytes,
+                push_ms = pushing.elapsed().as_millis() as u64,
                 "received remote batches via arrow"
             );
         }

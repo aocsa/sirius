@@ -12,8 +12,10 @@ const PRPC_MAGIC: &[u8; 4] = b"PRPC";
 const PRPC_HEAD_SIZE: usize = 12;
 const MAX_PRPC_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 // Cap the up-front body allocation so a frame that declares a large size but never sends the
-// bytes cannot pin `MAX_PRPC_MESSAGE_SIZE` per connection; the buffer grows as data arrives.
-const PRPC_READ_CHUNK: usize = 64 * 1024;
+// bytes cannot pin `MAX_PRPC_MESSAGE_SIZE` per connection; the buffer grows as data arrives. The
+// step is sized for the Arrow exchange transport's 64 MiB attachments (fewer reads and buffer
+// growths per frame) while still bounding what an unfinished frame can pin.
+const PRPC_READ_CHUNK: usize = 1024 * 1024;
 const PRPC_SUCCESS: i32 = 0;
 // brpc/baidu-rpc status codes: ENOSERVICE/ENOMETHOD are distinct, and EINTERNAL covers the rest.
 const PRPC_SERVICE_NOT_FOUND: i32 = 1001;
@@ -294,6 +296,30 @@ impl Frame {
         }
     }
 
+    /// Encodes everything of a request frame but its attachment — header, metadata (with
+    /// `attachment_size` set to `attachment_len`) and body — so a caller can write the
+    /// attachment straight from its own buffer after these bytes, with no copy of it. What the
+    /// blocking client sends: the Arrow exchange transport puts 64 MiB attachments through it,
+    /// one per frame, where [`for_request`](Self::for_request) plus [`encode`](Self::encode)
+    /// would copy each twice.
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+    pub(crate) fn encode_request_head(
+        service_name: impl Into<String>,
+        method_name: impl Into<String>,
+        body: &[u8],
+        attachment_len: usize,
+        correlation_id: Option<i64>,
+    ) -> Vec<u8> {
+        let frame = Self::for_request(
+            service_name,
+            method_name,
+            Vec::new(),
+            Vec::new(),
+            correlation_id,
+        );
+        Self::encode_head(&frame.meta, body, attachment_len)
+    }
+
     /// Reads one PRPC frame from a blocking stream, returning `None` on normal connection close.
     /// The synchronous mirror of [`read_async`](Self::read_async), used by the blocking client.
     #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
@@ -315,8 +341,17 @@ impl Frame {
         }
 
         let sizes = FrameSizes::parse_header(&header)?;
-        let payload = read_payload_sync(stream, sizes.message_size)?;
-        Self::decode_payload(sizes.meta_size, payload).map(Some)
+        // Metadata first: it says how the rest of the payload splits into body and attachment,
+        // so each lands in its own buffer instead of being copied out of one.
+        let meta = Self::decode_meta(read_payload_sync(stream, sizes.meta_size)?)?;
+        let (body_size, attachment_size) = Self::split_sizes(&meta, sizes)?;
+        let body = read_payload_sync(stream, body_size)?;
+        let attachment = read_payload_sync(stream, attachment_size)?;
+        Ok(Some(Self {
+            meta,
+            body,
+            attachment,
+        }))
     }
 
     /// Reads one PRPC frame from an async stream, returning `None` on normal connection close.
@@ -338,8 +373,16 @@ impl Frame {
         }
 
         let sizes = FrameSizes::parse_header(&header)?;
-        let payload = read_payload(stream, sizes.message_size).await?;
-        Self::decode_payload(sizes.meta_size, payload).map(Some)
+        // Metadata first, as in `read`, so body and attachment each land in their own buffer.
+        let meta = Self::decode_meta(read_payload(stream, sizes.meta_size).await?)?;
+        let (body_size, attachment_size) = Self::split_sizes(&meta, sizes)?;
+        let body = read_payload(stream, body_size).await?;
+        let attachment = read_payload(stream, attachment_size).await?;
+        Ok(Some(Self {
+            meta,
+            body,
+            attachment,
+        }))
     }
 
     /// Writes this encoded PRPC frame to an async stream.
@@ -358,27 +401,34 @@ impl Frame {
 
     /// Encodes this PRPC frame as `PRPC` magic, message size, metadata size, and body.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut meta = self.meta.clone();
-        meta.attachment_size = Some(self.attachment.len().min(i32::MAX as usize) as i32);
+        let mut bytes = Self::encode_head(&self.meta, &self.body, self.attachment.len());
+        bytes.extend_from_slice(&self.attachment);
+        bytes
+    }
+
+    /// The wire bytes of a frame up to its attachment: header, metadata and body, sized for an
+    /// attachment of `attachment_len` bytes that follows. `attachment_size` in the metadata is
+    /// set here, the single source of truth for it.
+    fn encode_head(meta: &RpcMeta, body: &[u8], attachment_len: usize) -> Vec<u8> {
+        let mut meta = meta.clone();
+        meta.attachment_size = Some(attachment_len.min(i32::MAX as usize) as i32);
         let meta_bytes = meta.encode_to_vec();
-        let message_size = meta_bytes.len() + self.body.len() + self.attachment.len();
+        let message_size = meta_bytes.len() + body.len() + attachment_len;
 
         let mut bytes = Vec::with_capacity(PRPC_HEAD_SIZE + message_size);
         bytes.extend_from_slice(PRPC_MAGIC);
         bytes.extend_from_slice(&(message_size as i32).to_be_bytes());
         bytes.extend_from_slice(&(meta_bytes.len() as i32).to_be_bytes());
         bytes.extend_from_slice(&meta_bytes);
-        bytes.extend_from_slice(&self.body);
-        bytes.extend_from_slice(&self.attachment);
+        bytes.extend_from_slice(body);
         bytes
     }
 
-    /// Decodes a complete PRPC payload after the fixed header has been parsed.
-    fn decode_payload(meta_size: usize, payload: Vec<u8>) -> Result<Self> {
-        let message_size = payload.len();
+    /// Decodes the metadata protobuf at the head of a payload and refuses the framing features
+    /// the Rust CN does not implement.
+    fn decode_meta(meta_bytes: Vec<u8>) -> Result<RpcMeta> {
         let meta =
-            RpcMeta::decode(&payload[..meta_size]).context("failed to decode PRPC metadata")?;
-
+            RpcMeta::decode(meta_bytes.as_slice()).context("failed to decode PRPC metadata")?;
         if meta.compress_type.unwrap_or(0) != 0 {
             return Err(anyhow!(
                 "compressed PRPC payloads are not supported by the Rust CN"
@@ -394,27 +444,21 @@ impl Frame {
                 "streaming PRPC payloads are not supported by the Rust CN"
             ));
         }
+        Ok(meta)
+    }
 
+    /// How the payload after the metadata splits into `(body, attachment)` byte counts.
+    fn split_sizes(meta: &RpcMeta, sizes: FrameSizes) -> Result<(usize, usize)> {
         let attachment_size = meta.attachment_size.unwrap_or(0);
         if attachment_size < 0 {
             return Err(anyhow!("negative PRPC attachment size"));
         }
         let attachment_size = attachment_size as usize;
-        let body_size = message_size - meta_size;
-        if attachment_size > body_size {
+        let after_meta = sizes.message_size - sizes.meta_size;
+        if attachment_size > after_meta {
             return Err(anyhow!("PRPC attachment size exceeds payload size"));
         }
-
-        let body_start = meta_size;
-        let body_end = message_size - attachment_size;
-        let body = payload[body_start..body_end].to_vec();
-        let attachment = payload[body_end..].to_vec();
-
-        Ok(Self {
-            meta,
-            body,
-            attachment,
-        })
+        Ok((after_meta - attachment_size, attachment_size))
     }
 }
 
@@ -523,5 +567,28 @@ mod tests {
         let decoded_request = decoded.into_request().unwrap();
         assert_eq!(decoded_request.attachment, b"thrift attachment");
         assert_eq!(decoded_request.body, b"request body");
+    }
+
+    /// The client's two-part encoding (head, then the attachment from the caller's buffer) puts
+    /// exactly the bytes of the owned encoding on the wire.
+    #[test]
+    fn request_head_plus_attachment_equals_the_owned_encoding() {
+        let owned = Frame::for_request(
+            "PInternalService",
+            "transmit_packed",
+            b"params".to_vec(),
+            vec![7u8; 4096],
+            Some(9),
+        )
+        .encode();
+        let mut split = Frame::encode_request_head(
+            "PInternalService",
+            "transmit_packed",
+            b"params",
+            4096,
+            Some(9),
+        );
+        split.extend_from_slice(&[7u8; 4096]);
+        assert_eq!(split, owned);
     }
 }

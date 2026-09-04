@@ -570,11 +570,24 @@ impl BrpcRuntime {
             ExchangeIdentity::new(compute_node.advertise_host.as_str(), compute_node.brpc_port);
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
+        // One thread reads and decodes every connection's frames (the shape the CN has always
+        // had); `SIRIUS_CN_BRPC_IO_THREADS` above 1 spreads the connections over a multi-thread
+        // runtime, which is what lets the Arrow exchange receiver take several senders' 64 MiB
+        // frames at once. Handlers run on the blocking pool either way.
+        let io_threads = Tunables::get().brpc_io_threads;
         let join = tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .build()
-                .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
+            let runtime = if io_threads > 1 {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(io_threads)
+                    .thread_name("brpc-io")
+                    .enable_io()
+                    .build()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .build()
+            }
+            .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
                 BrpcServer::with_executor(executor, identity, transport)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),

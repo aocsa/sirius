@@ -27,7 +27,9 @@
 //! transport thread; distinct destinations are independent counters.
 
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
@@ -62,19 +64,29 @@ pub(crate) struct ArrowDrain {
     pub(crate) spec: RemoteSendSpec,
     /// The sender fragment this drain belongs to, for failure attribution and the peer cancel.
     pub(crate) label: FragmentLabel,
-    /// The connection to the peer, dialed by [`prepare`].
-    client: PrpcClient,
+    /// One connection to the peer per encode-and-send worker, dialed by [`prepare`].
+    clients: Vec<PrpcClient>,
 }
 
-/// Dials the destination of `spec` so a peer nothing listens on fails here, on the caller's
-/// thread, exactly as it did when the whole drain ran inside the RPC. Nothing is exported yet.
-pub(crate) fn prepare(spec: RemoteSendSpec, label: FragmentLabel) -> Result<ArrowDrain, String> {
-    let mut client = PrpcClient::new(&spec.host, spec.brpc_port);
-    client.connect()?;
+/// Dials `workers` connections to the destination of `spec` (one per encode-and-send worker,
+/// at least one) so a peer nothing listens on fails here, on the caller's thread, exactly as it
+/// did when the whole drain ran inside the RPC. Nothing is exported yet.
+pub(crate) fn prepare(
+    spec: RemoteSendSpec,
+    label: FragmentLabel,
+    workers: usize,
+) -> Result<ArrowDrain, String> {
+    let clients = (0..workers.max(1))
+        .map(|_| {
+            let mut client = PrpcClient::new(&spec.host, spec.brpc_port);
+            client.connect()?;
+            Ok(client)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(ArrowDrain {
         spec,
         label,
-        client,
+        clients,
     })
 }
 
@@ -215,39 +227,33 @@ pub(crate) fn cancel_peer_receiver(spec: &RemoteSendSpec, label: &FragmentLabel,
     }
 }
 
-/// What one drain moved, for the `transmitted batches via arrow` line.
+/// What one encode-and-send worker moved, summed into the `transmitted batches via arrow` line.
 #[derive(Debug, Default)]
-struct DrainStats {
+struct WorkerStats {
     /// Frames sent (chunks of parked batches).
     batches: u64,
     /// IPC bytes sent, the total the receiver's `received remote batches via arrow` counts.
     bytes: u64,
-    /// Time inside `export_arrow_next` (the engine's D2H copy, serialized on the engine thread).
-    export: Duration,
     /// Time encoding chunks as Arrow IPC.
     encode: Duration,
     /// Time inside `transmit_packed` round trips (write, the peer's decode, the reply).
     send: Duration,
 }
 
-/// Sender flow: drain one parked output to a remote receiver as Arrow IPC frames and drop the
-/// parked output. Blocks until every chunk and the eos frame have been acknowledged; on a failed
-/// send the parked output is still dropped (best-effort), so a dead query does not pin it, and
-/// the receiver is cancelled at the peer.
-pub(crate) fn send_fragment(
-    executor: &dyn FragmentExecutor,
-    drain: ArrowDrain,
-) -> Result<(), String> {
-    let ArrowDrain {
-        spec,
-        label,
-        mut client,
-    } = drain;
-    let started = Instant::now();
+impl WorkerStats {
+    fn add(&mut self, other: &WorkerStats) {
+        self.batches += other.batches;
+        self.bytes += other.bytes;
+        self.encode += other.encode;
+        self.send += other.send;
+    }
+}
+
+/// One `transmit_packed` frame of `spec`'s stream: a data frame carrying `rows`, or the eos.
+fn frame(spec: &RemoteSendSpec, eos: bool, seq: i64, rows: Option<u64>) -> PTransmitPackedParams {
     let (hi, lo) = spec.slot.fragment_instance_id.as_halves();
-    let finst_id = PUniqueId { hi, lo };
-    let frame = |eos: bool, seq: i64, rows: Option<u64>| PTransmitPackedParams {
-        finst_id: Some(finst_id),
+    PTransmitPackedParams {
+        finst_id: Some(PUniqueId { hi, lo }),
         node_id: Some(spec.slot.node_id),
         sender_id: Some(spec.slot.sender_id),
         eos: Some(eos),
@@ -259,39 +265,158 @@ pub(crate) fn send_fragment(
         canary: None,
         rows,
         arrow_ipc: Some(true),
-    };
-    let mut seq: i64 = 0;
-    let mut stats = DrainStats::default();
+    }
+}
 
-    let sent = (|| -> Result<(), String> {
-        loop {
-            let exporting = Instant::now();
-            let Some(batch) = executor.export_arrow_next(spec.slot)? else {
+/// One encode-and-send worker: takes `(seq, chunk)`s off the shared queue until the exporter
+/// closes it, IPC-encodes each and ships it over this worker's own connection. Stops at the
+/// first failure and raises `failed`, so the exporter stops feeding the queue; the connection
+/// comes back either way (one of them sends the eos).
+fn send_worker(
+    mut client: PrpcClient,
+    spec: &RemoteSendSpec,
+    chunks: &Mutex<Receiver<(i64, RecordBatch)>>,
+    failed: &AtomicBool,
+) -> (PrpcClient, Result<WorkerStats, String>) {
+    let mut stats = WorkerStats::default();
+    loop {
+        // Hold the queue's lock only while waiting for the next chunk: the workers then take
+        // turns at the head of the queue and encode/send concurrently.
+        let next = chunks.lock().unwrap_or_else(PoisonError::into_inner).recv();
+        let Ok((seq, chunk)) = next else {
+            return (client, Ok(stats));
+        };
+        let outcome = (|| -> Result<(), String> {
+            let encoding = Instant::now();
+            let payload = encode_ipc(&chunk)?;
+            stats.encode += encoding.elapsed();
+            stats.bytes += payload.len() as u64;
+            let sending = Instant::now();
+            rpc_transmit(
+                &mut client,
+                frame(spec, false, seq, Some(chunk.num_rows() as u64)),
+                payload,
+            )?;
+            stats.send += sending.elapsed();
+            stats.batches += 1;
+            Ok(())
+        })();
+        if let Err(err) = outcome {
+            failed.store(true, Ordering::SeqCst);
+            return (client, Err(err));
+        }
+    }
+}
+
+/// Sender flow: drain one parked output to a remote receiver as Arrow IPC frames and drop the
+/// parked output. Blocks until every chunk and the eos frame have been acknowledged; on a failed
+/// send the parked output is still dropped (best-effort), so a dead query does not pin it, and
+/// the receiver is cancelled at the peer.
+///
+/// Pipelined: this thread exports parked batches (`export_arrow_next`, one engine round trip
+/// and one D2H copy each) and queues their chunks with their `seq`; the drain's workers (one
+/// per connection [`prepare`] dialed) encode and send them concurrently, so N frames are in
+/// flight per destination and the export overlaps the wire. The queue is bounded to the worker
+/// count, so host memory per drain stays within about three chunks per worker. Frames may reach
+/// the receiver out of `seq` order; it holds the early ones (`local_exchange.rs`,
+/// `push_remote_frame`). The eos goes last, once every worker has returned with its data frames
+/// acknowledged, so an eos never overtakes a data frame.
+pub(crate) fn send_fragment(
+    executor: &dyn FragmentExecutor,
+    drain: ArrowDrain,
+) -> Result<(), String> {
+    let ArrowDrain {
+        spec,
+        label,
+        clients,
+    } = drain;
+    let started = Instant::now();
+    let workers = clients.len();
+    let spec = Arc::new(spec);
+    let failed = Arc::new(AtomicBool::new(false));
+    let (chunk_tx, chunk_rx) = sync_channel::<(i64, RecordBatch)>(workers.max(1));
+    let chunk_rx = Arc::new(Mutex::new(chunk_rx));
+    let mut handles = Vec::with_capacity(workers);
+    let mut spawn_error = None;
+    for client in clients {
+        let spec = Arc::clone(&spec);
+        let chunk_rx = Arc::clone(&chunk_rx);
+        let failed = Arc::clone(&failed);
+        match std::thread::Builder::new()
+            .name("arrow-send".to_string())
+            .spawn(move || send_worker(client, &spec, &chunk_rx, &failed))
+        {
+            Ok(handle) => handles.push(handle),
+            Err(err) => {
+                spawn_error = Some(format!("failed to spawn an Arrow send worker: {err}"));
                 break;
-            };
-            stats.export += exporting.elapsed();
-            let named = with_names(&batch, &spec.names)?;
-            for chunk in chunk_by_rows(&named, MAX_CHUNK_BYTES) {
-                let encoding = Instant::now();
-                let payload = encode_ipc(&chunk)?;
-                stats.encode += encoding.elapsed();
-                stats.bytes += payload.len() as u64;
-                let sending = Instant::now();
-                rpc_transmit(
-                    &mut client,
-                    frame(false, seq, Some(chunk.num_rows() as u64)),
-                    payload,
-                )?;
-                stats.send += sending.elapsed();
-                seq += 1;
-                stats.batches += 1;
             }
         }
-        let sending = Instant::now();
-        rpc_transmit(&mut client, frame(true, seq, None), Vec::new())?;
-        stats.send += sending.elapsed();
-        Ok(())
-    })();
+    }
+
+    let mut seq: i64 = 0;
+    let mut export = Duration::ZERO;
+    let exported = match spawn_error {
+        Some(err) => Err(err),
+        None => (|| -> Result<(), String> {
+            loop {
+                if failed.load(Ordering::SeqCst) {
+                    // The worker's own error is reported below; stop exporting into a queue
+                    // nothing will drain.
+                    return Err("an Arrow send worker failed".to_string());
+                }
+                let exporting = Instant::now();
+                let Some(batch) = executor.export_arrow_next(spec.slot)? else {
+                    return Ok(());
+                };
+                export += exporting.elapsed();
+                let named = with_names(&batch, &spec.names)?;
+                for chunk in chunk_by_rows(&named, MAX_CHUNK_BYTES) {
+                    if chunk_tx.send((seq, chunk)).is_err() {
+                        return Err(
+                            "every Arrow send worker exited before the drain finished".to_string()
+                        );
+                    }
+                    seq += 1;
+                }
+            }
+        })(),
+    };
+    // Closing the queue ends the workers once they have sent what was queued.
+    drop(chunk_tx);
+    let mut stats = WorkerStats::default();
+    let mut worker_error = None;
+    let mut clients = Vec::with_capacity(workers);
+    for handle in handles {
+        match handle.join() {
+            Ok((client, Ok(worker_stats))) => {
+                stats.add(&worker_stats);
+                clients.push(client);
+            }
+            Ok((client, Err(err))) => {
+                worker_error.get_or_insert(err);
+                clients.push(client);
+            }
+            Err(_) => {
+                worker_error.get_or_insert("an Arrow send worker panicked".to_string());
+            }
+        }
+    }
+    // A worker's failure is the root cause when the exporter also stopped because of it.
+    let sent = match (worker_error, exported) {
+        (Some(err), _) => Err(err),
+        (None, Err(err)) => Err(err),
+        (None, Ok(())) => {
+            // Every data frame is acknowledged: the eos may go.
+            let sending = Instant::now();
+            let outcome = match clients.first_mut() {
+                Some(client) => rpc_transmit(client, frame(&spec, true, seq, None), Vec::new()),
+                None => Err("no connection left to send the Arrow eos frame".to_string()),
+            };
+            stats.send += sending.elapsed();
+            outcome
+        }
+    };
     if let Err(err) = &sent {
         // Best-effort GPU cleanup, as the nixl tier does: without it a failed transmit pins the
         // parked output for the process lifetime. A slot already retired with its query is Ok.
@@ -307,18 +432,22 @@ pub(crate) fn send_fragment(
     sent?;
     executor.drop_parked(spec.slot)?;
     let (query_id, fragment_instance_id) = label.log_ids();
+    let dest = format!("{}:{}", spec.host, spec.brpc_port);
+    // `encode_ms` and `send_ms` are summed over the workers, so they exceed `elapsed_ms` when
+    // the workers overlap; `export_ms` is this thread's time inside the engine.
     info!(
         %query_id,
         %fragment_instance_id,
         stream_id = spec.slot.node_id,
         sender_id = spec.slot.sender_id,
-        dest = %client.peer(),
+        %dest,
         batches = stats.batches,
         bytes = stats.bytes,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        export_ms = stats.export.as_millis() as u64,
+        export_ms = export.as_millis() as u64,
         encode_ms = stats.encode.as_millis() as u64,
         send_ms = stats.send.as_millis() as u64,
+        workers,
         "transmitted batches via arrow"
     );
     Ok(())

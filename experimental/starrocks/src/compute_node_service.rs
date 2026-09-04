@@ -176,6 +176,9 @@ struct ServiceCore {
     /// The exchange transport for REMOTE destinations (`ExchangeTransport::code`), from the
     /// registry at bring-up; tests override it per instance.
     exchange_transport: std::sync::atomic::AtomicU8,
+    /// Encode-and-send workers per remote Arrow drain (`SIRIUS_CN_ARROW_SEND_WORKERS`), from
+    /// the registry at bring-up; tests override it per instance.
+    arrow_send_workers: std::sync::atomic::AtomicUsize,
 }
 
 impl SiriusComputeNodeService {
@@ -221,6 +224,9 @@ impl SiriusComputeNodeService {
             exchange_transport: std::sync::atomic::AtomicU8::new(
                 Tunables::get().exchange_transport.code(),
             ),
+            arrow_send_workers: std::sync::atomic::AtomicUsize::new(
+                Tunables::get().arrow_send_workers,
+            ),
         });
         // A dedicated thread with a std channel (not a tokio task): fragment execution is
         // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
@@ -253,6 +259,14 @@ impl SiriusComputeNodeService {
         self.core
             .exchange_transport
             .store(transport.code(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Overrides the bring-up Arrow send-worker count for this service instance.
+    #[cfg(test)]
+    pub(crate) fn set_arrow_send_workers(&self, workers: usize) {
+        self.core
+            .arrow_send_workers
+            .store(workers.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Hands a ready receiver to the dispatch worker so this RPC thread returns immediately
@@ -1536,7 +1550,10 @@ impl ServiceCore {
                         transport.send_fragment(spec)?;
                     }
                     ExchangeTransport::Arrow => {
-                        match arrow_exchange::prepare(spec, Self::fragment_label(params)) {
+                        let workers = self
+                            .arrow_send_workers
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        match arrow_exchange::prepare(spec, Self::fragment_label(params), workers) {
                             Ok(drain) => drains.push(drain),
                             Err(err) => {
                                 // The dial failed before anything was exported: release this
@@ -3383,6 +3400,32 @@ pub(crate) mod tests {
         export_gate: Mutex<Option<mpsc::Receiver<()>>>,
         fail_export_at: Option<usize>,
         exports: AtomicUsize,
+        /// When set, every output slot parks a copy of these batches instead of the two
+        /// default ones (column names are ignored: the transport renames positionally).
+        template: Option<Vec<arrow_array::RecordBatch>>,
+    }
+
+    /// `count` single-row two-column batches (the sender plan names two columns) both holding
+    /// `0..count`, so a receiver's staged order can be read back after a drain that ships frames
+    /// over several connections.
+    fn numbered_batches(count: i64) -> Vec<arrow_array::RecordBatch> {
+        (0..count)
+            .map(|value| {
+                arrow_array::RecordBatch::try_from_iter([
+                    (
+                        "a",
+                        Arc::new(arrow_array::Int64Array::from(vec![value]))
+                            as arrow_array::ArrayRef,
+                    ),
+                    (
+                        "b",
+                        Arc::new(arrow_array::Int64Array::from(vec![value]))
+                            as arrow_array::ArrayRef,
+                    ),
+                ])
+                .unwrap()
+            })
+            .collect()
     }
 
     /// The batches `ArrowParkingExecutor` parks for a plan with these output names, in order.
@@ -3407,10 +3450,11 @@ pub(crate) mod tests {
             }
             let mut parked = self.parked.lock().unwrap();
             for slot in &run.outputs {
-                parked.insert(
-                    *slot,
-                    std::collections::VecDeque::from(parked_arrow_batches(&run.plan.output_names)),
-                );
+                let batches = match &self.template {
+                    Some(template) => template.clone(),
+                    None => parked_arrow_batches(&run.plan.output_names).to_vec(),
+                };
+                parked.insert(*slot, std::collections::VecDeque::from(batches));
             }
             Ok(None)
         }
@@ -3474,6 +3518,17 @@ pub(crate) mod tests {
         receiver_id: &TUniqueId,
         peer_executor: Arc<dyn FragmentExecutor>,
     ) -> Option<(SiriusComputeNodeService, u16, PeerGuard)> {
+        peer_with_registered_receiver_on(query_id, receiver_id, peer_executor, 1)
+    }
+
+    /// [`peer_with_registered_receiver`] with the peer's brpc runtime on `io_threads` threads
+    /// (1 is the production current-thread shape).
+    fn peer_with_registered_receiver_on(
+        query_id: &TUniqueId,
+        receiver_id: &TUniqueId,
+        peer_executor: Arc<dyn FragmentExecutor>,
+        io_threads: usize,
+    ) -> Option<(SiriusComputeNodeService, u16, PeerGuard)> {
         let peer_listener = match crate::BrpcServer::bind("127.0.0.1", 0) {
             Ok(listener) => listener,
             Err(_) => return None, // sandbox denies binding; the brpc tests skip alike
@@ -3484,7 +3539,7 @@ pub(crate) mod tests {
             peer_executor,
             ExchangeIdentity::new("127.0.0.1", peer_port),
         );
-        let (port, guard) = serve_peer(peer.clone())?;
+        let (port, guard) = serve_peer_on(peer.clone(), io_threads)?;
         let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
         receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
         let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
@@ -3568,6 +3623,168 @@ pub(crate) mod tests {
         });
     }
 
+    /// The pipelined drain: four workers ship 24 frames over four connections, so frames may
+    /// reach the peer out of `seq` order; the peer's rendezvous holds the early ones, and the
+    /// dispatched receiver still sees every batch exactly once, in the sender's parked order.
+    #[test]
+    fn arrow_frames_over_several_workers_arrive_in_parked_order_at_the_peer() {
+        capture_logs();
+        let query_id = TUniqueId::new(70, 1);
+        let receiver_id = TUniqueId::new(70, 2);
+        let peer_executor = Arc::new(RecordingExecutor::default());
+        let Some((peer, port, _peer_guard)) =
+            peer_with_registered_receiver(&query_id, &receiver_id, peer_executor.clone())
+        else {
+            return;
+        };
+
+        const FRAMES: i64 = 24;
+        let executor = Arc::new(ArrowParkingExecutor {
+            template: Some(numbered_batches(FRAMES)),
+            ..ArrowParkingExecutor::default()
+        });
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_exchange_transport(ExchangeTransport::Arrow);
+        service.set_arrow_send_workers(4);
+        let sender = arrow_sender_to_peer(&query_id, &TUniqueId::new(70, 3), &receiver_id, port);
+        assert_exec_ok(&service, &sender);
+
+        let fetched = fetch_rows_eventually(&peer, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        let inputs = peer_executor.remote_inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        let (node_id, sender_id, batches) = &inputs[0];
+        assert_eq!((*node_id, *sender_id), (7, 0));
+        let order: Vec<i64> = batches
+            .iter()
+            .map(|staged| {
+                let arrow = staged.arrow.as_ref().unwrap();
+                assert_eq!(arrow.len(), 1);
+                arrow[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect();
+        assert_eq!(order, (0..FRAMES).collect::<Vec<_>>());
+        drop(inputs);
+        wait_until("the drain line", || {
+            logged(
+                &query_id,
+                &["transmitted batches via arrow", "batches=24", "workers=4"],
+            )
+        });
+    }
+
+    /// Loopback throughput of the Arrow drain, one and four workers, 8 frames of 64 MiB each
+    /// (int64 columns; the export is a host copy here, so this is the encode, wire, decode and
+    /// stage legs). Prints GB/s per configuration; run with
+    /// `cargo test --no-default-features arrow_drain_loopback_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench, prints numbers; no assertion on speed"]
+    fn arrow_drain_loopback_bench() {
+        const FRAMES: usize = 8;
+        // 2 columns (the sender plan names two) x 8 B x 4 Mi rows = 64 MiB per frame.
+        const ROWS: usize = 4 << 20;
+        let batch = arrow_array::RecordBatch::try_from_iter((0..2).map(|column| {
+            (
+                format!("c{column}"),
+                Arc::new(arrow_array::Int64Array::from_iter_values(
+                    (0..ROWS as i64).map(|row| row + column),
+                )) as arrow_array::ArrayRef,
+            )
+        }))
+        .unwrap();
+        let bytes_per_drain = (batch.get_array_memory_size() * FRAMES) as f64;
+        capture_logs();
+        // The raw PRPC frame path alone (client encode, loopback, the peer's frame read and
+        // decode, no IPC decode): a 32 MiB attachment on an unknown method, timed per call.
+        {
+            let query_id = TUniqueId::new(74, 0);
+            let receiver_id = TUniqueId::new(74, 1);
+            let Some((_peer, port, _peer_guard)) = peer_with_registered_receiver(
+                &query_id,
+                &receiver_id,
+                Arc::new(RecordingExecutor::default()),
+            ) else {
+                return;
+            };
+            let attachment = vec![7u8; 32 << 20];
+            let mut client = crate::prpc_client::PrpcClient::new("127.0.0.1", port);
+            let started = std::time::Instant::now();
+            for _ in 0..8 {
+                let err = client
+                    .call("no_such_method", Vec::new(), attachment.clone())
+                    .expect_err("unknown method is a brpc error");
+                assert!(err.contains("not found"), "{err}");
+            }
+            let per_call = started.elapsed() / 8;
+            eprintln!(
+                "prpc raw 32 MiB attachment round trip: {:.1} ms per call ({:.2} GB/s)",
+                per_call.as_secs_f64() * 1e3,
+                (32u64 << 20) as f64 / per_call.as_secs_f64() / 1e9
+            );
+        }
+        for (round, workers, io_threads) in [
+            (1, 1usize, 1usize),
+            (2, 4, 1),
+            (3, 8, 1),
+            (4, 4, 4),
+            (5, 8, 4),
+            (6, 1, 1),
+            (7, 4, 1),
+            (8, 4, 4),
+        ] {
+            let query_id = TUniqueId::new(71, round);
+            let receiver_id = TUniqueId::new(72, round);
+            let peer_executor = Arc::new(RecordingExecutor::default());
+            let Some((peer, port, _peer_guard)) = peer_with_registered_receiver_on(
+                &query_id,
+                &receiver_id,
+                peer_executor.clone(),
+                io_threads,
+            ) else {
+                return;
+            };
+            let executor = Arc::new(ArrowParkingExecutor {
+                template: Some(vec![batch.clone(); FRAMES]),
+                ..ArrowParkingExecutor::default()
+            });
+            let service =
+                SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+            service.set_exchange_transport(ExchangeTransport::Arrow);
+            service.set_arrow_send_workers(workers);
+            let sender =
+                arrow_sender_to_peer(&query_id, &TUniqueId::new(73, round), &receiver_id, port);
+            let started = std::time::Instant::now();
+            assert_exec_ok(&service, &sender);
+            let slot = SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from(&receiver_id),
+                node_id: 7,
+                sender_id: 0,
+            };
+            wait_until("the drain to finish", || {
+                executor.dropped.lock().unwrap().as_slice() == [slot]
+            });
+            let elapsed = started.elapsed();
+            let fetched = fetch_rows_eventually(&peer, receiver_id.hi, receiver_id.lo);
+            assert!(!fetched.attachment.is_empty());
+            eprintln!(
+                "arrow drain loopback: workers={workers} peer_io_threads={io_threads} \
+                 frames={FRAMES} bytes={bytes_per_drain:.0} elapsed={:.3}s {:.2} GB/s",
+                elapsed.as_secs_f64(),
+                bytes_per_drain / elapsed.as_secs_f64() / 1e9
+            );
+            for line in logs_of(&query_id) {
+                if line.contains("transmitted batches via arrow") {
+                    eprintln!("  {}", line.trim_end());
+                }
+            }
+        }
+    }
+
     /// A drain that fails after the sender's RPC replied: the failure is recorded at query
     /// level on the sender's CN (its later fragments are refused, its result instances report
     /// the cause), the parked output is dropped exactly once, and the receiver is cancelled at
@@ -3638,6 +3855,15 @@ pub(crate) mod tests {
     /// Serves `service` as a peer CN on a loopback port; returns the port and a guard that stops
     /// the server on drop. `None` when the sandbox denies binding (the brpc tests skip alike).
     fn serve_peer(service: SiriusComputeNodeService) -> Option<(u16, PeerGuard)> {
+        serve_peer_on(service, 1)
+    }
+
+    /// [`serve_peer`] on a brpc runtime of `io_threads` threads: 1 is the production
+    /// current-thread runtime, more is the multi-thread runtime the bench compares against.
+    fn serve_peer_on(
+        service: SiriusComputeNodeService,
+        io_threads: usize,
+    ) -> Option<(u16, PeerGuard)> {
         let listener = match crate::BrpcServer::bind("127.0.0.1", 0) {
             Ok(listener) => listener,
             Err(err)
@@ -3655,10 +3881,18 @@ pub(crate) mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let join = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .build()
-                .unwrap();
+            let runtime = if io_threads > 1 {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(io_threads)
+                    .enable_io()
+                    .build()
+                    .unwrap()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .build()
+                    .unwrap()
+            };
             runtime.block_on(
                 crate::BrpcServer::from_service(service)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),

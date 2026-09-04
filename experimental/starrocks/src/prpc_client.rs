@@ -86,7 +86,9 @@ impl PrpcClient {
         attachment: Vec<u8>,
     ) -> Result<prpc::Response, String> {
         let had_cached_connection = self.connection.is_some();
-        match self.try_call(method_name, body.clone(), attachment.clone()) {
+        // Borrowed on both attempts: the frame is encoded straight from these bytes, so a retry
+        // costs no copy of a large attachment up front.
+        match self.try_call(method_name, &body, &attachment) {
             Ok(response) => Ok(response),
             Err(CallError::Rpc(err)) => Err(format!("{method_name} to {}: {err}", self.peer)),
             Err(CallError::Transport(err)) if had_cached_connection => {
@@ -97,7 +99,7 @@ impl PrpcClient {
                     "cached PRPC connection failed; retrying once over a fresh connection"
                 );
                 self.connection = None;
-                match self.try_call(method_name, body, attachment) {
+                match self.try_call(method_name, &body, &attachment) {
                     Ok(response) => Ok(response),
                     Err(CallError::Rpc(err)) | Err(CallError::Transport(err)) => {
                         self.connection = None;
@@ -119,25 +121,29 @@ impl PrpcClient {
     fn try_call(
         &mut self,
         method_name: &str,
-        body: Vec<u8>,
-        attachment: Vec<u8>,
+        body: &[u8],
+        attachment: &[u8],
     ) -> Result<prpc::Response, CallError> {
         let correlation_id = self.next_correlation_id;
         self.next_correlation_id += 1;
 
-        let frame = prpc::Frame::for_request(
+        // Header, metadata and body in one buffer; the attachment goes out from the caller's
+        // buffer right after, so a 64 MiB Arrow frame is never copied on the way to the socket.
+        let head = prpc::Frame::encode_request_head(
             SERVICE_NAME,
             method_name,
             body,
-            attachment,
+            attachment.len(),
             Some(correlation_id),
         );
-        let bytes = frame.encode();
 
         let stream = self.stream()?;
         stream
-            .write_all(&bytes)
+            .write_all(&head)
             .map_err(|err| CallError::Transport(format!("failed to write request frame: {err}")))?;
+        stream.write_all(attachment).map_err(|err| {
+            CallError::Transport(format!("failed to write request attachment: {err}"))
+        })?;
         stream
             .flush()
             .map_err(|err| CallError::Transport(format!("failed to flush request frame: {err}")))?;
