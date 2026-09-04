@@ -33,6 +33,7 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <future>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -86,8 +87,15 @@ class sirius_engine {
   void initialize(duckdb::unique_ptr<op::sirius_physical_operator> physical_plan);
   //! Initialize the sirius engine internally
   void initialize_internal(op::sirius_physical_operator& physical_result_collector);
-  //! Execute the sirius engine
+  //! Execute the sirius engine: start() followed by join().
   void execute();
+  //! Hand the pipelines to the task scheduler and return without waiting. Split from join() so a
+  //! caller can feed the query's streaming sources from another thread while it runs and block
+  //! only in join(). Legal once per initialize().
+  void start();
+  //! Wait for the query started by start() (the opt-in watchdog included), then for every
+  //! in-flight task; on an error drains the scheduler exactly as execute() does before rethrowing.
+  void join();
   //! Reset the sirius engine
   void reset();
   //! Cancel the tasks
@@ -109,6 +117,9 @@ class sirius_engine {
   sirius::query_id_t query_id_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   rust::Box<quent::query::QueryHandle> query_handle_;
+  //! The completion future start() took from the scheduler; consumed by join().
+  std::future<void> query_future_;
+  bool query_started_{false};
 };
 
 }  // namespace sirius

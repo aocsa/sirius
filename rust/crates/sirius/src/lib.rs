@@ -20,7 +20,7 @@ use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_array::{Array, RecordBatch, RecordBatchReader, StructArray};
 use arrow_schema::SchemaRef;
-use cxx::{Exception, UniquePtr, let_cxx_string};
+use cxx::{Exception, SharedPtr, UniquePtr, let_cxx_string};
 
 /// An initialized Sirius engine context.
 ///
@@ -194,10 +194,13 @@ pub fn stream_view_name(stream_id: u64) -> String {
 /// to take with [`Fragment::relay_from`]. A fragment declaring **none** is a result fragment and
 /// produces Arrow via [`Fragment::result_to_arrow`].
 ///
-/// Calls are ordered: declare, [`build`](Fragment::build), relay from every sender,
-/// [`run`](Fragment::run), then drain. `build` opens a query lifecycle on the shared engine that
-/// `run` closes, so one fragment at a time may sit between the two — dropping a built-but-unrun
-/// fragment closes the lifecycle for you.
+/// Calls are ordered: declare, [`build`](Fragment::build), relay from every sender (or push, then
+/// close), [`run`](Fragment::run), then drain. `build` opens a query lifecycle on the shared
+/// engine that `run` closes, so one fragment at a time may sit between the two — dropping a
+/// built-but-unrun fragment closes the lifecycle for you. `run` is [`start`](Fragment::start)
+/// followed by [`join`](Fragment::join): a producer that must feed the fragment while it runs
+/// holds a [`FragmentInput`] (from [`input_handle`](Fragment::input_handle)) on its own thread
+/// and pushes between the two, while this thread blocks in `join`.
 ///
 /// Borrows the [`SiriusContext`] that created it, so a fragment cannot outlive its engine.
 pub struct Fragment<'ctx> {
@@ -313,9 +316,34 @@ impl Fragment<'_> {
         )
     }
 
-    /// Execute the fragment and close its query lifecycle. Blocks until its pipelines finish.
+    /// Execute the fragment and close its query lifecycle. Blocks until its pipelines finish;
+    /// equivalent to [`start`](Fragment::start) followed by [`join`](Fragment::join).
     pub fn run(&mut self) -> Result<(), Exception> {
         self.inner.pin_mut().run()
+    }
+
+    /// Begin execution and return once the query is started. The pipelines run on the engine's
+    /// executors; a [`FragmentInput`] taken from [`input_handle`](Fragment::input_handle) may keep
+    /// feeding the input streams from any thread until [`join`](Fragment::join) returns. Legal
+    /// once, after [`build`](Fragment::build); a started fragment that is dropped before `join`
+    /// is joined by its destructor.
+    pub fn start(&mut self) -> Result<(), Exception> {
+        self.inner.pin_mut().start()
+    }
+
+    /// Wait for a fragment started by [`start`](Fragment::start) to finish and close its query
+    /// lifecycle. The execution error, if any, is returned here, and every [`FragmentInput`] of
+    /// this fragment refuses pushes from then on.
+    pub fn join(&mut self) -> Result<(), Exception> {
+        self.inner.pin_mut().join()
+    }
+
+    /// The thread-safe producer handle onto this fragment's input streams — the same underlying
+    /// handle every call. Errs before [`build`](Fragment::build).
+    pub fn input_handle(&mut self) -> Result<FragmentInput, Exception> {
+        Ok(FragmentInput {
+            inner: self.inner.pin_mut().input_handle()?,
+        })
     }
 
     /// Collect a result fragment's rows over the Arrow C Data Interface.
@@ -511,6 +539,84 @@ impl Fragment<'_> {
     /// per sender; the stream ends once every expected sender has closed.
     pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
         self.inner.pin_mut().close_input(stream_id, sender_id)
+    }
+}
+
+/// Thread-safe producer handle onto a built [`Fragment`]'s input streams, from
+/// [`Fragment::input_handle`].
+///
+/// What lets a producer thread feed a fragment while the fragment's owning thread blocks in
+/// [`Fragment::join`] (or [`run`](Fragment::run)): the handle carries the fragment's stream
+/// session, the input schemas and senders resolved at `build`, and the GPU memory space — none
+/// of the fragment's single-threaded state (the DuckDB connection, the query lifecycle, the
+/// result). `push_arrow` and `close_input` are legal from any thread, concurrently, from `build`
+/// until `join`/`run` returned; after that, and after the fragment is dropped, they return `Err`
+/// rather than touching freed state. Not tied to the fragment's lifetime on purpose: the C++
+/// side detaches the handle under a lock that waits for pushes in flight, so a late call is a
+/// refusal, never a fault. There is no backpressure: a producer that outruns the query grows the
+/// GPU tier until the downgrade executor spills.
+pub struct FragmentInput {
+    inner: SharedPtr<sirius_sys::FragmentInput>,
+}
+
+// SAFETY: the C++ `FragmentInput` is a `shared_ptr` whose every method either takes the
+// handle's own `std::shared_mutex` (shared for a push, exclusive when the fragment detaches it)
+// and then forwards to the stream session, which serializes on the stream's mutex, or reads
+// immutable post-build state (schemas, senders, the memory space pointer). The H2D copy runs on
+// a stream the push acquires from the memory space's pool and synchronizes before returning, so
+// no thread-affine CUDA state is behind any call. Once the fragment joins or is dropped the
+// handle is detached and every method errs, so the `shared_ptr` cannot reach freed engine state.
+unsafe impl Send for FragmentInput {}
+unsafe impl Sync for FragmentInput {}
+
+impl FragmentInput {
+    /// Push one host-memory Arrow record batch into input stream `stream_id` as sender
+    /// `sender_id`: [`Fragment::push_arrow`] for any thread, including while the fragment's
+    /// owner blocks in [`Fragment::join`]. Same reconciliation and refusals; the buffers are
+    /// copied to the GPU (on a copy stream from the memory space's pool, not cudf's default
+    /// stream) before this returns, so `batch` is untouched afterwards. Errs once the fragment
+    /// has finished.
+    pub fn push_arrow(
+        &self,
+        stream_id: u64,
+        sender_id: u32,
+        batch: &RecordBatch,
+    ) -> Result<(), SiriusError> {
+        let array = StructArray::from(batch.clone());
+        let (ffi_array, ffi_schema) =
+            arrow_array::ffi::to_ffi(&array.to_data()).map_err(SiriusError::Arrow)?;
+        // SAFETY: both addresses name live, readable `FFI_ArrowArray` / `FFI_ArrowSchema` values
+        // owned by this stack frame (repr(C), ABI-identical to the C structs) that outlive the
+        // call; the engine copies out of them and never releases them.
+        unsafe {
+            self.inner
+                .push_arrow(
+                    stream_id,
+                    sender_id,
+                    std::ptr::addr_of!(ffi_array) as usize,
+                    std::ptr::addr_of!(ffi_schema) as usize,
+                )
+                .map_err(SiriusError::Engine)
+        }
+    }
+
+    /// Record that `sender_id` finished producing into input stream `stream_id`:
+    /// [`Fragment::close_input`] for any thread. Errs once the fragment has finished.
+    pub fn close_input(&self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
+        self.inner.close_input(stream_id, sender_id)
+    }
+
+    /// False once the fragment joined, ran or was dropped: a push then errs.
+    pub fn is_open(&self) -> bool {
+        self.inner.is_open()
+    }
+}
+
+impl std::fmt::Debug for FragmentInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FragmentInput")
+            .field("open", &self.is_open())
+            .finish()
     }
 }
 
@@ -1493,6 +1599,80 @@ mod tests {
         doubled.extend(rows(&relay_result));
         doubled.sort();
         assert_eq!(rows(&two_senders_result), doubled);
+    }
+
+    /// The widened threading contract: the receiver is started, its owner blocks in `join()`
+    /// on this thread, and a second thread feeds it through the `Send + Sync` `FragmentInput`
+    /// with pauses between pushes; the rows equal the pre-materialized `relay_from` hop, and a
+    /// push after `join()` returned is an `Err`, not a silent drop or a fault. Requires a GPU.
+    #[test]
+    fn start_join_takes_arrow_pushes_from_another_thread_while_join_blocks() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let receiver_plan = stream_read_plan(0);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let host_batches = ctx.execute_substrait(&sender_plan).unwrap();
+        assert_eq!(host_batches.len(), 1, "the 3-row scan arrives as one batch");
+
+        let make_receiver = || {
+            let mut receiver = ctx.fragment().unwrap();
+            receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+            receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+            receiver.build(&receiver_plan).unwrap();
+            receiver
+        };
+
+        // Reference: both batches pushed before run().
+        let expected = {
+            let mut receiver = make_receiver();
+            receiver.push_arrow(0, 0, &host_batches[0]).unwrap();
+            receiver.push_arrow(0, 0, &host_batches[0]).unwrap();
+            receiver.close_input(0, 0).unwrap();
+            receiver.run().unwrap();
+            rows(&receiver.result_to_arrow().unwrap())
+        };
+        assert_eq!(expected.len(), 6);
+
+        let mut receiver = make_receiver();
+        let input = receiver.input_handle().unwrap();
+        assert!(input.is_open());
+        receiver.start().unwrap();
+        assert!(receiver.run().is_err(), "run() after start() must refuse");
+
+        let batch = host_batches[0].clone();
+        let producer = std::thread::spawn(move || {
+            // The owner is heading into join(); the first push lands while it blocks there.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            input.push_arrow(0, 0, &batch).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            input.push_arrow(0, 0, &batch).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            input.close_input(0, 0).unwrap();
+            input
+        });
+        receiver.join().unwrap();
+        let input = producer.join().expect("the producer thread panicked");
+
+        // Closed by join(): a late push is refused loudly.
+        assert!(!input.is_open());
+        let late = input.push_arrow(0, 0, &host_batches[0]);
+        assert!(
+            late.unwrap_err().to_string().contains("finished"),
+            "a push after join() must name the finished fragment"
+        );
+        assert!(input.close_input(0, 0).is_err());
+
+        assert_eq!(rows(&receiver.result_to_arrow().unwrap()), expected);
     }
 
     /// The sender-side twin of `arrow_hop_matches_relay_hop`, and the hop the Arrow exchange

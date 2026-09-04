@@ -200,27 +200,53 @@ void streaming_fragment::build(sirius::query_id_t query_id)
 
 void streaming_fragment::run()
 {
+  start();
+  join();
+}
+
+void streaming_fragment::start()
+{
   if (!_built) {
-    throw sirius::invalid_input_exception("streaming_fragment: build() must run before run()");
+    throw sirius::invalid_input_exception("streaming_fragment: build() must run before start()");
   }
+  if (_started) { throw sirius::invalid_input_exception("streaming_fragment: already started"); }
 
   try {
     // Shared query window (don't open a second StandaloneQueryScope): a new window resets
     // task_creator / scan manager that build() populated → zero tasks, empty output, no error.
-    _engine->execute();
+    _engine->start();
+    _started = true;
   } catch (...) {
-    // Poison every output before unwinding: otherwise the streams are neither closed nor
-    // failed, so a peer parked in wait() blocks forever with no error anywhere. fail_output is
-    // idempotent (first-failure-wins), so this stays safe even when a caller (e.g.
-    // sirius::ffi::Fragment::run()) also poisons the same outputs itself.
-    auto const cause = std::current_exception();
-    for (auto id : _spec.outputs) {
-      try {
-        _session.fail_output(id, cause);
-      } catch (...) {  // NOLINT(bugprone-empty-catch)
-      }
-    }
+    poison_outputs(std::current_exception());
     throw;
+  }
+}
+
+void streaming_fragment::join()
+{
+  if (!_started) {
+    throw sirius::invalid_input_exception("streaming_fragment: start() must run before join()");
+  }
+  _started = false;
+  try {
+    _engine->join();
+  } catch (...) {
+    poison_outputs(std::current_exception());
+    throw;
+  }
+}
+
+void streaming_fragment::poison_outputs(std::exception_ptr cause) noexcept
+{
+  // Poison every output before unwinding: otherwise the streams are neither closed nor failed,
+  // so a peer parked in wait() blocks forever with no error anywhere. fail_output is idempotent
+  // (first-failure-wins), so this stays safe even when a caller (e.g.
+  // sirius::ffi::Fragment::run()) also poisons the same outputs itself.
+  for (auto id : _spec.outputs) {
+    try {
+      _session.fail_output(id, cause);
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
   }
 }
 

@@ -63,6 +63,7 @@
 #include <substrait/plan.pb.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1198,6 +1199,159 @@ TEST_CASE("Fragment::push_arrow from a producer thread between build() and run()
   arrow_stream_guard out;
   fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
   REQUIRE(read_fixture_result(out.stream) == rows);
+}
+
+// The widened contract: start() begins execution and returns; a producer thread feeds the running
+// fragment through the input handle (the first push lands only after join() is already blocking,
+// with pauses between pushes), closes the sender, and join() returns exactly what a fragment fed
+// before run() returns. Both fragment kinds take the split: the result fragment through the
+// sirius_interface start/join pair, the intermediate one through streaming_fragment's.
+TEST_CASE("Fragment::start()/join() take pushes through the input handle while join() blocks",
+          "[isolated_context][sirius_ffi]")
+{
+  using namespace std::chrono_literals;
+  auto context   = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  const auto all = fixture_rows(12);
+  const std::vector<fixture_row> first(all.begin(), all.begin() + 5);
+  const std::vector<fixture_row> second(all.begin() + 5, all.end());
+  const auto host_first  = to_host_arrow(fixture_table(first)->view(), fixture_columns());
+  const auto host_second = to_host_arrow(fixture_table(second)->view(), fixture_columns());
+
+  // Reference: the same two batches, both pushed before run().
+  std::vector<fixture_row> expected;
+  {
+    auto fragment = build_result_fragment(*context, fixture_columns());
+    fragment->push_arrow(0, 0, host_first.array_addr(), host_first.schema_addr());
+    fragment->push_arrow(0, 0, host_second.array_addr(), host_second.schema_addr());
+    fragment->close_input(0, 0);
+    fragment->run();
+    arrow_stream_guard out;
+    fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    expected = read_fixture_result(out.stream);
+  }
+  REQUIRE(expected == all);
+
+  // The producer: waits until the owner is inside join(), then pushes with pauses and closes.
+  using clock = std::chrono::steady_clock;
+  struct producer_run {
+    std::exception_ptr error;
+    clock::time_point first_push{};
+  };
+  const auto produce = [&](const std::shared_ptr<sirius::ffi::FragmentInput>& input,
+                           producer_run& run,
+                           const std::atomic<bool>& owner_joining) {
+    try {
+      while (!owner_joining.load()) {
+        std::this_thread::sleep_for(1ms);
+      }
+      std::this_thread::sleep_for(30ms);
+      run.first_push = clock::now();
+      input->push_arrow(0, 0, host_first.array_addr(), host_first.schema_addr());
+      std::this_thread::sleep_for(30ms);
+      input->push_arrow(0, 0, host_second.array_addr(), host_second.schema_addr());
+      std::this_thread::sleep_for(10ms);
+      input->close_input(0, 0);
+    } catch (...) {
+      run.error = std::current_exception();
+    }
+  };
+
+  SECTION("result fragment")
+  {
+    auto fragment = build_result_fragment(*context, fixture_columns());
+    auto input    = fragment->input_handle();
+    REQUIRE(input == fragment->input_handle());  // one shared handle per fragment
+    REQUIRE(input->is_open());
+    fragment->start();
+    REQUIRE_THROWS_WITH(fragment->run(), Catch::Matchers::Contains("already started"));
+    REQUIRE_THROWS_WITH(fragment->start(), Catch::Matchers::Contains("already started"));
+
+    producer_run run;
+    std::atomic<bool> owner_joining{false};
+    std::thread producer([&] { produce(input, run, owner_joining); });
+    owner_joining.store(true);
+    REQUIRE_NOTHROW(fragment->join());
+    const auto joined = clock::now();
+    producer.join();
+    if (run.error) { std::rethrow_exception(run.error); }
+    REQUIRE(run.first_push <= joined);  // join() was blocking when the first batch arrived
+
+    // The handle is closed by join(): refusals, not a dangling session.
+    REQUIRE_FALSE(input->is_open());
+    REQUIRE_THROWS_WITH(input->push_arrow(0, 0, host_first.array_addr(), host_first.schema_addr()),
+                        Catch::Matchers::Contains("finished"));
+    REQUIRE_THROWS_WITH(input->close_input(0, 0), Catch::Matchers::Contains("finished"));
+    REQUIRE_THROWS_WITH(fragment->join(), Catch::Matchers::Contains("already run"));
+
+    arrow_stream_guard out;
+    fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    REQUIRE(read_fixture_result(out.stream) == expected);
+  }
+
+  SECTION("intermediate fragment, drained through relay_from after join()")
+  {
+    auto sender = sirius::ffi::make_fragment(*context);
+    declare_columns(*sender, 0, fixture_columns());
+    sender->declare_output(10);
+    sender->build(stream_read_plan(0, fixture_columns()));
+    auto input = sender->input_handle();
+    sender->start();
+
+    producer_run run;
+    std::atomic<bool> owner_joining{false};
+    std::thread producer([&] { produce(input, run, owner_joining); });
+    owner_joining.store(true);
+    REQUIRE_NOTHROW(sender->join());
+    producer.join();
+    if (run.error) { std::rethrow_exception(run.error); }
+    REQUIRE_FALSE(input->is_open());
+    REQUIRE(sender->output_row_count(10) == all.size());
+
+    auto receiver = build_result_fragment(*context, fixture_columns());
+    REQUIRE(receiver->relay_from(*sender, 10, 0, 0) > 0);
+    receiver->run();
+    arrow_stream_guard out;
+    receiver->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    REQUIRE(read_fixture_result(out.stream) == expected);
+  }
+
+  SECTION("the handle outlives its fragment and refuses instead of faulting")
+  {
+    std::shared_ptr<sirius::ffi::FragmentInput> input;
+    {
+      auto fragment = build_result_fragment(*context, fixture_columns());
+      input         = fragment->input_handle();
+      fragment->close_input(0, 0);
+      fragment->run();
+    }
+    REQUIRE_FALSE(input->is_open());
+    REQUIRE_THROWS_WITH(input->push_arrow(0, 0, host_first.array_addr(), host_first.schema_addr()),
+                        Catch::Matchers::Contains("finished"));
+  }
+
+  SECTION("a started fragment destroyed before join() is joined by its destructor")
+  {
+    {
+      auto fragment = build_result_fragment(*context, fixture_columns());
+      fragment->close_input(0, 0);
+      fragment->start();
+    }
+    // The lifecycle slot was released: the next fragment builds and runs.
+    auto next = build_result_fragment(*context, fixture_columns());
+    next->close_input(0, 0);
+    REQUIRE_NOTHROW(next->run());
+  }
+
+  SECTION("input_handle() and join() before their turn throw")
+  {
+    auto fragment = sirius::ffi::make_fragment(*context);
+    declare_columns(*fragment, 0, fixture_columns());
+    REQUIRE_THROWS_WITH(fragment->input_handle(), Catch::Matchers::Contains("build() must run"));
+    fragment->build(stream_read_plan(0, fixture_columns()));
+    REQUIRE_THROWS_WITH(fragment->join(), Catch::Matchers::Contains("start() must run"));
+    fragment->close_input(0, 0);
+    REQUIRE_NOTHROW(fragment->run());
+  }
 }
 
 // The helper's by-name refusals: shapes cudf would import into something the engine cannot

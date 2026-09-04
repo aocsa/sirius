@@ -245,7 +245,16 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
-  nvtx3::scoped_range nvtx_range{"sirius::query"};
+  start();
+  join();
+}
+
+void sirius_engine::start()
+{
+  if (query_started_) {
+    throw invalid_input_exception("sirius_engine::start: the query was already started");
+  }
+  nvtx3::scoped_range nvtx_range{"sirius::query::start"};
   query_handle_->executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -270,9 +279,26 @@ void sirius_engine::execute()
                              .worker_id          = telemetry_context_->worker_id(),
                              .query_id           = query_id_,
                            });
-  auto future = sirius_ctx->get_task_scheduler().start_query();
+  query_future_  = sirius_ctx->get_task_scheduler().start_query();
+  query_started_ = true;
+}
+
+void sirius_engine::join()
+{
+  if (!query_started_) {
+    throw invalid_input_exception("sirius_engine::join: start() must run before join()");
+  }
+  // Consumed whatever happens below: a second join() is an error, not a second wait.
+  query_started_ = false;
+  nvtx3::scoped_range nvtx_range{"sirius::query"};
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    throw invalid_input_exception("Sirius context is not initialized.");
+  }
+
   try {
-    wait_for_query_future(future, *sirius_ctx);
+    wait_for_query_future(query_future_, *sirius_ctx);
     sirius_ctx->get_task_scheduler().wait_for_completion();
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
