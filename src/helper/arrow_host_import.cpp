@@ -17,6 +17,8 @@
 #include "helper/arrow_host_import.hpp"
 
 #include "cudf/cudf_utils.hpp"  // sirius::get_cudf_type
+#include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"  // sirius::memory::saturating_add
 #include "sirius/exception.hpp"
 
 // The Arrow C Data Interface structs (ArrowSchema, ArrowArray). DuckDB's copy is the one every
@@ -28,12 +30,20 @@
 #include "duckdb/common/arrow/arrow.hpp"
 
 #include <cudf/interop.hpp>
+#include <cudf/null_mask.hpp>                  // cudf::bitmask_allocation_size_bytes
 #include <cudf/unary.hpp>                      // cudf::cast, cudf::is_supported_cast
-#include <cudf/utilities/traits.hpp>           // cudf::is_fixed_point
+#include <cudf/utilities/traits.hpp>           // cudf::is_fixed_point, cudf::size_of
 #include <cudf/utilities/type_dispatcher.hpp>  // cudf::type_to_name
 
-#include <bit>       // std::popcount
-#include <charconv>  // std::from_chars
+#include <rmm/aligned.hpp>  // rmm::align_up, rmm::CUDA_ALLOCATION_ALIGNMENT
+
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
+#include <algorithm>  // std::max
+#include <bit>        // std::popcount
+#include <charconv>   // std::from_chars
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -189,24 +199,15 @@ std::int64_t count_nulls(const std::uint8_t* validity, std::int64_t begin, std::
   return (end - begin) - valid;
 }
 
-// Storage for a struct whose window had to be pushed into its children: shallow copies of the
-// caller's structs that point at the caller's buffers and are released by nobody.
-struct windowed_struct {
-  ArrowArray top{};
-  std::vector<ArrowArray> children;
-  std::vector<ArrowArray*> child_pointers;
-};
-
 // A producer may slice the struct itself (Arrow C++ `StructArray::Slice`) rather than its columns
 // (arrow-rs `RecordBatch::slice`), or hand over children longer than the struct; both are legal
-// C Data Interface shapes whose rows are the struct's [offset, offset + length). `cudf::from_arrow`
-// imports each child by the child's own offset and length and ignores the struct's, so the window
-// is pushed into shallow copies of the children first, the normalization arrow-rs applies on
-// export. Only the window's rows are copied. Returns `array` itself when nothing needs pushing.
-const ArrowArray* window_struct_children(const ArrowArray& array,
-                                         std::string_view what,
-                                         const std::vector<std::string>& names,
-                                         windowed_struct& storage)
+// C Data Interface shapes whose rows are the struct's [offset, offset + length). cudf imports each
+// child by the child's own offset and length and ignores the struct's, so the window is pushed
+// into a shallow copy of each child before its import, the normalization arrow-rs applies on
+// export. Refuses a window that runs past a child, naming the column.
+void validate_struct_window(const ArrowArray& array,
+                            std::string_view what,
+                            const std::vector<std::string>& names)
 {
   if (array.offset < 0 || array.length < 0) {
     throw invalid_input_exception("{}: the struct array has a negative offset ({}) or length ({})",
@@ -214,9 +215,7 @@ const ArrowArray* window_struct_children(const ArrowArray& array,
                                   array.offset,
                                   array.length);
   }
-  const auto count  = static_cast<std::size_t>(array.n_children);
-  bool needs_window = array.offset != 0;
-  for (std::size_t i = 0; i < count; ++i) {
+  for (std::size_t i = 0; i < static_cast<std::size_t>(array.n_children); ++i) {
     const auto& child = *array.children[i];
     if (child.length < array.offset + array.length) {
       throw invalid_input_exception(
@@ -228,42 +227,33 @@ const ArrowArray* window_struct_children(const ArrowArray& array,
         array.offset,
         array.offset + array.length);
     }
-    needs_window = needs_window || child.length != array.length;
   }
-  if (!needs_window) { return &array; }
-
-  storage.children.reserve(count);
-  storage.child_pointers.reserve(count);
-  for (std::size_t i = 0; i < count; ++i) {
-    ArrowArray child = *array.children[i];
-    child.offset += array.offset;
-    child.length = array.length;
-    // null_count describes the whole child; the window's is recounted unless it is known to be 0.
-    const auto* validity =
-      child.n_buffers > 0 ? static_cast<const std::uint8_t*>(child.buffers[0]) : nullptr;
-    child.null_count = (validity == nullptr || child.null_count == 0)
-                         ? 0
-                         : count_nulls(validity, child.offset, child.offset + child.length);
-    storage.children.push_back(child);
-  }
-  for (auto& child : storage.children) {
-    storage.child_pointers.push_back(&child);
-  }
-  storage.top          = array;
-  storage.top.offset   = 0;
-  storage.top.children = storage.child_pointers.data();
-  return &storage.top;
 }
 
-}  // namespace
+// Shallow copy of child `i` restricted to the struct's window: points at the caller's buffers and
+// is released by nobody. Only the window's rows are copied by the import. The child's null_count
+// describes the whole child; the window's is recounted unless it is known to be 0.
+ArrowArray windowed_child(const ArrowArray& array, std::size_t i)
+{
+  ArrowArray child = *array.children[i];
+  if (array.offset == 0 && child.length == array.length) { return child; }
+  child.offset += array.offset;
+  child.length = array.length;
+  const auto* validity =
+    child.n_buffers > 0 ? static_cast<const std::uint8_t*>(child.buffers[0]) : nullptr;
+  child.null_count = (validity == nullptr || child.null_count == 0)
+                       ? 0
+                       : count_nulls(validity, child.offset, child.offset + child.length);
+  return child;
+}
 
-std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
-                                                     const ArrowArray* array,
-                                                     std::string_view what,
-                                                     const std::vector<std::string>& names,
-                                                     const std::vector<logical_type>& types,
-                                                     rmm::cuda_stream_view stream,
-                                                     rmm::device_async_resource_ref mr)
+// The checks both entry points run before anything is read: null or released structs, the
+// declared name/type agreement, a struct top level, and the column count on both structs.
+void validate_struct_batch(const ArrowSchema* schema,
+                           const ArrowArray* array,
+                           std::string_view what,
+                           const std::vector<std::string>& names,
+                           const std::vector<logical_type>& types)
 {
   if (schema == nullptr || array == nullptr) {
     throw invalid_input_exception("{}: requires non-null ArrowSchema and ArrowArray pointers",
@@ -294,6 +284,99 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
       array->n_children,
       types.size());
   }
+}
+
+// Allocator granularity: every device buffer the import makes is rounded up to this.
+std::size_t aligned_bytes(std::size_t bytes)
+{
+  return rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+}
+
+std::size_t saturating_add(std::size_t a, std::size_t b) { return memory::saturating_add(a, b); }
+
+// Device bytes of one imported column at `declared`, from the windowed host child.
+std::size_t resident_bytes_of(const ArrowArray& child, cudf::data_type declared)
+{
+  const auto rows   = static_cast<std::size_t>(child.length);
+  std::size_t bytes = 0;
+  const bool has_validity =
+    child.n_buffers > 0 && child.buffers != nullptr && child.buffers[0] != nullptr;
+  if (has_validity) {
+    bytes = saturating_add(
+      bytes,
+      aligned_bytes(cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows))));
+  }
+  if (declared.id() == cudf::type_id::STRING) {
+    // 32-bit offsets (rows + 1) plus the characters of the window, read off the host offsets.
+    bytes = saturating_add(bytes, aligned_bytes((rows + 1) * sizeof(std::int32_t)));
+    if (rows > 0 && child.n_buffers > 1 && child.buffers[1] != nullptr) {
+      const auto* offsets = static_cast<const std::int32_t*>(child.buffers[1]);
+      const auto begin    = offsets[child.offset];
+      const auto end      = offsets[child.offset + child.length];
+      if (end > begin) {
+        bytes = saturating_add(bytes, aligned_bytes(static_cast<std::size_t>(end - begin)));
+      }
+    }
+    return bytes;
+  }
+  if (cudf::is_nested(declared)) { return bytes; }  // children not walked; see the header
+  return saturating_add(bytes, aligned_bytes(rows * cudf::size_of(declared)));
+}
+
+// The arriving width of a decimal format string: 128 for `d:p,s` and `d:p,s,128`, the third
+// field otherwise; nullopt for anything that is not a decimal.
+std::optional<int> decimal_bitwidth_of(std::string_view format)
+{
+  if (format.substr(0, 2) != "d:") { return std::nullopt; }
+  const auto first = format.find(',');
+  if (first == std::string_view::npos) { return std::nullopt; }
+  const auto second = format.find(',', first + 1);
+  if (second == std::string_view::npos) { return 128; }
+  int width             = 0;
+  const auto digits     = format.substr(second + 1);
+  const auto* const end = digits.data() + digits.size();
+  const auto [ptr, ec]  = std::from_chars(digits.data(), end, width);
+  if (ec != std::errc{} || ptr != end) { return std::nullopt; }
+  return width;
+}
+
+// The largest allocation alive beside the resident columns while `child` is imported.
+std::size_t transient_bytes_of(const ArrowSchema& child_schema,
+                               const ArrowArray& child,
+                               cudf::data_type declared)
+{
+  const auto rows   = static_cast<std::size_t>(child.length);
+  const auto format = format_of(child_schema);
+  if (format == "b") {
+    // cudf lands the host bitmap on the device before it expands it to one byte a value.
+    return aligned_bytes(cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows)));
+  }
+  if (const auto width = decimal_bitwidth_of(format);
+      width && cudf::is_fixed_point(declared) &&
+      static_cast<std::size_t>(*width / 8) > cudf::size_of(declared)) {
+    // Held at the arriving width until the cast to the declared width lands.
+    std::size_t wide = aligned_bytes(rows * static_cast<std::size_t>(*width / 8));
+    if (child.n_buffers > 0 && child.buffers != nullptr && child.buffers[0] != nullptr) {
+      wide = saturating_add(
+        wide,
+        aligned_bytes(cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows))));
+    }
+    return wide;
+  }
+  return 0;
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
+                                                     const ArrowArray* array,
+                                                     std::string_view what,
+                                                     const std::vector<std::string>& names,
+                                                     const std::vector<logical_type>& types,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr)
+{
+  validate_struct_batch(schema, array, what, names, types);
 
   std::vector<cudf::data_type> expected;
   expected.reserve(types.size());
@@ -302,29 +385,34 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
     refuse_unsupported_shape(what, i, names[i], child, types[i]);
     expected.push_back(get_cudf_type(types[i]));
     // A plain type mismatch, refused from the format string before any buffer is copied. Formats
-    // the table does not know fall through to the check on the imported table.
+    // the table does not know fall through to the check on the imported column.
     const auto carried = cudf_type_of_format(format_of(child));
     if (carried && *carried != expected[i] && !differs_in_width_only(*carried, expected[i])) {
       throw_type_mismatch(what, i, names[i], types[i], expected[i], *carried);
     }
   }
+  validate_struct_window(*array, what, names);
 
-  windowed_struct window;
-  const ArrowArray* rows = window_struct_children(*array, what, names, window);
-
-  // Host -> device copy of every buffer; cudf owns the result, the input is not released.
+  // Host -> device copy, one column at a time; cudf owns the result, the input is not released.
+  // Each column is reconciled to its declared width before the next is imported, so the wide
+  // decimal128 a producer emits is alive for one column only, never for the whole batch.
   std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(types.size());
   try {
-    columns = cudf::from_arrow(schema, rows, stream, mr)->release();
-    for (std::size_t i = 0; i < columns.size(); ++i) {
-      const auto actual = columns[i]->type();
-      if (actual == expected[i]) { continue; }
-      if (differs_in_width_only(actual, expected[i]) &&
-          cudf::is_supported_cast(actual, expected[i])) {
-        columns[i] = cudf::cast(columns[i]->view(), expected[i], stream, mr);
-        continue;
+    for (std::size_t i = 0; i < types.size(); ++i) {
+      const ArrowArray window = windowed_child(*array, i);
+      auto column             = cudf::from_arrow_column(schema->children[i], &window, stream, mr);
+      const auto actual       = column->type();
+      if (actual != expected[i]) {
+        if (!differs_in_width_only(actual, expected[i]) ||
+            !cudf::is_supported_cast(actual, expected[i])) {
+          throw_type_mismatch(what, i, names[i], types[i], expected[i], actual);
+        }
+        // The cast's output is the only other allocation; the wide column is freed when `column`
+        // is reassigned, before the next child is touched.
+        column = cudf::cast(column->view(), expected[i], stream, mr);
       }
-      throw_type_mismatch(what, i, names[i], types[i], expected[i], actual);
+      columns.push_back(std::move(column));
     }
   } catch (...) {
     // The copies may still be reading the producer's buffers (from pinned host memory a
@@ -335,6 +423,104 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
     throw;
   }
   return std::make_unique<cudf::table>(std::move(columns));
+}
+
+std::size_t arrow_import_footprint::peak_bytes() const noexcept
+{
+  return memory::saturating_add(resident_bytes, transient_bytes);
+}
+
+arrow_import_footprint estimate_arrow_import_footprint(const ArrowSchema* schema,
+                                                       const ArrowArray* array,
+                                                       std::string_view what,
+                                                       const std::vector<std::string>& names,
+                                                       const std::vector<logical_type>& types)
+{
+  validate_struct_batch(schema, array, what, names, types);
+  validate_struct_window(*array, what, names);
+
+  arrow_import_footprint footprint;
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    // HUGEINT is refused by the import before any copy; it has no cudf carrier to size here.
+    if (types[i].id() == type_id::HUGEINT || types[i].id() == type_id::UHUGEINT) { continue; }
+    const auto declared     = get_cudf_type(types[i]);
+    const ArrowArray window = windowed_child(*array, i);
+    footprint.resident_bytes =
+      saturating_add(footprint.resident_bytes, resident_bytes_of(window, declared));
+    footprint.transient_bytes = std::max(
+      footprint.transient_bytes, transient_bytes_of(*schema->children[i], window, declared));
+  }
+  return footprint;
+}
+
+std::size_t arrow_export_scratch_bytes(const cudf::table_view& table)
+{
+  std::size_t scratch = 0;
+  const auto rows     = static_cast<std::size_t>(table.num_rows());
+  const auto mask     = [&](cudf::column_view const& column) {
+    return column.nullable() ? aligned_bytes(cudf::bitmask_allocation_size_bytes(column.size()))
+                                 : std::size_t{0};
+  };
+  const auto walk = [&](cudf::column_view const& column, auto& self) -> void {
+    const auto type = column.type();
+    if (type.id() == cudf::type_id::DECIMAL32 || type.id() == cudf::type_id::DECIMAL64) {
+      // Widened to decimal128 on the device before the copy.
+      scratch = saturating_add(scratch, saturating_add(aligned_bytes(rows * 16), mask(column)));
+    } else if (type.id() == cudf::type_id::BOOL8) {
+      // Packed to a bitmap on the device before the copy.
+      scratch =
+        saturating_add(scratch, aligned_bytes(cudf::bitmask_allocation_size_bytes(column.size())));
+    }
+    for (cudf::size_type c = 0; c < column.num_children(); ++c) {
+      self(column.child(c), self);
+    }
+  };
+  for (auto const& column : table) {
+    walk(column, walk);
+  }
+  return scratch;
+}
+
+arrow_transfer_reservation::arrow_transfer_reservation(cucascade::memory::memory_space& space,
+                                                       rmm::cuda_stream_view stream,
+                                                       std::size_t bytes,
+                                                       std::string_view what)
+  : stream_(stream), bytes_(bytes)
+{
+  if (bytes == 0) {
+    granted_ = true;
+    return;
+  }
+  auto reservation = space.make_reservation_or_null(bytes);
+  if (reservation == nullptr) {
+    // Same degrade as the result collector's host reservation: say so, then let the copies
+    // compete for headroom as unreserved allocations do.
+    SIRIUS_LOG_WARN(
+      "{}: GPU reservation of {} bytes failed ({} bytes reserved of a {} byte limit) -- "
+      "proceeding without a reservation, the import may OOM",
+      what,
+      bytes,
+      space.get_total_reserved_memory(),
+      space.get_max_memory());
+    return;
+  }
+  granted_        = true;
+  auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  // attach_reservation_to_tracker consumes the reservation even when it declines (a state is
+  // already attached for this stream/thread), so ask first and hold the reservation unattached
+  // in that case rather than lose it.
+  if (allocator != nullptr && !allocator->is_stream_tracked(stream) &&
+      allocator->attach_reservation_to_tracker(stream, std::move(reservation))) {
+    allocator_ = allocator;
+    return;
+  }
+  held_ = std::move(reservation);
+}
+
+arrow_transfer_reservation::~arrow_transfer_reservation()
+{
+  if (allocator_ != nullptr) { allocator_->reset_stream_reservation(stream_); }
+  held_.reset();
 }
 
 }  // namespace sirius

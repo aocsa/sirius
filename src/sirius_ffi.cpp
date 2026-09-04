@@ -849,8 +849,14 @@ bool Fragment::export_arrow(std::uint64_t stream_id,
     metadata.push_back(nameless_metadata(column));
   }
   auto schema = cudf::to_arrow_schema(view, metadata);
-  // Temporary device allocations of the conversion come from the batch's own memory space; the
-  // host buffers are Arrow-owned and freed through the release callback the caller now holds.
+  // Temporary device allocations of the conversion (decimal widening, bool packing) come from the
+  // batch's own memory space and are reserved there for the copy's duration; the host buffers are
+  // Arrow-owned and freed through the release callback the caller now holds.
+  sirius::arrow_transfer_reservation scratch(
+    *space,
+    stream,
+    sirius::arrow_export_scratch_bytes(view),
+    "Fragment: export_arrow() of output stream " + std::to_string(stream_id));
   auto host = cudf::to_arrow_host(view, stream, space->get_default_allocator());
   // The caller may read (and release) the host buffers the moment this returns.
   stream.synchronize();
@@ -976,19 +982,31 @@ void Fragment::push_arrow(std::uint64_t stream_id,
     throw sirius::internal_exception("Fragment: push_arrow() found no GPU memory space");
   }
 
+  const auto* schema = reinterpret_cast<const ArrowSchema*>(schema_addr);
+  const auto* array  = reinterpret_cast<const ArrowArray*>(array_addr);
+  const auto what    = "Fragment: Arrow batch for stream " + std::to_string(stream_id);
+
   // The H2D copy is mandatory: the HOST tier is addressed by offsets inside cuCascade-owned
   // blocks and spill assumes it owns the memory, so caller memory cannot be pinned into it. The
   // batch the engine keeps lives in ordinary pool memory — fully accounted and spillable like any
   // other — and the synchronize below is what lets the caller release its Arrow structs on return.
+  //
+  // What the import is about to allocate (the table at the declared widths plus one column at its
+  // arriving width) is reserved in the space first and charged against that reservation while it
+  // is copied; the reservation is released when this call returns, once the batch is in the
+  // session and owns its memory as ordinary pool bytes. A refused reservation degrades with a
+  // warning rather than failing the push.
+  const auto footprint =
+    sirius::estimate_arrow_import_footprint(schema, array, what, declared.names, declared.types);
   auto stream = cudf::get_default_stream();
-  auto table =
-    sirius::import_arrow_host_table(reinterpret_cast<const ArrowSchema*>(schema_addr),
-                                    reinterpret_cast<const ArrowArray*>(array_addr),
-                                    "Fragment: Arrow batch for stream " + std::to_string(stream_id),
-                                    declared.names,
-                                    declared.types,
-                                    stream,
-                                    gpu_space->get_default_allocator());
+  sirius::arrow_transfer_reservation reservation(*gpu_space, stream, footprint.peak_bytes(), what);
+  auto table = sirius::import_arrow_host_table(schema,
+                                               array,
+                                               what,
+                                               declared.names,
+                                               declared.types,
+                                               stream,
+                                               gpu_space->get_default_allocator());
   stream.synchronize();
 
   // A host batch has no local producing operator, so there is no telemetry lineage to thread.

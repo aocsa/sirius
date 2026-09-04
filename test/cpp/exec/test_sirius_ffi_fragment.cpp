@@ -47,10 +47,14 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/memory_space.hpp>
 // The Arrow C Data Interface structs (ArrowSchema, ArrowArray, ArrowArrayStream): DuckDB's copy,
 // the definition libsirius itself is built against. Apache Arrow's arrow/c/abi.h is not a
 // dependency of this tree (absent from the vcpkg build), so it is not included here.
@@ -1304,6 +1308,199 @@ TEST_CASE("arrow_host_import refuses the shapes the engine cannot consume, by na
     column.schema.format = "l";
     const auto what      = import_error(column, logical_type::make(type_id::BIGINT));
     CHECK_THAT(what, Catch::Matchers::Contains("struct"));
+  }
+}
+
+// The declared-width import allocates one column at a time: a decimal128 batch declared
+// DECIMAL(15,2) is held at 16 bytes a row for one column only, never for the whole batch, and the
+// footprint estimate the reservation is made from bounds the measured peak. Measured through an
+// rmm statistics adaptor around a plain cudaMalloc upstream, no engine context.
+TEST_CASE("arrow_host_import imports one column at a time at the declared width",
+          "[sirius_ffi][arrow_host_import]")
+{
+  constexpr std::int64_t n     = std::int64_t{1} << 18;
+  constexpr std::size_t narrow = static_cast<std::size_t>(n) * 8;   // DECIMAL64, one column
+  constexpr std::size_t wide   = static_cast<std::size_t>(n) * 16;  // decimal128, one column
+  constexpr int columns        = 6;
+
+  std::vector<plan_column> price_columns;
+  std::vector<std::unique_ptr<cudf::column>> device_columns;
+  for (int c = 0; c < columns; ++c) {
+    price_columns.push_back({"p" + std::to_string(c), col_kind::DECIMAL_15_2});
+    std::vector<__int128_t> values(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < n; ++i) {
+      values[static_cast<std::size_t>(i)] = i * 100 + c;
+    }
+    device_columns.push_back(
+      fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL128, -2}, values));
+  }
+  const cudf::table device_table(std::move(device_columns));
+  const auto host = to_host_arrow(device_table.view(), price_columns);
+  for (std::int64_t c = 0; c < columns; ++c) {
+    // cudf spells a decimal128 without an explicit width (only the narrower widths carry one);
+    // the estimate and the import treat both `d:p,s` and `d:p,s,128` as 16 bytes a row.
+    REQUIRE(std::string(host.schema->children[c]->format) == "d:38,2");
+  }
+
+  std::vector<std::string> names;
+  std::vector<sirius::logical_type> types;
+  for (const auto& column : price_columns) {
+    names.push_back(column.name);
+    types.push_back(sirius::logical_type::make_decimal(15, 2));
+  }
+  const auto* schema = reinterpret_cast<const ArrowSchema*>(host.schema_addr());
+  const auto* array  = reinterpret_cast<const ArrowArray*>(host.array_addr());
+
+  const auto footprint =
+    sirius::estimate_arrow_import_footprint(schema, array, "test batch", names, types);
+  REQUIRE(footprint.resident_bytes == columns * narrow);
+  REQUIRE(footprint.transient_bytes == wide);
+  REQUIRE(footprint.peak_bytes() == columns * narrow + wide);
+
+  // Every allocation of the import is measured, whether cudf routes it through the `mr` argument
+  // or through the current device resource (cudf::cast's fixed-point width change takes the
+  // latter), so the adaptor is installed as both for the duration of the import.
+  rmm::mr::statistics_resource_adaptor stats{rmm::mr::cuda_memory_resource{}};
+  struct current_resource_guard {
+    rmm::device_async_resource_ref previous;
+    explicit current_resource_guard(rmm::device_async_resource_ref next)
+      : previous(cudf::get_current_device_resource_ref())
+    {
+      cudf::set_current_device_resource_ref(next);
+    }
+    ~current_resource_guard() { cudf::set_current_device_resource_ref(previous); }
+  };
+  auto stream = cudf::get_default_stream();
+  std::unique_ptr<cudf::table> table;
+  {
+    current_resource_guard as_current{rmm::device_async_resource_ref{stats}};
+    table = sirius::import_arrow_host_table(
+      schema, array, "test batch", names, types, stream, rmm::device_async_resource_ref{stats});
+    stream.synchronize();
+  }
+
+  REQUIRE(table->num_columns() == columns);
+  for (int c = 0; c < columns; ++c) {
+    REQUIRE(table->get_column(c).type() == cudf::data_type{cudf::type_id::DECIMAL64, -2});
+  }
+  const auto bytes = stats.get_bytes_counter();
+  CAPTURE(bytes.value, bytes.peak, bytes.total);
+  REQUIRE(static_cast<std::size_t>(bytes.value) == columns * narrow);  // only the table is alive
+  // Importing the whole batch wide and then casting would peak at every wide column plus one
+  // narrow one (columns * wide + narrow); the per-column import peaks below the wide total.
+  REQUIRE(static_cast<std::size_t>(bytes.peak) < columns * wide);
+  REQUIRE(static_cast<std::size_t>(bytes.peak) <= footprint.peak_bytes());
+
+  // The same bound over the full fixture (bool bitmap, strings, date, a decimal64 that arrives
+  // at cudf's explicit width, every column nullable), whole and sliced on the struct: the estimate
+  // is what push_arrow reserves, so it must cover what cudf allocates for every column kind.
+  using sirius::type_id;
+  const std::vector<std::string> fixture_names{"id", "x", "flag", "name", "price", "d"};
+  const std::vector<sirius::logical_type> fixture_types{
+    sirius::logical_type::make(type_id::BIGINT),
+    sirius::logical_type::make(type_id::DOUBLE),
+    sirius::logical_type::make(type_id::BOOLEAN),
+    sirius::logical_type::make(type_id::VARCHAR),
+    sirius::logical_type::make_decimal(15, 2),
+    sirius::logical_type::make(type_id::DATE)};
+  for (const std::int64_t offset : {std::int64_t{0}, std::int64_t{3}}) {
+    auto nullable = to_host_arrow(nullable_fixture_table(12)->view(), fixture_columns());
+    nullable.array->array.offset = offset;
+    nullable.array->array.length = 12 - offset;
+    const auto* fixture_schema   = reinterpret_cast<const ArrowSchema*>(nullable.schema_addr());
+    const auto* fixture_array    = reinterpret_cast<const ArrowArray*>(nullable.array_addr());
+    const auto fixture_footprint = sirius::estimate_arrow_import_footprint(
+      fixture_schema, fixture_array, "fixture", fixture_names, fixture_types);
+    REQUIRE(fixture_footprint.resident_bytes > 0);
+
+    rmm::mr::statistics_resource_adaptor fixture_stats{rmm::mr::cuda_memory_resource{}};
+    std::unique_ptr<cudf::table> imported;
+    {
+      current_resource_guard as_current{rmm::device_async_resource_ref{fixture_stats}};
+      imported = sirius::import_arrow_host_table(fixture_schema,
+                                                 fixture_array,
+                                                 "fixture",
+                                                 fixture_names,
+                                                 fixture_types,
+                                                 stream,
+                                                 rmm::device_async_resource_ref{fixture_stats});
+      stream.synchronize();
+    }
+    REQUIRE(imported->num_rows() == 12 - offset);
+    const auto fixture_bytes = fixture_stats.get_bytes_counter();
+    CHECK(static_cast<std::size_t>(fixture_bytes.peak) <= fixture_footprint.peak_bytes());
+  }
+}
+
+// What push_arrow does around the import: reserve the footprint in the GPU memory space, charge
+// the copies against it (no double counting while the reservation is attached), release the
+// reservation once the batch owns its memory, and degrade with a warning when the space cannot
+// grant it. Run against a standalone 256 MiB space, no engine context.
+TEST_CASE("arrow_transfer_reservation reserves, attaches, releases and degrades",
+          "[sirius_ffi][arrow_host_import]")
+{
+  constexpr std::size_t mib = std::size_t{1} << 20;
+  cucascade::memory::gpu_memory_space_config config;
+  config.device_id              = 0;
+  config.memory_capacity        = 256 * mib;
+  config.per_stream_reservation = false;  // sirius's default: the tracker is per thread
+  cucascade::memory::memory_space space(config);
+  auto stream = space.acquire_stream();
+
+  REQUIRE(space.get_total_reserved_memory() == 0);
+  const auto initial_available = space.get_available_memory();
+
+  SECTION("a granted reservation is attached; allocations on it are not counted twice")
+  {
+    std::optional<rmm::device_buffer> batch;
+    {
+      sirius::arrow_transfer_reservation reservation(space, stream, 64 * mib, "test batch");
+      REQUIRE(reservation.granted());
+      REQUIRE(reservation.attached());
+      REQUIRE(reservation.requested_bytes() == 64 * mib);
+      REQUIRE(space.get_total_reserved_memory() == 64 * mib);
+      REQUIRE(space.get_available_memory() == initial_available - 64 * mib);
+      // The copy: an allocation on the reserving thread is charged to the reservation, so the
+      // space's available memory does not move again.
+      batch.emplace(32 * mib, stream, space.get_default_allocator());
+      stream.synchronize();
+      REQUIRE(space.get_available_memory() == initial_available - 64 * mib);
+    }
+    // Released: the unused half of the reservation is back; the batch's 32 MiB stay accounted as
+    // ordinary pool memory until the batch is freed.
+    REQUIRE(space.get_total_reserved_memory() == 0);
+    REQUIRE(space.get_available_memory() == initial_available - 32 * mib);
+    batch.reset();
+    stream.synchronize();
+    REQUIRE(space.get_available_memory() == initial_available);
+  }
+
+  SECTION("a reservation the space cannot grant degrades without throwing")
+  {
+    sirius::arrow_transfer_reservation reservation(space, stream, 1024 * mib, "test batch");
+    REQUIRE_FALSE(reservation.granted());
+    REQUIRE_FALSE(reservation.attached());
+    REQUIRE(space.get_total_reserved_memory() == 0);
+    REQUIRE(space.get_available_memory() == initial_available);
+  }
+
+  SECTION("a second reservation on a thread that already has one is held unattached")
+  {
+    sirius::arrow_transfer_reservation outer(space, stream, 16 * mib, "outer");
+    sirius::arrow_transfer_reservation inner(space, stream, 16 * mib, "inner");
+    REQUIRE(outer.attached());
+    REQUIRE(inner.granted());
+    REQUIRE_FALSE(inner.attached());
+    REQUIRE(space.get_total_reserved_memory() == 32 * mib);
+  }
+  REQUIRE(space.get_total_reserved_memory() == 0);
+
+  SECTION("a zero-byte request reserves nothing and is granted")
+  {
+    sirius::arrow_transfer_reservation reservation(space, stream, 0, "empty");
+    REQUIRE(reservation.granted());
+    REQUIRE_FALSE(reservation.attached());
+    REQUIRE(space.get_total_reserved_memory() == 0);
   }
 }
 

@@ -270,6 +270,10 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// A strings column whose cudf offsets are 64-bit (a batch holding more than 2 GiB of
   /// characters in one column) exports as `large_utf8`, which `push_arrow` refuses by name; keep
   /// a parked batch under that size (the packed hop carries such a batch, this one does not).
+  /// The device scratch the conversion needs (a DECIMAL32/64 column is widened to decimal128 and a
+  /// BOOL8 column packed to a bitmap on the device before the copy) is reserved in the batch's
+  /// memory space for the copy's duration and released before returning; a refused reservation is
+  /// logged and the copy proceeds unreserved.
   /// @throws before `build()`, on an unknown output stream, on null addresses, or on a parked
   /// batch that is not GPU-resident (same contract as `export_packed`).
   bool export_arrow(std::uint64_t stream_id,
@@ -311,6 +315,14 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// a membership check only — the batch carries no sender identity past this call, so a push
   /// from a sender that already called close_input() is refused only once every sender has
   /// closed and the stream ended.
+  ///
+  /// Memory: the columns are imported one at a time and narrowed to the declared width before the
+  /// next is copied, so the transient device footprint is the table at the declared widths plus
+  /// one column at its arriving width. Those bytes are reserved in the GPU memory space before the
+  /// copy (`memory_space::make_reservation_or_null`) and charged against the reservation while it
+  /// runs; the reservation is released when the call returns, the batch then owning its memory as
+  /// ordinary pool bytes. A reservation the space cannot grant is logged as a warning and the copy
+  /// proceeds unreserved, never silently more than that.
   ///
   /// Contract in this milestone: legal between `build()` and `run()`, exactly where `push_packed`
   /// sits. Besides the stream session (mutex-protected) and immutable post-`build()` state — the
