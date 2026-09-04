@@ -14,9 +14,10 @@ new `Fragment::push_arrow` FFI, and reads the result back as Arrow. `push_arrow`
 Deliverables: (M1, delivered) the `push_arrow` FFI plus a helper that imports Arrow through cudf and checks it against
 the declared stream schema, with Catch2 tests (13 cases, 267 assertions on GPU 1); (M2, delivered) Rust bindings, an
 Arrow hop test that returns the same rows as the `relay_from` and `push_packed` hops, and a micro-benchmark of both
-PCIe legs at 128 MiB, 512 MiB and 2 GiB; (M3) a third input kind in the StarRocks CN with an in-process loopback A/B;
-(M4) a one-copy Arrow output through `cudf::to_arrow_host`; (M5) the end-to-end comparison against NIXL at the byte
-totals of 5.1.
+PCIe legs at 128 MiB, 512 MiB and 2 GiB; (M3, delivered) the Arrow-over-brpc exchange transport in the StarRocks CN,
+drained off the RPC thread and pipelined over several connections; (M4, delivered behind `SIRIUS_CN_RESULT_PATH=arrow`)
+a one-copy Arrow output through `cudf::to_arrow_host`; (M5) the end-to-end comparison against NIXL at the byte totals
+of 5.1: run once (below); the rerun with the M3 closing fixes is pending.
 
 Expected outcomes: a tested path for a CPU host (a Doris BE, a StarRocks BE or CN) to feed a GPU fragment without
 device pointers or pack metadata (in hand); the widened threading contract, `start()`/`join()` and the thread-safe
@@ -222,22 +223,32 @@ CPU. Two facts for it: cudf writes decimal32/64 out as decimal128 at the widest 
 
 ### 2.6 How it maps onto StarRocks
 
-- A third input kind. `ExecuteRequest` and `FragmentRun` (`engine.rs:48-73`, `fragment_executor.rs:99-120`) carry
-  `inputs` (local relay) and `remote_inputs` (staged packed batches). Add `arrow_inputs: Vec<(i32, i32,
-  Vec<RecordBatch>)>` as `(exchange node id, sender id, batches)`. Its sender ids join the `declare_input_sender` loop
-  (`:444-454`), which `push_arrow` requires (2.3). It is consumed after the remote push loop (`:550-579`) and before
-  `run()` (`:590`): `push_arrow` per batch, then `close_input`. `RecordBatch` is owned and `Send`, so it crosses the
-  mpsc channel like `StagedBatch`.
-- The sender side. `result_to_arrow` is valid only on a fragment with no output streams (`sirius_ffi.cpp:974-977`), so
-  an Arrow-producing sender runs as a result fragment and hands `FragmentResult.batches` on; `declare_output_hash_key`
-  and `declare_output_broadcast` are not available on that path, so a fan-out must be partitioned on the host. The M3
-  loopback A/B: sender result fragment, `Vec<RecordBatch>`, receiver `arrow_inputs`, one CN process, against the
-  `relay_from` result.
-- Exact cardinality. `RecordBatch::num_rows()` summed per stream is always known and becomes a third term next to
-  `local_rows` and `remote_rows` (`engine.rs:477-491`), so the stream keeps the exact branch of
-  `declare_input_cardinality`. That call must precede `build()`: when the exact cardinality is wanted, the row counts
-  (not the batches) must be known before `build()`, and the CN's store-and-forward seam has them. `push_arrow` itself
-  is legal after `build()`.
+As delivered (M3, M4; the planning text that follows each item is kept where it still explains a choice):
+
+- The input kind. A remote sender's Arrow frames arrive over the existing `transmit_packed` RPC (`arrow_ipc = true`)
+  and are staged as `StagedBatch::arrow` inside `remote_inputs` (`fragment_executor.rs`, `StagedBatch`), so
+  `ExecuteRequest` and `FragmentRun` carry no third field: the engine thread's remote push loop calls `push_arrow` for
+  an Arrow batch and `push_packed` for a packed one, then `close_input`, all before `run()` (`engine.rs`,
+  `run_fragment_inner`). The receiver's rendezvous (`local_exchange.rs`, `push_remote_frame`) holds an Arrow frame that
+  overtook its predecessor and appends it in `seq` order; a packed frame out of order, or an eos with a hole, is still
+  a lost frame.
+- The sender side. The engine gained `Fragment::export_arrow` (`export_arrow_next` in Rust), which pops a parked
+  output batch as host Arrow through `cudf::to_arrow_host`, so an Arrow-producing sender runs as an ordinary
+  intermediate fragment with `declare_output`, broadcast and hash keys intact; the planning-time worry that a sender
+  would have to be a result fragment did not materialize. The drain (`arrow_exchange.rs`, `send_fragment`) runs on an
+  `arrow-drain` thread once the sender's `exec_plan_fragment` has replied: it exports into a bounded queue and
+  `SIRIUS_CN_ARROW_SEND_WORKERS` workers (default 4) encode and send over one connection each, the eos after every data
+  frame is acknowledged. The peer is dialed inside the RPC so an unreachable destination still fails it; a drain that
+  fails afterwards fails the query on the sender's CN and cancels the receiver at the peer (`cancel_plan_fragment`
+  with the cause).
+- Exact cardinality. A staged Arrow batch carries `num_rows`, so `remote_rows` sums it like a packed batch's `rows`
+  and the stream keeps the exact branch of `declare_input_cardinality` (`engine.rs`, `run_fragment_inner`). That call
+  must precede `build()`, which is one of the two reasons the receiver is still dispatched only once every sender has
+  closed (section 3, "Not delivered").
+- The result edge (M4). `SIRIUS_CN_RESULT_PATH=arrow` makes a RESULT_SINK fragment declare one output stream, run as an
+  intermediate fragment and drain through `export_arrow_next` into the record batches the MySQL encoder reads
+  (`engine.rs`, `run_fragment_inner`; `result_encoder.rs` renders the decimal32/64 widths cudf exports). Default
+  `duckdb` keeps `result_to_arrow`.
 - Feature gating. `experimental/starrocks/Cargo.toml:17` pins `arrow-array = "59"` without the `ffi` feature;
   `arrow_array::ffi::to_ffi` reaches the CN only through the `sirius` crate's `features = ["ffi"]`
   (`rust/crates/sirius/Cargo.toml:21`) and stays inside `sirius::Fragment::push_arrow(&mut self, stream_id, sender_id,
@@ -251,8 +262,8 @@ CPU. Two facts for it: cudf writes decimal32/64 out as decimal128 at the widest 
   `declare_input_cardinality` if known, `build` a plan whose read names `stream_view_name(id)`, `push_arrow` per
   batch, `close_input`, `run`, `result_to_arrow`. Across a process boundary (a StarRocks BE, or the process running
   the FE-planned scan): Arrow IPC stream bytes in a brpc attachment, the D3 transport of the multi-CN plan
-  (`MULTI-CN-PLAN.md:170`, section 6; designed, never shipped), decoded on the CN into `RecordBatch`es and fed as
-  `arrow_inputs`. No `arrow-ipc` crate is in the tree; not scheduled here.
+  (`MULTI-CN-PLAN.md:170`, section 6), which is what the M3 transport now is: `arrow_ipc` frames of `transmit_packed`,
+  decoded on the CN into `RecordBatch`es and staged for `push_arrow`. A BE-side producer would emit the same frames.
 
 ## 3. The threading contract
 
@@ -410,6 +421,44 @@ M5 SF1000 arm lands tens of GB per query on the receiving CN's host). A parked b
 characters in one string column exports as `large_utf8`, which `push_arrow` refuses by name; the nixl tier carries such
 a batch. The same 2-CN TPC-H arm can therefore run once over NIXL and once over Arrow, which is the M5 comparison.
 
+**Closing changes after the first M5 run** (commits `5503e422`, `2f09fdea`; `experimental/starrocks`):
+
+- The drain left the RPC. The sender fragment and its Arrow drain ran inside `exec_plan_fragment`; the 15.4 GB drain
+  of q04 took 59 s, the FE's ~60 s per-RPC deadline (`RpcTimerTask` in the FE log) cancelled the query mid-drain and
+  retried it, the re-planned scan parked 62 GB on one CN, and the OOM that followed took the engine's task-creation
+  error path, which is the crash the diagnosis traced (an engine defect, out of this branch's scope). Now
+  `arrow_exchange::prepare` dials the peer inside the RPC (an unreachable destination still fails it and drops the
+  parked output), the RPC replies, and an `arrow-drain` thread runs the drain; the receivers this sender readied are
+  dispatched after its drains complete, the order the inline drain kept, so a local receiver never competes with the
+  drain's exports for the engine thread. A middle fragment on the dispatch worker joins its drains there. A drain that
+  fails after the reply fails the query on this CN (`fail_fragment`) and cancels the receiver at the peer with the
+  cause. Tests: `a_slow_arrow_drain_does_not_hold_the_exec_plan_fragment_reply` (gated export; the RPC returns while
+  nothing was exported), `an_arrow_drain_failure_after_the_reply_fails_the_query_here_and_at_the_peer`.
+- The drain is pipelined. The drain thread exports (`export_arrow_next`, one engine round trip and D2H copy each) into
+  a bounded queue; `SIRIUS_CN_ARROW_SEND_WORKERS` workers (default 4, validated in `tunable.rs`) encode and send
+  concurrently over one connection each, `seq` assigned at export; the eos goes after every worker has returned with
+  its frames acknowledged. The receiver's rendezvous holds Arrow frames that overtake each other and appends them in
+  `seq` order (`local_exchange.rs`; packed frames and the eos keep the lost-frame check). The PRPC frame path copies a
+  large attachment once instead of four times (the client writes the head then the attachment from the caller's
+  buffer; the server reads metadata, body and attachment into their own buffers, in 1 MiB steps). Loopback bench on
+  this box (`arrow_drain_loopback_bench`, 8 frames of 64 MiB, host-resident export): 0.35 GB/s with 1 worker before
+  the copy fix, 0.64 after; 1.3 GB/s with 4 workers and 1.4 with 8 on the receiver's single I/O thread; 2.0 and 2.7
+  GB/s with `SIRIUS_CN_BRPC_IO_THREADS=4` (default 1: a multi-thread brpc runtime changes every RPC's threading, so it
+  is opt-in). A raw 32 MiB `transmit_packed` round trip went from 73 ms to 31 ms; a plain loopback TCP round trip of
+  the same bytes is 7 ms, so the frame path still has room.
+- Not delivered: early receiver dispatch through `start()` + `FragmentInput`. The receiver is still dispatched once
+  every sender has closed, and every Arrow batch is pushed before `run()`. Two reasons, both about fix 2's semantics
+  and the engine's one-thread contract: (1) the engine thread would block in `join()` for the receiver's whole run,
+  and that thread also serves this CN's own `export_arrow_next` calls, so in a 2-CN shuffle where both CNs send and
+  receive the same exchange each CN's drain would wait behind the other's receiver — a cross-CN stall; (2)
+  `declare_input_cardinality` must precede `build()`, and a remote sender's row count is only known at its eos, so an
+  early start plans blind (cardinality 1 on the stream), which is the q07 join-order regression the exact branch
+  exists to prevent. Streaming into a running receiver needs an engine that serves exports while a query runs, or a
+  sender that announces its row count before its first frame; neither is in this step.
+- Log lines. `transmitted batches via arrow` keeps `stream_id sender_id dest batches bytes elapsed_ms` and adds
+  `query_id fragment_instance_id export_ms encode_ms send_ms workers`; `received remote batches via arrow` adds
+  `push_ms`; the tunables line adds `arrow_send_workers`, `brpc_io_threads`, `result_path`.
+
 Original plan, kept for the record:
 
 - Files:
@@ -426,6 +475,23 @@ Original plan, kept for the record:
   in one process. Dependencies: M2.
 
 ### M4: one-copy output through `cudf::to_arrow_host`
+
+**Delivered behind the CN knob `SIRIUS_CN_RESULT_PATH=arrow`** (default `duckdb`, any other value fails bring-up;
+commit `2d0c85bf`). No new engine verb was needed: `Fragment::export_arrow` (M3) already pops a parked batch through
+`cudf::to_arrow_host`, so with the knob on a RESULT_SINK fragment declares one output stream, runs as an intermediate
+fragment and is drained on the engine thread with `export_arrow_next` into the `RecordBatch`es `MysqlResultEncoder`
+reads (`engine.rs`, `run_fragment_inner`); the `duckdb` path (`result_to_arrow`, four copies) is unchanged. A DECIMAL
+arrives at the width cudf held it in (`DECIMAL(15,2)` as `decimal64(18,2)`, 2.5) and the encoder gained the
+decimal32/64 arms, rendering the same text. The engine logs `drained result via arrow` with `batches`, `rows`,
+`host_bytes`, `elapsed_ms`. Test on GPU 1: `engine::tests::arrow_result_path_renders_the_same_mysql_rows_as_the_duckdb_path`
+runs a parquet fixture (BIGINT, VARCHAR, DECIMAL(15,2), DATE, BOOLEAN, DOUBLE, nulls) through both paths and compares
+the MySQL text rows cell for cell, alternating the knob. Not measured end to end yet (the D2H rate of 5.2 is the
+expectation: 1.1-1.2 GB/s today against 4.1-4.3 GB/s for `to_arrow_host`); whether a sorted result stays ordered
+through the streaming sink the way it does through the collector is untested beyond the fixture and is the one risk
+to check in the arm. The CN-level result-sink tests use the stub executor, which has no result path; the knob is read
+by the engine handle (`SiriusEngine::result_path`, a per-instance override in tests).
+
+Original plan, kept for the record:
 
 - Files: an Arrow-producing result collector beside `sirius_physical_result_collector.cpp`, or a separate `Fragment`
   verb in `sirius_ffi.{hpp,cpp}` that walks the GPU result batches and calls `to_arrow_host` per batch into a
@@ -462,6 +528,23 @@ lineitem fragment's translation, then the segfault). Conclusion for the design q
 the Arrow path is the host-input contract for a CPU-side producer (its intended role), and needs pipelining
 (overlap export, encode, send, decode, push) and the crash fix before it can be measured against NIXL on equal
 terms; the reservation accounting is in (2.3). Evidence: `starrocks-tools/evidence/rtxpro6000-fix4/X-nixl`, `X-arrow`, `arrow-vs-nixl.md`.
+
+What the diagnosis of that run and the closing changes established afterwards (M3, "Closing changes"):
+
+- The q04 failure and the q07 crash were one chain. The 59 s drain inside `exec_plan_fragment` tripped the FE's ~60 s
+  per-RPC deadline; the FE cancelled q04 mid-drain and retried it; the retry re-planned lineitem so one CN parked 62.1 GB
+  in its 60 GiB pool; the join fragment's task creation then threw `out_of_memory` on the one engine error path that
+  stops the scheduler from its own pool thread (`task_creator.cpp:589`), and the next fragment (q07's lineitem scan)
+  ran against the torn-down scheduler. The same q03 drains (68 s) were cancelled and retried the same way (the r2 in
+  the table is a retry). The crash did not reproduce in five gdb-wrapped cluster runs; three induced OOMs took the
+  executor path and recovered. The engine fix (report, do not stop, from the creation catch) is out of this branch's
+  scope; the CN-side trigger is closed: the RPC replies before the drain, and the drain is 4-7x faster on loopback.
+- The arm has not been rerun with these changes yet. The numbers to expect
+  from the loopback bench: a 19.7 GB q03 stream at 1.3 GB/s takes ~15 s instead of 68 s (4 workers, one I/O thread),
+  ~10 s with `SIRIUS_CN_BRPC_IO_THREADS=4`; the receiver's `push_ms` (H2D at ~10 GB/s) and the sender's `export_ms`
+  (D2H at ~4 GB/s, serialized on the engine thread) are now logged per stream so the next run can attribute what is
+  left. Knobs for the rerun: `SIRIUS_CN_EXCHANGE_TRANSPORT=arrow SIRIUS_CN_ARROW_SEND_WORKERS=4
+  SIRIUS_CN_BRPC_IO_THREADS=4`, and `SIRIUS_CN_RESULT_PATH=arrow` for the M4 leg.
 
 ## 5. Performance comparison against NIXL
 
