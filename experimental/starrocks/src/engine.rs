@@ -38,6 +38,7 @@ use crate::fragment_executor::{
     FragmentExecutor, FragmentLabel, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
 };
 use crate::parked_registry::{ParkedRegistry, QueryId, Release, RetireTrigger, RetiredQueries};
+use crate::tunable::{ResultPath, Tunables};
 
 /// One fragment execution handed to the engine thread.
 ///
@@ -64,6 +65,9 @@ struct ExecuteRequest {
     hash_keys: Vec<usize>,
     /// The query and instance this run belongs to; parked output is owned by `label.query_id`.
     label: FragmentLabel,
+    /// How a result fragment's rows come back (`SIRIUS_CN_RESULT_PATH`); ignored for a
+    /// fragment with `outputs`.
+    result_path: ResultPath,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
     /// Test-only: runs between `fragment.run()` and the park, standing in for a cancel or a
@@ -142,6 +146,9 @@ pub struct SiriusEngine {
     /// here BEFORE queueing its `RetireQuery`, so a `Run` already sitting in the FIFO ahead of it
     /// is refused when the thread dequeues it (the same off-thread shape as `staging`).
     retired: Arc<Mutex<RetiredQueries>>,
+    /// How result fragments return their rows (`ResultPath::code`), from the registry at
+    /// bring-up; tests override it per instance.
+    result_path: std::sync::atomic::AtomicU8,
 }
 
 impl SiriusEngine {
@@ -170,10 +177,25 @@ impl SiriusEngine {
                 thread: Mutex::new(Some(thread)),
                 staging,
                 retired,
+                result_path: std::sync::atomic::AtomicU8::new(Tunables::get().result_path.code()),
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
         }
+    }
+
+    /// The result path in force for this engine handle.
+    fn result_path(&self) -> ResultPath {
+        ResultPath::from_code(self.result_path.load(std::sync::atomic::Ordering::Relaxed))
+            .expect("result_path only ever holds a ResultPath code")
+    }
+
+    /// Overrides the bring-up result path for this engine handle; tests use it to run both
+    /// paths without touching the process environment.
+    #[cfg(test)]
+    pub(crate) fn set_result_path(&self, path: ResultPath) {
+        self.result_path
+            .store(path.code(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Points the engine's log directory at `<engine_dir>/log` and pins the CUDA device when
@@ -516,8 +538,17 @@ fn run_fragment_inner<'ctx>(
     }
 
     // An intermediate fragment sinks into one output stream per destination (stream i belongs
-    // to destination outputs[i]); a result fragment declares none and produces Arrow instead.
-    for stream in 0..request.outputs.len() as u64 {
+    // to destination outputs[i]); a result fragment declares none and produces Arrow through
+    // `result_to_arrow` -- unless the Arrow result path is on, in which case it declares one
+    // output stream, runs as an intermediate fragment and is drained with `export_arrow_next`
+    // (`cudf::to_arrow_host`, one D2H copy per batch) instead of the collector's four copies.
+    let arrow_result = request.outputs.is_empty() && request.result_path == ResultPath::Arrow;
+    let output_streams = if arrow_result {
+        1
+    } else {
+        request.outputs.len() as u64
+    };
+    for stream in 0..output_streams {
         fragment
             .declare_output(stream)
             .map_err(|err| format!("failed to declare fragment output stream {stream}: {err}"))?;
@@ -669,6 +700,29 @@ fn run_fragment_inner<'ctx>(
         registry.park(request.label.query_id, &request.outputs, fragment)?;
         return Ok(None);
     }
+    if arrow_result {
+        // The one-copy result path: pop every parked GPU batch as host Arrow (the batch owns its
+        // buffers, so it crosses to the caller's thread like a `result_to_arrow` batch). The
+        // schema carries types only; the MySQL encoder renders by type and needs no names.
+        let draining = std::time::Instant::now();
+        let mut batches = Vec::new();
+        let mut host_bytes = 0usize;
+        while let Some(batch) = fragment
+            .export_arrow_next(0)
+            .map_err(|err| format!("failed to export a result batch as Arrow: {err}"))?
+        {
+            host_bytes += batch.get_array_memory_size();
+            batches.push(batch);
+        }
+        info!(
+            batches = batches.len(),
+            rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            host_bytes,
+            elapsed_ms = draining.elapsed().as_millis() as u64,
+            "drained result via arrow"
+        );
+        return Ok(Some(FragmentResult::new(batches)));
+    }
     // `result_to_arrow` drains the stream and drops the context-referencing wrapper here, on the
     // engine thread, returning owned batches whose buffers are released via their own Arrow C
     // release callbacks — independent of the context. So they are safe to send to, and drop on,
@@ -741,6 +795,7 @@ impl FragmentExecutor for SiriusEngine {
                 broadcast: run.broadcast,
                 hash_keys: run.hash_keys,
                 label: run.label,
+                result_path: self.result_path(),
                 respond,
                 #[cfg(test)]
                 after_run: None,
@@ -1063,6 +1118,7 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 label: FragmentLabel::default(),
+                result_path: ResultPath::DuckDb,
                 respond: respond_tx,
                 after_run: None,
             }))
@@ -1093,6 +1149,106 @@ mod tests {
         let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
+    }
+
+    /// Writes a parquet fixture covering the MySQL encoder's type set at `path`: `id BIGINT,
+    /// name VARCHAR, price DECIMAL(15,2), day DATE, flag BOOLEAN, x DOUBLE`, three rows with a
+    /// null in every nullable column. Returns the column names in file order.
+    fn write_typed_parquet(path: &std::path::Path) -> Vec<String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Decimal128(15, 2), true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("x", DataType::Float64, true),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            Arc::new(
+                arrow_array::Decimal128Array::from(vec![Some(-123456), Some(5), None])
+                    .with_precision_and_scale(15, 2)
+                    .unwrap(),
+            ),
+            Arc::new(arrow_array::Date32Array::from(vec![
+                None,
+                Some(10471),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                None,
+            ])),
+            Arc::new(arrow_array::Float64Array::from(vec![
+                Some(0.5),
+                None,
+                Some(-2.25),
+            ])),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    /// The M4 one-copy result path (`SIRIUS_CN_RESULT_PATH=arrow`): a result fragment run with
+    /// one declared output stream and drained through `export_arrow_next` renders, cell for
+    /// cell, the same MySQL text rows as `result_to_arrow` over the encoder's whole type set
+    /// (the DECIMAL(15,2) arrives as decimal64(18,2) instead of decimal128(15,2) and the
+    /// columns carry no names, neither of which the encoder needs). Requires a GPU.
+    #[test]
+    fn arrow_result_path_renders_the_same_mysql_rows_as_the_duckdb_path() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed.parquet");
+        let names = write_typed_parquet(&path);
+        let plan = local_files_plan(path.to_str().unwrap(), names);
+
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+        let rows_of = |result: FragmentResult| -> Vec<Vec<u8>> {
+            let mut rows = crate::result_encoder::MysqlResultEncoder::encode(&result.batches, 0)
+                .expect("encode as MySQL text rows")
+                .rows;
+            rows.sort();
+            rows
+        };
+
+        engine.set_result_path(ResultPath::DuckDb);
+        let duckdb = run_result(&engine, &plan);
+        assert_eq!(
+            duckdb.batches[0].schema_ref().field(2).data_type(),
+            &DataType::Decimal128(15, 2),
+            "the DuckDB path hands the decimal out at its declared width"
+        );
+        let duckdb_rows = rows_of(duckdb);
+        assert_eq!(duckdb_rows.len(), 3);
+
+        engine.set_result_path(ResultPath::Arrow);
+        let arrow = run_result(&engine, &plan);
+        assert_eq!(
+            arrow.batches[0].schema_ref().field(2).data_type(),
+            &DataType::Decimal64(18, 2),
+            "the Arrow path hands the decimal out at the cudf width"
+        );
+        let arrow_rows = rows_of(arrow);
+        assert_eq!(arrow_rows, duckdb_rows);
+
+        // Both paths keep working when alternated: the engine's lifecycle closed cleanly.
+        engine.set_result_path(ResultPath::DuckDb);
+        assert_eq!(rows_of(run_result(&engine, &plan)), duckdb_rows);
+        engine.set_result_path(ResultPath::Arrow);
+        assert_eq!(rows_of(run_result(&engine, &plan)), duckdb_rows);
     }
 
     /// The engine-actor mirror of the sirius crate's `packed_hop_matches_relay_hop`: a sender
@@ -1830,6 +1986,7 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 label: labelled(204, 1),
+                result_path: ResultPath::DuckDb,
                 respond: respond_tx,
                 // The cancel lands while the fragment runs.
                 after_run: Some(Box::new(move || {

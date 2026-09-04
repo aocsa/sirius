@@ -7,9 +7,9 @@
 use arrow_array::temporal_conversions::{as_date, as_datetime};
 use arrow_array::types::{Date32Type, TimestampMicrosecondType};
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, TimestampMicrosecondArray,
+    Array, BooleanArray, Date32Array, Decimal32Array, Decimal64Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use starrocks_thrift::data::TResultBatch;
@@ -92,6 +92,18 @@ impl MysqlResultEncoder {
             }
             DataType::Decimal128(_, _) => {
                 let typed = Self::downcast::<Decimal128Array>(array)?;
+                Ok(Some(typed.value_as_string(row).into_bytes()))
+            }
+            // The Arrow result path (`SIRIUS_CN_RESULT_PATH=arrow`) exports a DECIMAL at the
+            // cudf width the engine held it in: `cudf::to_arrow_host` spells a DECIMAL(15,2) as
+            // decimal64(18, 2) and a DECIMAL(9, s) or narrower as decimal32. Same digits, same
+            // scale, same text.
+            DataType::Decimal64(_, _) => {
+                let typed = Self::downcast::<Decimal64Array>(array)?;
+                Ok(Some(typed.value_as_string(row).into_bytes()))
+            }
+            DataType::Decimal32(_, _) => {
+                let typed = Self::downcast::<Decimal32Array>(array)?;
                 Ok(Some(typed.value_as_string(row).into_bytes()))
             }
             DataType::Date32 => {
@@ -269,6 +281,56 @@ mod tests {
         assert_eq!(
             cells(&result.rows[2]),
             vec!["NULL", "1970-01-01", "1970-01-01 00:00:00.001500"]
+        );
+    }
+
+    /// The narrower decimal widths the Arrow result path exports render exactly as the
+    /// decimal128 the DuckDB path produces for the same DECIMAL(p, s) value.
+    #[test]
+    fn narrow_decimals_render_like_decimal128() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d64", DataType::Decimal64(18, 2), true),
+            Field::new("d32", DataType::Decimal32(9, 3), true),
+            Field::new("d128", DataType::Decimal128(15, 2), true),
+        ]));
+        let d64: ArrayRef = Arc::new(
+            Decimal64Array::from(vec![Some(-123456), Some(5), None])
+                .with_precision_and_scale(18, 2)
+                .unwrap(),
+        );
+        let d32: ArrayRef = Arc::new(
+            Decimal32Array::from(vec![Some(1_234_567), None, Some(-1)])
+                .with_precision_and_scale(9, 3)
+                .unwrap(),
+        );
+        let d128: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(-123456), Some(5), None])
+                .with_precision_and_scale(15, 2)
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema, vec![d64, d32, d128]).unwrap();
+
+        let result = MysqlResultEncoder::encode(&[batch], 0).unwrap();
+
+        // Row 0: "-1234.56" (len 8), "1234.567" (len 8), "-1234.56" (len 8).
+        let mut expected = vec![0x08];
+        expected.extend_from_slice(b"-1234.56");
+        expected.push(0x08);
+        expected.extend_from_slice(b"1234.567");
+        expected.push(0x08);
+        expected.extend_from_slice(b"-1234.56");
+        assert_eq!(result.rows[0], expected);
+        // Row 1: "0.05", NULL, "0.05" -- the two widths agree cell for cell.
+        assert_eq!(
+            result.rows[1],
+            vec![
+                0x04, b'0', b'.', b'0', b'5', 0xFB, 0x04, b'0', b'.', b'0', b'5'
+            ]
+        );
+        // Row 2: NULL, "-0.001", NULL.
+        assert_eq!(
+            result.rows[2],
+            vec![0xFB, 0x06, b'-', b'0', b'.', b'0', b'0', b'1', 0xFB]
         );
     }
 

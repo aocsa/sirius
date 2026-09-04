@@ -434,6 +434,71 @@ impl ExchangeTransport {
     }
 }
 
+/// How a RESULT_SINK fragment's rows come back from the engine (`engine.rs`,
+/// `run_fragment_inner`): the M4 one-copy Arrow output path behind a knob.
+///
+/// Not a [`Knob`]: a word, read with the same three rules (reject, log, unset means the
+/// default) — the [`ExchangeTransport`] pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ResultPath {
+    /// `result_to_arrow`: the engine's result collector materializes a DuckDB result (D2H copy,
+    /// host table to `DataChunk`, `ColumnDataCollection`) and DuckDB's Arrow stream wrapper
+    /// converts it (four copies per byte). The shipped default.
+    DuckDb = 0,
+    /// The result fragment declares one output stream and runs as an intermediate fragment; its
+    /// parked GPU batches are drained with `export_arrow_next` (`cudf::to_arrow_host`, one D2H
+    /// copy per batch) into the same `RecordBatch`es the MySQL encoder reads.
+    Arrow = 1,
+}
+
+/// Environment name of the result path.
+const RESULT_PATH_NAME: &str = "SIRIUS_CN_RESULT_PATH";
+
+impl ResultPath {
+    /// The path when the variable is unset.
+    pub(crate) const DEFAULT: Self = Self::DuckDb;
+
+    /// The accepted spellings, for the rejection message.
+    const ACCEPTED: &'static str = "duckdb, arrow";
+
+    /// The configured path, or the default when unset. Trimmed and case-insensitive.
+    ///
+    /// # Errors
+    /// Any other value, naming the variable, the value and the accepted set.
+    fn read() -> Result<Self, String> {
+        let Some(raw) = env_value(RESULT_PATH_NAME) else {
+            return Ok(Self::DEFAULT);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "duckdb" => Ok(Self::DuckDb),
+            "arrow" => Ok(Self::Arrow),
+            _ => Err(format!(
+                "{RESULT_PATH_NAME}: expected one of {}, got \"{raw}\" (unset means the default, \
+                 duckdb)",
+                Self::ACCEPTED
+            )),
+        }
+    }
+
+    /// The path as the byte an `AtomicU8` holds; [`from_code`](Self::from_code) inverts it.
+    /// Read by the engine handle, which only exists with the `sirius-engine` feature.
+    #[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
+    pub(crate) const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`code`](Self::code); `None` for a byte no path produces.
+    #[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::DuckDb),
+            1 => Some(Self::Arrow),
+            _ => None,
+        }
+    }
+}
+
 /// The resolved transport tunables. Clone so call sites can hold one cheaply: the peer list is
 /// the one heap field, and it is `None` in every configuration but an explicit
 /// `SIRIUS_CN_NIXL_WARMUP_PEERS`.
@@ -467,6 +532,8 @@ pub struct Tunables {
     pub arrow_send_workers: usize,
     /// See [`BRPC_IO_THREADS`].
     pub brpc_io_threads: usize,
+    /// See [`ResultPath`].
+    pub(crate) result_path: ResultPath,
 }
 
 impl Tunables {
@@ -485,6 +552,7 @@ impl Tunables {
         exchange_transport: ExchangeTransport::DEFAULT,
         arrow_send_workers: ARROW_SEND_WORKERS.default as usize,
         brpc_io_threads: BRPC_IO_THREADS.default as usize,
+        result_path: ResultPath::DEFAULT,
     };
 
     /// Reads and validates every knob without touching the global.
@@ -512,6 +580,7 @@ impl Tunables {
             exchange_transport: ExchangeTransport::read()?,
             arrow_send_workers: ARROW_SEND_WORKERS.read()? as usize,
             brpc_io_threads: BRPC_IO_THREADS.read()? as usize,
+            result_path: ResultPath::read()?,
         })
     }
 
@@ -552,6 +621,7 @@ impl Tunables {
             exchange_transport = ?published.exchange_transport,
             arrow_send_workers = published.arrow_send_workers,
             brpc_io_threads = published.brpc_io_threads,
+            result_path = ?published.result_path,
             "resolved CN transport tunables"
         );
         Ok(published)
@@ -627,6 +697,7 @@ pub(crate) mod tests {
                 (EXCHANGE_TRANSPORT_NAME, None),
                 (ARROW_SEND_WORKERS.name, None),
                 (BRPC_IO_THREADS.name, None),
+                (RESULT_PATH_NAME, None),
             ],
             Tunables::from_env,
         )
@@ -645,6 +716,45 @@ pub(crate) mod tests {
         assert_eq!(resolved.exchange_transport, ExchangeTransport::Nixl);
         assert_eq!(resolved.arrow_send_workers, 4);
         assert_eq!(resolved.brpc_io_threads, 1);
+        assert_eq!(resolved.result_path, ResultPath::DuckDb);
+    }
+
+    /// The result path knob: unset is `duckdb`; case and whitespace are tolerated; anything else
+    /// fails the whole resolution naming the variable, the value and the accepted set.
+    #[test]
+    fn result_path_parses_duckdb_arrow_and_rejects_others() {
+        assert_eq!(
+            with_env(&[(RESULT_PATH_NAME, None)], ResultPath::read),
+            Ok(ResultPath::DuckDb)
+        );
+        for duckdb in ["duckdb", "DuckDB", " duckdb "] {
+            assert_eq!(
+                with_env(&[(RESULT_PATH_NAME, Some(duckdb))], ResultPath::read),
+                Ok(ResultPath::DuckDb),
+                "{duckdb:?}"
+            );
+        }
+        assert_eq!(
+            with_env(&[(RESULT_PATH_NAME, Some("ARROW"))], ResultPath::read),
+            Ok(ResultPath::Arrow)
+        );
+        for bad in ["off", "cudf", "1"] {
+            let error = with_env(&[(RESULT_PATH_NAME, Some(bad))], ResultPath::read)
+                .expect_err("not an accepted result path");
+            assert!(
+                error.contains(RESULT_PATH_NAME)
+                    && error.contains(bad)
+                    && error.contains("duckdb, arrow"),
+                "{error}"
+            );
+        }
+        let resolved = with_env(&[(RESULT_PATH_NAME, Some("arrow"))], Tunables::from_env)
+            .expect("arrow resolves");
+        assert_eq!(resolved.result_path, ResultPath::Arrow);
+        for path in [ResultPath::DuckDb, ResultPath::Arrow] {
+            assert_eq!(ResultPath::from_code(path.code()), Some(path));
+        }
+        assert_eq!(ResultPath::from_code(2), None);
     }
 
     /// The brpc I/O thread count: unset is 1 (the current-thread runtime), a value in 1..=64 is
