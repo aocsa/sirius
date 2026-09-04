@@ -6,7 +6,7 @@ worked config (`configs/gb200-4gpu/engine-a.env`, or the launcher in
 
 ## How they work
 
-Transport knobs live in one registry, [`src/tunable.rs`](../src/tunable.rs).
+Transport and dispatch knobs live in one registry, [`src/tunable.rs`](../src/tunable.rs).
 They are resolved once at bring-up: a typo or out-of-range value **fails CN
 startup** (it is never clamped or silently ignored). The CN then logs the
 resolved set — that line is what the process actually got, not what the
@@ -14,7 +14,9 @@ launcher echoed.
 
 Unset means the compiled default. Empty string is treated as unset.
 
-Everything else below is read outside that registry and follows its own rules.
+Everything else below is read outside that registry and follows its own rules,
+except where a row says otherwise (`SIRIUS_CN_FRAGMENT_FUSION` is a registry
+knob listed under "Dispatch", next to the dispatch switch it pairs with).
 
 ## Transport (validated registry)
 
