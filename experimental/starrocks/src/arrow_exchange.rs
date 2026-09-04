@@ -11,6 +11,16 @@
 //!
 //! Same-CN exchanges never come here: they stay native relays (or fusions) on the GPU.
 //!
+//! THREADING: a drain is [`prepare`]d on the sender's RPC thread (the peer is dialed there, so a
+//! destination nothing listens on still fails the sender's `exec_plan_fragment`) and then run by
+//! [`send_fragment`] on a drain thread the service spawns, after the RPC has replied. A drain at
+//! SF1000 moves tens of GB and took 59 s inside the RPC in the first end-to-end run, past the
+//! FE's ~60 s per-RPC deadline: the FE cancelled the query mid-drain and retried it, and the
+//! retry's re-planned scan is what ran the receiving CN out of GPU memory. A drain that fails
+//! after the RPC replied fails the sender's query on this CN ([`ServiceCore::fail_fragment`]) and
+//! cancels the receiver at the peer ([`cancel_peer_receiver`]), so the FE's `fetch_data` there
+//! reports the cause instead of waiting for a frame that never comes.
+//!
 //! ORDERING: the receiver fails a query on a `seq` gap per (exchange key, sender ordinal). Every
 //! frame of one destination — the counter and the eos — is issued by the one call of
 //! [`send_fragment`] that drains that destination, so the invariant holds without a dedicated
@@ -18,7 +28,7 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
@@ -28,10 +38,13 @@ use prost::Message;
 use starrocks_thrift::status_code::TStatusCode;
 use tracing::{info, warn};
 
-use crate::fragment_executor::FragmentExecutor;
+use crate::fragment_executor::{FragmentExecutor, FragmentLabel};
 use crate::nixl_transport::RemoteSendSpec;
 use crate::proto::starrocks::p_internal_service_brpc::methods;
-use crate::proto::starrocks::{PTransmitPackedParams, PTransmitPackedResult, PUniqueId, StatusPb};
+use crate::proto::starrocks::{
+    PCancelPlanFragmentRequest, PCancelPlanFragmentResult, PPlanFragmentCancelReason,
+    PTransmitPackedParams, PTransmitPackedResult, PUniqueId, StatusPb,
+};
 use crate::prpc_client::PrpcClient;
 
 /// Upper bound on the Arrow buffer bytes one `transmit_packed` attachment carries. The PRPC
@@ -39,6 +52,31 @@ use crate::prpc_client::PrpcClient;
 /// chunk must sit well under it with room for IPC framing and the variable-width slack of an
 /// estimate by rows.
 pub(crate) const MAX_CHUNK_BYTES: usize = 64 << 20;
+
+/// One remote Arrow drain, dialed and ready to run: the parked output stream `spec.slot` names,
+/// shipped to `spec.host:spec.brpc_port`. Built by [`prepare`] on the sender's RPC thread and
+/// consumed by [`send_fragment`] on a drain thread.
+#[derive(Debug)]
+pub(crate) struct ArrowDrain {
+    /// Where the output goes and which parked stream it is.
+    pub(crate) spec: RemoteSendSpec,
+    /// The sender fragment this drain belongs to, for failure attribution and the peer cancel.
+    pub(crate) label: FragmentLabel,
+    /// The connection to the peer, dialed by [`prepare`].
+    client: PrpcClient,
+}
+
+/// Dials the destination of `spec` so a peer nothing listens on fails here, on the caller's
+/// thread, exactly as it did when the whole drain ran inside the RPC. Nothing is exported yet.
+pub(crate) fn prepare(spec: RemoteSendSpec, label: FragmentLabel) -> Result<ArrowDrain, String> {
+    let mut client = PrpcClient::new(&spec.host, spec.brpc_port);
+    client.connect()?;
+    Ok(ArrowDrain {
+        spec,
+        label,
+        client,
+    })
+}
 
 /// Slices `batch` into row ranges whose estimated buffer bytes stay at or under `max_bytes`,
 /// preserving row order; one chunk when it already fits. The estimate is
@@ -128,15 +166,84 @@ fn rpc_transmit(
     check_status("transmit_packed", &result.status)
 }
 
+/// Cancels the receiver `spec.slot` feeds at the peer, with `error` as the cause, so the FE's
+/// `fetch_data` on that CN reports the sender's failure instead of polling until its query
+/// timeout. Best-effort: the peer may already be gone, and the sender's own query-level failure
+/// (`fail_fragment`) is recorded regardless.
+pub(crate) fn cancel_peer_receiver(spec: &RemoteSendSpec, label: &FragmentLabel, error: &str) {
+    let (hi, lo) = spec.slot.fragment_instance_id.as_halves();
+    let request = PCancelPlanFragmentRequest {
+        finst_id: PUniqueId { hi, lo },
+        cancel_reason: Some(PPlanFragmentCancelReason::InternalError as i32),
+        is_pipeline: None,
+        query_id: label.query_id.map(|query_id| {
+            let (hi, lo) = query_id.as_halves();
+            PUniqueId { hi, lo }
+        }),
+        error_message: Some(format!(
+            "remote Arrow sender {} failed while transmitting into exchange {}: {error}",
+            label.log_ids().1,
+            spec.slot.node_id
+        )),
+    };
+    let mut client = PrpcClient::new(&spec.host, spec.brpc_port);
+    let outcome = client
+        .call(
+            methods::CANCEL_PLAN_FRAGMENT,
+            request.encode_to_vec(),
+            Vec::new(),
+        )
+        .and_then(|response| {
+            PCancelPlanFragmentResult::decode(response.body.as_slice())
+                .map_err(|err| format!("undecodable cancel_plan_fragment reply: {err}"))
+        })
+        .and_then(|result| check_status("cancel_plan_fragment", &result.status));
+    match outcome {
+        Ok(()) => info!(
+            receiver_fragment_instance_id = %spec.slot.fragment_instance_id,
+            stream_id = spec.slot.node_id,
+            dest = %client.peer(),
+            "cancelled the receiver of a failed Arrow drain at the peer"
+        ),
+        Err(err) => warn!(
+            receiver_fragment_instance_id = %spec.slot.fragment_instance_id,
+            stream_id = spec.slot.node_id,
+            dest = %client.peer(),
+            error = %err,
+            "could not cancel the receiver of a failed Arrow drain at the peer"
+        ),
+    }
+}
+
+/// What one drain moved, for the `transmitted batches via arrow` line.
+#[derive(Debug, Default)]
+struct DrainStats {
+    /// Frames sent (chunks of parked batches).
+    batches: u64,
+    /// IPC bytes sent, the total the receiver's `received remote batches via arrow` counts.
+    bytes: u64,
+    /// Time inside `export_arrow_next` (the engine's D2H copy, serialized on the engine thread).
+    export: Duration,
+    /// Time encoding chunks as Arrow IPC.
+    encode: Duration,
+    /// Time inside `transmit_packed` round trips (write, the peer's decode, the reply).
+    send: Duration,
+}
+
 /// Sender flow: drain one parked output to a remote receiver as Arrow IPC frames and drop the
 /// parked output. Blocks until every chunk and the eos frame have been acknowledged; on a failed
-/// send the parked output is still dropped (best-effort), so a dead query does not pin it.
+/// send the parked output is still dropped (best-effort), so a dead query does not pin it, and
+/// the receiver is cancelled at the peer.
 pub(crate) fn send_fragment(
     executor: &dyn FragmentExecutor,
-    spec: &RemoteSendSpec,
+    drain: ArrowDrain,
 ) -> Result<(), String> {
+    let ArrowDrain {
+        spec,
+        label,
+        mut client,
+    } = drain;
     let started = Instant::now();
-    let mut client = PrpcClient::new(&spec.host, spec.brpc_port);
     let (hi, lo) = spec.slot.fragment_instance_id.as_halves();
     let finst_id = PUniqueId { hi, lo };
     let frame = |eos: bool, seq: i64, rows: Option<u64>| PTransmitPackedParams {
@@ -154,27 +261,38 @@ pub(crate) fn send_fragment(
         arrow_ipc: Some(true),
     };
     let mut seq: i64 = 0;
-    let mut batches: u64 = 0;
-    let mut bytes: u64 = 0;
+    let mut stats = DrainStats::default();
 
     let sent = (|| -> Result<(), String> {
-        while let Some(batch) = executor.export_arrow_next(spec.slot)? {
+        loop {
+            let exporting = Instant::now();
+            let Some(batch) = executor.export_arrow_next(spec.slot)? else {
+                break;
+            };
+            stats.export += exporting.elapsed();
             let named = with_names(&batch, &spec.names)?;
             for chunk in chunk_by_rows(&named, MAX_CHUNK_BYTES) {
+                let encoding = Instant::now();
                 let payload = encode_ipc(&chunk)?;
-                bytes += payload.len() as u64;
+                stats.encode += encoding.elapsed();
+                stats.bytes += payload.len() as u64;
+                let sending = Instant::now();
                 rpc_transmit(
                     &mut client,
                     frame(false, seq, Some(chunk.num_rows() as u64)),
                     payload,
                 )?;
+                stats.send += sending.elapsed();
                 seq += 1;
-                batches += 1;
+                stats.batches += 1;
             }
         }
-        rpc_transmit(&mut client, frame(true, seq, None), Vec::new())
+        let sending = Instant::now();
+        rpc_transmit(&mut client, frame(true, seq, None), Vec::new())?;
+        stats.send += sending.elapsed();
+        Ok(())
     })();
-    if sent.is_err() {
+    if let Err(err) = &sent {
         // Best-effort GPU cleanup, as the nixl tier does: without it a failed transmit pins the
         // parked output for the process lifetime. A slot already retired with its query is Ok.
         if let Err(drop_err) = executor.drop_parked(spec.slot) {
@@ -184,16 +302,23 @@ pub(crate) fn send_fragment(
                 "failed to drop the parked output of a failed remote Arrow transmit"
             );
         }
+        cancel_peer_receiver(&spec, &label, err);
     }
     sent?;
     executor.drop_parked(spec.slot)?;
+    let (query_id, fragment_instance_id) = label.log_ids();
     info!(
+        %query_id,
+        %fragment_instance_id,
         stream_id = spec.slot.node_id,
         sender_id = spec.slot.sender_id,
         dest = %client.peer(),
-        batches,
-        bytes,
+        batches = stats.batches,
+        bytes = stats.bytes,
         elapsed_ms = started.elapsed().as_millis() as u64,
+        export_ms = stats.export.as_millis() as u64,
+        encode_ms = stats.encode.as_millis() as u64,
+        send_ms = stats.send.as_millis() as u64,
         "transmitted batches via arrow"
     );
     Ok(())

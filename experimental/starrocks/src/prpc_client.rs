@@ -63,6 +63,18 @@ impl PrpcClient {
         &self.peer
     }
 
+    /// Dials the peer now instead of on the first call, so a destination nothing listens on
+    /// fails where the caller can still report it (inside the sender's RPC) rather than later
+    /// on a drain worker whose failure only reaches the FE through the query's result path.
+    pub(crate) fn connect(&mut self) -> Result<(), String> {
+        match self.stream() {
+            Ok(_) => Ok(()),
+            Err(CallError::Transport(err)) | Err(CallError::Rpc(err)) => {
+                Err(format!("connect to {}: {err}", self.peer))
+            }
+        }
+    }
+
     /// Sends one framed `PInternalService` request and returns the peer's response body and
     /// attachment. A transport failure on a previously-used connection is retried once over a
     /// fresh connection — the peer may simply have closed an idle socket; a duplicate delivery

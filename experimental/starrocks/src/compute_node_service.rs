@@ -102,19 +102,29 @@ enum DestinationRoute {
     Remote { host: String, brpc_port: u16 },
 }
 
-/// What processing one fragment produced: the receivers whose sender sets it completed. The
-/// caller decides where they execute — RPC handlers hand them to the dispatch worker, the worker
-/// itself runs them inline.
+/// What processing one fragment produced: the receivers whose sender sets it completed, and the
+/// remote Arrow drains it still owes. The caller decides where they execute — RPC handlers hand
+/// the receivers to the dispatch worker and the drains to a drain thread, the worker itself runs
+/// the drains and then the receivers inline.
 #[must_use]
 #[derive(Debug, Default)]
 struct FragmentOutcome {
     ready: Vec<ReadyFragment>,
+    /// Remote destinations of an Arrow-mode sender, dialed but not yet drained. Empty for every
+    /// other fragment (a nixl-mode sender drains inside `execute_fragment_with_inputs`).
+    drains: Vec<arrow_exchange::ArrowDrain>,
+    /// The fragment that produced this outcome, for attributing a drain failure to its query.
+    label: FragmentLabel,
 }
 
 impl FragmentOutcome {
-    /// A fragment that readied `ready` receivers.
+    /// A fragment that readied `ready` receivers and owes no drain.
     fn from_ready(ready: Vec<ReadyFragment>) -> Self {
-        Self { ready }
+        Self {
+            ready,
+            drains: Vec::new(),
+            label: FragmentLabel::default(),
+        }
     }
 }
 
@@ -255,11 +265,58 @@ impl SiriusComputeNodeService {
 
     /// Hands every receiver this fragment readied to the dispatch worker, so the RPC that
     /// completed their sender sets returns without waiting on their execution.
+    ///
+    /// A sender with remote Arrow drains still owing replies now too: its drains run on a drain
+    /// thread ([`finish_arrow_drains`](Self::finish_arrow_drains)), which hands the readied
+    /// receivers on once every drain has completed — the order the inline drain kept, so a local
+    /// receiver of this sender never competes with the drain's exports for the engine thread.
+    /// The FE's per-RPC deadline (~60 s) is what forbids draining inside the RPC: the first
+    /// SF1000 Arrow run held one `exec_plan_fragment` open for 59 s, the FE cancelled and retried
+    /// the query, and the retry ran a CN out of GPU memory.
     fn dispatch_ready(&self, outcome: FragmentOutcome) -> std::result::Result<(), String> {
-        for ready in outcome.ready {
-            self.dispatch(ready)?;
+        if outcome.drains.is_empty() {
+            for ready in outcome.ready {
+                self.dispatch(ready)?;
+            }
+            return Ok(());
         }
+        let service = self.clone();
+        std::thread::Builder::new()
+            .name("arrow-drain".to_string())
+            .spawn(move || service.finish_arrow_drains(outcome))
+            .map_err(|err| format!("failed to spawn the Arrow drain thread: {err}"))?;
         Ok(())
+    }
+
+    /// The drain thread's body: runs the sender's remote Arrow drains, records a failure at
+    /// query level exactly as the inline path did through the RPC status (`fail_fragment`: the
+    /// query's result instances on this CN report it, its later fragments are refused, its
+    /// parked output is retired; `send_fragment` itself cancelled the receiver at the peer), then
+    /// hands the readied receivers to the dispatch worker. After a failure they are still handed
+    /// on: gate 3 in `run_ready_fragment` skips them and returns their staged leases.
+    fn finish_arrow_drains(self, outcome: FragmentOutcome) {
+        let FragmentOutcome {
+            ready,
+            drains,
+            label,
+        } = outcome;
+        if let Err(error) = self.core.run_arrow_drains(drains) {
+            let (query_id, fragment_instance_id) = label.log_ids();
+            tracing::error!(
+                %query_id,
+                %fragment_instance_id,
+                %error,
+                "remote Arrow drain failed after the sender's exec_plan_fragment replied; failing the query on this CN"
+            );
+            if let (Some(id), Some(query_id)) = (label.fragment_instance_id, label.query_id) {
+                self.core.fail_fragment(id, query_id, error);
+            }
+        }
+        for ready in ready {
+            if let Err(error) = self.dispatch(ready) {
+                tracing::error!(%error, "could not dispatch a receiver readied by a drained sender");
+            }
+        }
     }
 }
 
@@ -846,44 +903,87 @@ impl ServiceCore {
             return Vec::new();
         }
         let is_result_fragment = matches!(Self::is_mysql_result_sink(&ready.params), Ok(true));
-        match self.execute_ready_fragment(ready) {
-            Ok(outcome) => outcome.ready,
-            Err(error) => {
-                match (id, query_id) {
-                    (Some(id), Some(query_id)) => {
-                        if is_result_fragment {
-                            // The FE polls fetch_data on this id; its reserved entry becomes
-                            // the error instead of waiting forever.
-                            tracing::error!(fragment_instance_id = %id, error = %error, "dispatched result fragment failed");
-                        } else {
-                            // An intermediate receiver has no FE-polled entry of its own, so
-                            // its failure must reach the query's result-fragment instances —
-                            // otherwise the FE polls until its timeout and the stalled
-                            // fetch_data wedges this CN's whole frame loop.
-                            tracing::error!(
-                                fragment_instance_id = %id,
-                                error = %error,
-                                "dispatched intermediate receiver fragment failed; failing the query's result fragments"
-                            );
-                        }
-                        // Fails this id, every reserved result instance of the query, records
-                        // the failure so a later fragment of the query is refused, and retires
-                        // the query's parked output on the executor.
-                        self.fail_fragment(id, query_id, error);
-                    }
-                    (Some(id), None) => {
-                        // Defensive: exec params carry both ids or neither, so this arm should
-                        // be unreachable. Park the error under the instance id at least.
-                        tracing::error!(fragment_instance_id = %id, error = %error, "dispatched receiver fragment without a query_id failed");
-                        self.results.fail(id, error);
-                    }
-                    (None, _) => {
-                        tracing::error!(error = %error, "dispatched receiver fragment without a fragment_instance_id failed");
-                    }
+        // A middle fragment's remote Arrow drains are joined here, on the worker: it is off the
+        // RPC path already, and it is the thread that would run the readied receivers, so
+        // deferring the join would buy no overlap and would only move a drain failure away from
+        // where a fragment failure is attributed to its query.
+        let error = match self.execute_ready_fragment(ready) {
+            Ok(FragmentOutcome { ready, drains, .. }) => match self.run_arrow_drains(drains) {
+                Ok(()) => return ready,
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        match (id, query_id) {
+            (Some(id), Some(query_id)) => {
+                if is_result_fragment {
+                    // The FE polls fetch_data on this id; its reserved entry becomes
+                    // the error instead of waiting forever.
+                    tracing::error!(fragment_instance_id = %id, error = %error, "dispatched result fragment failed");
+                } else {
+                    // An intermediate receiver has no FE-polled entry of its own, so
+                    // its failure must reach the query's result-fragment instances —
+                    // otherwise the FE polls until its timeout and the stalled
+                    // fetch_data wedges this CN's whole frame loop.
+                    tracing::error!(
+                        fragment_instance_id = %id,
+                        error = %error,
+                        "dispatched intermediate receiver fragment failed; failing the query's result fragments"
+                    );
                 }
-                Vec::new()
+                // Fails this id, every reserved result instance of the query, records
+                // the failure so a later fragment of the query is refused, and retires
+                // the query's parked output on the executor.
+                self.fail_fragment(id, query_id, error);
+            }
+            (Some(id), None) => {
+                // Defensive: exec params carry both ids or neither, so this arm should
+                // be unreachable. Park the error under the instance id at least.
+                tracing::error!(fragment_instance_id = %id, error = %error, "dispatched receiver fragment without a query_id failed");
+                self.results.fail(id, error);
+            }
+            (None, _) => {
+                tracing::error!(error = %error, "dispatched receiver fragment without a fragment_instance_id failed");
             }
         }
+        Vec::new()
+    }
+
+    /// Runs every prepared remote Arrow drain of one sender concurrently (one thread per
+    /// destination, each with its own connection) and joins them; the first failure wins. A
+    /// failed drain has already dropped its parked output and cancelled its receiver at the peer
+    /// (`arrow_exchange::send_fragment`); the destinations after it keep draining, since each
+    /// owns its own claim on the parked output.
+    fn run_arrow_drains(
+        &self,
+        drains: Vec<arrow_exchange::ArrowDrain>,
+    ) -> std::result::Result<(), String> {
+        if drains.is_empty() {
+            return Ok(());
+        }
+        let workers: Vec<_> = drains
+            .into_iter()
+            .map(|drain| {
+                let executor = Arc::clone(&self.executor);
+                std::thread::Builder::new()
+                    .name("arrow-drain".to_string())
+                    .spawn(move || arrow_exchange::send_fragment(executor.as_ref(), drain))
+                    .map_err(|err| format!("failed to spawn an Arrow drain thread: {err}"))
+            })
+            .collect();
+        let mut first_error = None;
+        for worker in workers {
+            let outcome = match worker {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err("an Arrow drain thread panicked".to_string())),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = outcome {
+                first_error.get_or_insert(err);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Records a fragment failure at query level and retires the query's parked output on the
@@ -1408,17 +1508,20 @@ impl ServiceCore {
                 ready_receivers.extend(ready);
             }
         }
-        // Remote destinations second, drained one at a time in the FE's destination order. Each
-        // `send_fragment` blocks until this destination's parked stream has been exported,
+        // Remote destinations second, in the FE's destination order. Over nixl each
+        // `send_fragment` blocks here until this destination's parked stream has been exported,
         // every batch and the eos have been signaled over brpc, and the destination's claim on
         // the parked output released (dropped on failure, so a dead query does not pin its
-        // output). Over nixl that is the transport thread exporting into staging leases and
-        // WRITING each batch into a lease the peer granted; over Arrow it is this thread
-        // exporting host Arrow batches and shipping them as IPC attachments. Either way the seq
-        // counter and the eos frame live inside that one drain, which is what the receiver's
-        // per-(exchange, sender) gap check relies on. A failure fails the sender's RPC — the FE
-        // sees the error, never a receiver that waits forever — and the destinations after it
-        // are not drained; their claims go with the engine's next wipe.
+        // output): the transport thread exports into staging leases and WRITES each batch into
+        // a lease the peer granted, in about a second. Over Arrow the drain moves the rows
+        // themselves through host memory and takes tens of seconds at SF1000, so only the dial
+        // happens here (a destination nothing listens on still fails this RPC); the drain itself
+        // is handed back in the outcome and runs on a drain thread after the RPC replied. Either
+        // way the seq counter and the eos frame live inside one drain, which is what the
+        // receiver's per-(exchange, sender) gap check relies on. A failure here fails the
+        // sender's RPC — the FE sees the error, never a receiver that waits forever — and the
+        // destinations after it are not drained; their claims go with the engine's next wipe.
+        let mut drains = Vec::new();
         for (slot, route) in slots.iter().zip(&routes) {
             if let DestinationRoute::Remote { host, brpc_port } = route {
                 let spec = RemoteSendSpec {
@@ -1433,12 +1536,31 @@ impl ServiceCore {
                         transport.send_fragment(spec)?;
                     }
                     ExchangeTransport::Arrow => {
-                        arrow_exchange::send_fragment(self.executor.as_ref(), &spec)?;
+                        match arrow_exchange::prepare(spec, Self::fragment_label(params)) {
+                            Ok(drain) => drains.push(drain),
+                            Err(err) => {
+                                // The dial failed before anything was exported: release this
+                                // destination's claim as a failed drain would have, so the
+                                // parked output is not pinned by a dead query.
+                                if let Err(drop_err) = self.executor.drop_parked(*slot) {
+                                    tracing::warn!(
+                                        slot = ?slot,
+                                        error = %drop_err,
+                                        "failed to drop the parked output of an undialable Arrow destination"
+                                    );
+                                }
+                                return Err(err);
+                            }
+                        }
                     }
                 }
             }
         }
-        Ok(FragmentOutcome::from_ready(ready_receivers))
+        Ok(FragmentOutcome {
+            ready: ready_receivers,
+            drains,
+            label: Self::fragment_label(params),
+        })
     }
 
     /// Classifies a data-stream sink destination against this CN's advertised exchange
@@ -3251,11 +3373,16 @@ pub(crate) mod tests {
 
     /// A sender-side executor for the Arrow tier without a GPU: a sender run parks two Arrow
     /// batches per output slot (one int64 column per plan output name; rows 1..=3, then 4..=5),
-    /// which `export_arrow_next` drains in order and `drop_parked` releases exactly once.
+    /// which `export_arrow_next` drains in order and `drop_parked` releases exactly once. With
+    /// `export_gate` set, the first export blocks until the gate fires (a slow drain); with
+    /// `fail_export_at` set, that export (0-based, counted across slots) fails instead.
     #[derive(Debug, Default)]
     struct ArrowParkingExecutor {
         parked: Mutex<HashMap<SenderSlot, std::collections::VecDeque<arrow_array::RecordBatch>>>,
         dropped: Mutex<Vec<SenderSlot>>,
+        export_gate: Mutex<Option<mpsc::Receiver<()>>>,
+        fail_export_at: Option<usize>,
+        exports: AtomicUsize,
     }
 
     /// The batches `ArrowParkingExecutor` parks for a plan with these output names, in order.
@@ -3292,6 +3419,16 @@ pub(crate) mod tests {
             &self,
             slot: SenderSlot,
         ) -> Result<Option<arrow_array::RecordBatch>, String> {
+            let gate = self.export_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                // Bounded wait so a regression fails the test instead of hanging the suite.
+                gate.recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|err| format!("gated Arrow export was never released: {err}"))?;
+            }
+            let export = self.exports.fetch_add(1, Ordering::SeqCst);
+            if self.fail_export_at == Some(export) {
+                return Err(format!("export {export} exploded on the GPU"));
+            }
             let mut parked = self.parked.lock().unwrap();
             let queue = parked
                 .get_mut(&slot)
@@ -3308,6 +3445,194 @@ pub(crate) mod tests {
             self.dropped.lock().unwrap().push(slot);
             Ok(())
         }
+    }
+
+    /// A sender fragment of `query_id` (instance `sender_id`) whose one destination is exchange
+    /// node 7 of `receiver_id` on the peer at loopback `port`.
+    fn arrow_sender_to_peer(
+        query_id: &TUniqueId,
+        sender_id: &TUniqueId,
+        receiver_id: &TUniqueId,
+        port: u16,
+    ) -> TExecPlanFragmentParams {
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(query_id.clone(), sender_id.clone());
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![remote_destination(
+            receiver_id.clone(),
+            i32::from(port),
+        )]);
+        sender.params = Some(sender_exec);
+        sender
+    }
+
+    /// A peer CN on a loopback listener with a result-sink receiver of `query_id` registered at
+    /// exchange node 7, expecting one sender. Returns the peer service, its port and the guard.
+    fn peer_with_registered_receiver(
+        query_id: &TUniqueId,
+        receiver_id: &TUniqueId,
+        peer_executor: Arc<dyn FragmentExecutor>,
+    ) -> Option<(SiriusComputeNodeService, u16, PeerGuard)> {
+        let peer_listener = match crate::BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
+            Err(_) => return None, // sandbox denies binding; the brpc tests skip alike
+        };
+        let peer_port = peer_listener.local_addr().unwrap().port();
+        drop(peer_listener);
+        let peer = SiriusComputeNodeService::with_executor(
+            peer_executor,
+            ExchangeIdentity::new("127.0.0.1", peer_port),
+        );
+        let (port, guard) = serve_peer(peer.clone())?;
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&peer, &receiver);
+        Some((peer, port, guard))
+    }
+
+    /// The fix for the first SF1000 Arrow run: a sender whose Arrow drain is slow must reply to
+    /// its `exec_plan_fragment` as soon as the fragment has run and the drain is queued, not
+    /// after the drain (59 s there, past the FE's ~60 s per-RPC deadline, which cancelled and
+    /// retried the query). The gate holds the first export; the RPC returns while it is held,
+    /// nothing has been exported, and the parked output is still there. Released, the drain
+    /// completes on its own thread: the peer's receiver runs over the rows, the parked output is
+    /// dropped exactly once, and the per-stream `transmitted batches via arrow` line carries the
+    /// drain duration and its export/encode/send split.
+    #[test]
+    fn a_slow_arrow_drain_does_not_hold_the_exec_plan_fragment_reply() {
+        capture_logs();
+        let query_id = TUniqueId::new(68, 1);
+        let receiver_id = TUniqueId::new(68, 2);
+        let peer_executor = Arc::new(RecordingExecutor::default());
+        let Some((peer, port, _peer_guard)) =
+            peer_with_registered_receiver(&query_id, &receiver_id, peer_executor.clone())
+        else {
+            return;
+        };
+
+        let (release, gate) = mpsc::channel();
+        let executor = Arc::new(ArrowParkingExecutor {
+            export_gate: Mutex::new(Some(gate)),
+            ..ArrowParkingExecutor::default()
+        });
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_exchange_transport(ExchangeTransport::Arrow);
+        let sender = arrow_sender_to_peer(&query_id, &TUniqueId::new(68, 3), &receiver_id, port);
+        let replied_after = {
+            let started = std::time::Instant::now();
+            assert_exec_ok(&service, &sender);
+            started.elapsed()
+        };
+
+        // The RPC replied while the drain is still held at its first export.
+        assert_eq!(executor.exports.load(Ordering::SeqCst), 0);
+        assert!(executor.dropped.lock().unwrap().is_empty());
+        assert_eq!(executor.parked.lock().unwrap().len(), 1);
+        assert!(
+            replied_after < std::time::Duration::from_secs(5),
+            "the sender RPC waited on the drain: {replied_after:?}"
+        );
+
+        release.send(()).unwrap();
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from(&receiver_id),
+            node_id: 7,
+            sender_id: 0,
+        };
+        wait_until("the drain to drop the parked output", || {
+            executor.dropped.lock().unwrap().as_slice() == [slot]
+        });
+        let fetched = fetch_rows_eventually(&peer, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        assert_eq!(peer_executor.remote_inputs.lock().unwrap().len(), 1);
+        wait_until("the drain line", || {
+            logged(
+                &query_id,
+                &[
+                    "transmitted batches via arrow",
+                    "stream_id=7",
+                    "sender_id=0",
+                    &format!("dest=127.0.0.1:{port}"),
+                    "batches=2",
+                    "bytes=",
+                    "elapsed_ms=",
+                    "export_ms=",
+                    "encode_ms=",
+                    "send_ms=",
+                ],
+            )
+        });
+    }
+
+    /// A drain that fails after the sender's RPC replied: the failure is recorded at query
+    /// level on the sender's CN (its later fragments are refused, its result instances report
+    /// the cause), the parked output is dropped exactly once, and the receiver is cancelled at
+    /// the peer, so the FE's `fetch_data` there reports the sender's error instead of waiting
+    /// for an eos that never comes.
+    #[test]
+    fn an_arrow_drain_failure_after_the_reply_fails_the_query_here_and_at_the_peer() {
+        let query_id = TUniqueId::new(69, 1);
+        let receiver_id = TUniqueId::new(69, 2);
+        let peer_executor = Arc::new(RecordingExecutor::default());
+        let Some((peer, port, _peer_guard)) =
+            peer_with_registered_receiver(&query_id, &receiver_id, peer_executor.clone())
+        else {
+            return;
+        };
+
+        let executor = Arc::new(ArrowParkingExecutor {
+            fail_export_at: Some(1),
+            ..ArrowParkingExecutor::default()
+        });
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_exchange_transport(ExchangeTransport::Arrow);
+        let sender = arrow_sender_to_peer(&query_id, &TUniqueId::new(69, 3), &receiver_id, port);
+        // The dial succeeded and the fragment ran, so the RPC is OK; the drain fails later.
+        assert_exec_ok(&service, &sender);
+
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from(&receiver_id),
+            node_id: 7,
+            sender_id: 0,
+        };
+        wait_until("the failed drain to drop the parked output", || {
+            executor.dropped.lock().unwrap().as_slice() == [slot]
+        });
+        let query = FragmentInstanceId::from(&query_id);
+        wait_until("the sender's query to fail on its CN", || {
+            service.core.results.failure_of(query).is_some()
+        });
+        assert!(
+            service
+                .core
+                .results
+                .failure_of(query)
+                .unwrap()
+                .contains("export 1 exploded"),
+            "{:?}",
+            service.core.results.failure_of(query)
+        );
+        // The peer's receiver was cancelled with the cause; its FE-polled entry reports it.
+        wait_until("the peer to retire the receiver", || {
+            peer.core
+                .exchanges
+                .is_retired(FragmentInstanceId::from(&receiver_id))
+        });
+        let failed = fetch_error_eventually(&peer, receiver_id.hi, receiver_id.lo);
+        assert!(
+            failed.status.error_msgs[0].contains("remote Arrow sender")
+                && failed.status.error_msgs[0].contains("export 1 exploded"),
+            "{:?}",
+            failed.status.error_msgs
+        );
+        assert!(
+            peer_executor.remote_inputs.lock().unwrap().is_empty(),
+            "the cancelled receiver never ran"
+        );
     }
 
     /// Serves `service` as a peer CN on a loopback port; returns the port and a guard that stops
@@ -3411,13 +3736,16 @@ pub(crate) mod tests {
         sender.params = Some(sender_exec);
         assert_exec_ok(&service, &sender);
 
-        // A dropped its parked output exactly once, after the drain.
+        // A dropped its parked output exactly once, after the drain (which runs on its own
+        // thread now, so the RPC reply no longer implies the drain has finished).
         let slot = SenderSlot {
             fragment_instance_id: FragmentInstanceId::from(&receiver_id),
             node_id: 7,
             sender_id: 0,
         };
-        assert_eq!(executor.dropped.lock().unwrap().as_slice(), &[slot]);
+        wait_until("the drain to drop the parked output", || {
+            executor.dropped.lock().unwrap().as_slice() == [slot]
+        });
         assert!(executor.parked.lock().unwrap().is_empty());
 
         // B ran its receiver over the decoded batches, staged lease-free, in parked order.
