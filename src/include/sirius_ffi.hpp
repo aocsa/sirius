@@ -234,6 +234,12 @@ class SIRIUS_FFI_EXPORT InboundStore {
   /// pool); 0 when credits are disabled.
   std::uint64_t credit_budget() const;
 
+  /// Test hook: asks the GPU space's downgrade executor to spill every idle candidate it can
+  /// find -- staged frames first -- and returns the bytes it moved. What production does under
+  /// pressure, on demand.
+  /// @throws when the context has no downgrade executor.
+  std::uint64_t spill_staged_for_testing() const;
+
  private:
   std::shared_ptr<State> state_;
   friend class Fragment;

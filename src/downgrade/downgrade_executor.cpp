@@ -141,6 +141,12 @@ void downgrade_executor::drain()
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 
+void downgrade_executor::add_candidate_source(candidate_source source)
+{
+  std::lock_guard<std::mutex> lock(_sources_mutex);
+  _candidate_sources.push_back(std::move(source));
+}
+
 void downgrade_executor::processing_loop()
 {
   while (_running.load()) {
@@ -220,7 +226,88 @@ void downgrade_executor::processing_loop()
     // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
     // sweep, so a query ending concurrently cannot pull one out from under this loop.
     bool pool_interrupted = false;
-    auto const managers   = _data_repo_registry.get_all();
+    // Dispatches every candidate a provider offers; returns false once the worker pool refused a
+    // slot (interrupted) so the callers stop walking sources.
+    auto dispatch_candidates = [&](sirius::convertible_data_provider& provider,
+                                   source_stats& stats) -> bool {
+      auto candidates = provider.get_all_convertible(
+        source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
+      for (auto& candidate : candidates) {
+        if (req->satisfied.load()) break;
+
+        auto candidate_bytes = candidate->bytes_in_space(source_space);
+
+        auto slot = _pool->reserve();
+        if (!slot) {
+          pool_interrupted = true;
+          return false;
+        }
+
+        // Re-check after reserve() returns -- the previous candidate's worker may
+        // have set satisfied while we were blocked waiting for a thread slot.
+        if (req->satisfied.load()) break;
+
+        auto exc_stream = _stream_pool->acquire_stream(
+          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+
+        _pool->dispatch(
+          std::move(slot),
+          [cand       = std::move(candidate),
+           req_ptr    = req.get(),
+           &res_mgr   = _reservation_manager,
+           &targets   = target_spaces,
+           exc_stream = std::move(exc_stream),
+           candidate_bytes,
+           host_end_idx,
+           &stats,
+           &host_target_stats,
+           &disk_target_stats]() mutable {
+            try {
+              auto result = cand->convert(targets, exc_stream, res_mgr, false);
+              if (result) {
+                req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                stats.batches.fetch_add(1, std::memory_order_relaxed);
+                stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                for (size_t i = 0; i < result->size(); ++i) {
+                  if ((*result)[i] == 0) continue;
+                  if (i < host_end_idx) {
+                    host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                    host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                  } else {
+                    disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                    disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                  }
+                }
+                if (req_ptr->predicate && req_ptr->predicate()) {
+                  req_ptr->satisfied.store(true);
+                }
+              }
+            } catch (const std::exception& e) {
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
+            }
+          });
+      }
+      return true;
+    };
+
+    // === TIER 0: external candidate sources (the exchange ingress store) ===
+    // Inbound frames staged for a receiver that has not started yet are the cheapest victims:
+    // nobody reads them until the receiver runs (the consuming operator reloads a host-resident
+    // batch through lock_or_prepare_batch), so they go before any query's own repositories.
+    std::vector<candidate_source> sources;
+    {
+      std::lock_guard<std::mutex> lock(_sources_mutex);
+      sources = _candidate_sources;
+    }
+    for (auto const& source : sources) {
+      if (req->satisfied.load() || pool_interrupted) break;
+      auto provider = source();
+      if (provider == nullptr) continue;
+      if (!dispatch_candidates(*provider, repo_stats)) break;
+    }
+
+    auto const managers = _data_repo_registry.get_all();
     for (auto const& manager : std::views::reverse(managers)) {
       if (req->satisfied.load() || pool_interrupted) break;
       auto repos = manager->get_repositories();
@@ -228,65 +315,7 @@ void downgrade_executor::processing_loop()
         if (req->satisfied.load()) break;
 
         convertible_data_batch_provider provider(repo);
-        auto candidates = provider.get_all_convertible(
-          source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
-        for (auto& candidate : candidates) {
-          if (req->satisfied.load()) break;
-
-          auto candidate_bytes = candidate->bytes_in_space(source_space);
-
-          auto slot = _pool->reserve();
-          if (!slot) {
-            pool_interrupted = true;
-            break;
-          }
-
-          // Re-check after reserve() returns -- the previous candidate's worker may
-          // have set satisfied while we were blocked waiting for a thread slot.
-          if (req->satisfied.load()) break;
-
-          auto exc_stream = _stream_pool->acquire_stream(
-            cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-
-          _pool->dispatch(
-            std::move(slot),
-            [cand       = std::move(candidate),
-             req_ptr    = req.get(),
-             &res_mgr   = _reservation_manager,
-             &targets   = target_spaces,
-             exc_stream = std::move(exc_stream),
-             candidate_bytes,
-             host_end_idx,
-             &repo_stats,
-             &host_target_stats,
-             &disk_target_stats]() mutable {
-              try {
-                auto result = cand->convert(targets, exc_stream, res_mgr, false);
-                if (result) {
-                  req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                  req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
-                  repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                  repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                  for (size_t i = 0; i < result->size(); ++i) {
-                    if ((*result)[i] == 0) continue;
-                    if (i < host_end_idx) {
-                      host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                      host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                    } else {
-                      disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                      disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                    }
-                  }
-                  if (req_ptr->predicate && req_ptr->predicate()) {
-                    req_ptr->satisfied.store(true);
-                  }
-                }
-              } catch (const std::exception& e) {
-                SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
-              }
-            });
-        }
-        if (pool_interrupted) break;
+        if (!dispatch_candidates(provider, repo_stats)) break;
       }
     }
 

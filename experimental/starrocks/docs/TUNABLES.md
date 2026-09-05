@@ -59,10 +59,13 @@ naming the receiver's reason. Before credits the copy was an unreserved allocati
 RPC thread, and a receiver whose running fragments held the pool failed the query with
 `failed to stage a ... byte inbound frame: out_of_memory` (q05/q18 at 2 CNs, 84 GiB pool).
 A staged frame keeps its credit until the receiver takes it or it is dropped; a lease released
-without a stage (canary, retired receiver, failed transfer) returns its credit. The budget is
-a bound on inbound bytes held at once, not a guarantee of progress: a receiver whose whole
-input exceeds the budget still needs spill (path 03) to converge, and hits the wait timeout
-instead of an OOM until then.
+without a stage (canary, retired receiver, failed transfer) returns its credit. Staged frames are
+also the first spill candidates of the GPU space's downgrade executor: under pressure (a pipeline
+task's or a credit's reservation falling short) idle staged frames move to host, the receiver
+later reloads them batch by batch through the consuming operator, and a refused credit asks for
+that spill before the sender is told to wait. So a receiver whose whole input exceeds the budget
+converges through host memory (`--host-memory-limit`) rather than waiting out the timeout; only
+a host that is full too leaves the sender waiting.
 
 ## Dispatch
 

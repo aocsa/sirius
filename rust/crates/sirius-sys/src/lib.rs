@@ -157,6 +157,10 @@ mod ffi {
         /// The ingress budget; 0 when credits are disabled.
         fn credit_budget(self: &InboundStore) -> Result<u64>;
 
+        /// Test hook: spill every idle downgrade candidate (staged frames
+        /// first) to host; returns the bytes moved.
+        fn spill_staged_for_testing(self: &InboundStore) -> Result<u64>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches that outlive its own query) or none (a result fragment, which

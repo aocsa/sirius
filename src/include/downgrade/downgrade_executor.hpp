@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/convertible_data.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
@@ -160,6 +161,21 @@ class downgrade_executor {
    */
   bool has_disk_tier() const;
 
+  /// A factory for a provider of extra downgrade candidates outside the per-query repository
+  /// registry -- the exchange ingress store's staged inbound frames. Called once per downgrade
+  /// request on the processing thread; may return nullptr when the source is gone.
+  using candidate_source = std::function<std::unique_ptr<sirius::convertible_data_provider>()>;
+
+  /**
+   * @brief Registers an external candidate source, visited BEFORE the query repositories.
+   *
+   * Inbound exchange frames staged for a receiver that has not started are the cheapest victims
+   * under pressure: nobody reads them until their receiver runs, and the consuming operator
+   * reloads a host-resident batch through lock_or_prepare_batch. Thread-safe; the source is
+   * kept for the executor's lifetime, so it must hold only weak references.
+   */
+  void add_candidate_source(candidate_source source);
+
   /**
    * @brief Number of downgrade requests the monitor loop has issued (test-only).
    *
@@ -210,6 +226,11 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  /// External candidate sources (see add_candidate_source), copied under the mutex per request.
+  /// Declared last on purpose: every earlier member keeps its offset for translation units that
+  /// only forward-use the class.
+  std::mutex _sources_mutex;
+  std::vector<candidate_source> _candidate_sources;
 };
 
 }  // namespace parallel

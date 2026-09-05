@@ -50,6 +50,9 @@
 #include "planner/substrait_scan_ranges.hpp"           // sirius::planner::scan_byte_ranges_state
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "yaml_reader.hpp"                             // sirius::parse_bytes (ingress budget)
+#include "data/convertible_data_batch.hpp"             // sirius::convertible_data_batch (ingress spill)
+#include "downgrade/downgrade_executor.hpp"            // sirius::parallel::downgrade_executor
+#include "memory/defragmenter_oom_policy.hpp"          // sirius::memory::defragmenter_oom_policy (credit copy)
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
@@ -203,6 +206,20 @@ struct InboundStore::State {
   std::uint64_t credited{0};
   std::unordered_map<std::uint64_t, Credit> credits;             // lease offset -> credit
   std::unordered_map<std::uint64_t, Credit> staged_credits;      // ticket -> credit
+  // Column types captured from the packed metadata at stage time, so the receiver's schema
+  // guard needs no GPU-resident view: a staged batch may have been spilled to host meanwhile.
+  std::unordered_map<std::uint64_t, std::vector<cudf::data_type>> staged_types;
+  // The GPU memory space's downgrade executor: a refused credit asks it to spill idle staged
+  // frames (and other idle data) before the sender is told to wait; null in a context without one.
+  sirius::parallel::downgrade_executor* downgrade{nullptr};
+
+  /// Column types of the staged batch under `ticket` (empty when unknown).
+  std::vector<cudf::data_type> types_of(std::uint64_t ticket)
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = staged_types.find(ticket);
+    return it == staged_types.end() ? std::vector<cudf::data_type>{} : it->second;
+  }
 
   void close()
   {
@@ -218,10 +235,12 @@ struct InboundStore::State {
     }
     staged.clear();
     staged_bytes.clear();
+    staged_types.clear();
     staged_credits.clear();
     credits.clear();
     credited = 0;
     gpu_space = nullptr;
+    downgrade = nullptr;
   }
 
   /// Drops the credit booked under `ticket` (if any) and returns its bytes to the budget.
@@ -253,12 +272,99 @@ struct InboundStore::State {
     auto batch = std::move(it->second);
     staged.erase(it);
     staged_bytes.erase(ticket);
+    staged_types.erase(ticket);
     // The batch now belongs to its receiver (or is being dropped): its bytes leave the ingress
     // budget, the way a pipeline task's reservation ends while its output lives on.
     release_staged_credit_locked(ticket);
     return batch;
   }
+
+  /// Staged batches with their tickets, oldest first (that receiver is the furthest from
+  /// running), as downgrade candidates (path 04 + 03: staged frames are the first thing to
+  /// spill under pressure; the consuming operator reloads them).
+  std::vector<std::pair<std::uint64_t, std::shared_ptr<cucascade::data_batch>>>
+  spill_candidates_locked() const
+  {
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<cucascade::data_batch>>> ordered;
+    ordered.reserve(staged.size());
+    for (const auto& [ticket, batch] : staged) {
+      ordered.emplace_back(ticket, batch);
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+      return a.first < b.first;
+    });
+    return ordered;
+  }
+
+  /// A staged frame offered for spilling leaves the ingress budget now: its bytes are about to
+  /// leave the GPU, and a budget that kept counting them would keep refusing the credits whose
+  /// refusal asked for the spill in the first place. If the conversion then does not happen the
+  /// frame stays resident but uncredited, the pre-credit accounting, until the receiver takes it.
+  void release_credit_for_spill(std::uint64_t ticket)
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_staged_credit_locked(ticket);
+  }
 };
+
+namespace {
+
+/// Offers the inbound store's idle, GPU-resident staged frames to the downgrade executor.
+/// Holds the store weakly: the executor outlives contexts, and a source whose store is gone
+/// simply offers nothing.
+class ingress_spill_provider final : public sirius::convertible_data_provider {
+ public:
+  explicit ingress_spill_provider(std::shared_ptr<InboundStore::State> state)
+    : state_(std::move(state))
+  {
+  }
+
+  std::unique_ptr<sirius::convertible_data> get_next_convertible(
+    cucascade::memory::memory_space* space, bool /*front_to_back*/) override
+  {
+    for (auto& [ticket, batch] : candidates()) {
+      if (auto convertible = wrap(ticket, batch, space)) { return convertible; }
+    }
+    return nullptr;
+  }
+
+  std::vector<std::unique_ptr<sirius::convertible_data>> get_all_convertible(
+    cucascade::memory::memory_space* space, bool /*front_to_back*/, bool /*ignore_subscribed*/) override
+  {
+    std::vector<std::unique_ptr<sirius::convertible_data>> out;
+    for (auto& [ticket, batch] : candidates()) {
+      if (auto convertible = wrap(ticket, batch, space)) { out.push_back(std::move(convertible)); }
+    }
+    return out;
+  }
+
+ private:
+  std::vector<std::pair<std::uint64_t, std::shared_ptr<cucascade::data_batch>>> candidates() const
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->gpu_space == nullptr) { return {}; }
+    return state_->spill_candidates_locked();
+  }
+
+  /// A staged batch is a candidate only while idle and resident in `space`; one a receiver has
+  /// already taken is no longer in the store, one being staged is not yet. Offering it returns
+  /// its credit to the budget (see `release_credit_for_spill`).
+  std::unique_ptr<sirius::convertible_data> wrap(std::uint64_t ticket,
+                                                 const std::shared_ptr<cucascade::data_batch>& batch,
+                                                 cucascade::memory::memory_space* space) const
+  {
+    if (batch->get_subscriber_count() > 0) { return nullptr; }
+    if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
+    auto ro = batch->try_to_read_only();
+    if (!ro || ro->get_memory_space() != space) { return nullptr; }
+    state_->release_credit_for_spill(ticket);
+    return std::make_unique<sirius::convertible_data_batch>(batch);
+  }
+
+  std::shared_ptr<InboundStore::State> state_;
+};
+
+}  // namespace
 
 // (duckdb::shared_ptr, so the SiriusContext can register as a ClientContextState).
 struct Context::Impl {
@@ -331,6 +437,23 @@ struct Context::Impl {
         throw sirius::internal_exception("Context: no GPU memory space for the inbound store");
       }
       inbound = std::make_shared<InboundStore::State>(staging_arena, gpu_space);
+      // Staged frames are spill candidates: the GPU space's downgrade executor learns about the
+      // store (weakly, it outlives contexts) and a refused credit can ask it for room.
+      try {
+        auto& downgrade   = context->get_downgrade_executor(gpu_space->get_id());
+        inbound->downgrade = &downgrade;
+        downgrade.add_candidate_source(
+          [weak = std::weak_ptr<InboundStore::State>(inbound)]()
+            -> std::unique_ptr<sirius::convertible_data_provider> {
+            auto state = weak.lock();
+            if (state == nullptr) { return nullptr; }
+            return std::make_unique<ingress_spill_provider>(std::move(state));
+          });
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_WARN("inbound store: no downgrade executor for the GPU space ({}); staged "
+                        "frames will not spill and a refused credit only waits",
+                        e.what());
+      }
     }
 
     client.config.enable_optimizer = true;
@@ -503,23 +626,56 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
   const auto* payload  = reinterpret_cast<const std::uint8_t*>(st.arena->base()) + offset;
   // Allocates no device memory: the view aliases the lease until the deep copy below.
   auto unpacked = cudf::unpack(metadata, payload);
-  auto stream   = st.stream.view();
-  // A credited frame is copied into its reservation, so the pool's admission already counted
-  // it; an uncredited one takes the bare pool allocator (legacy senders, credits disabled).
+  std::vector<cudf::data_type> types;
+  types.reserve(static_cast<std::size_t>(unpacked.num_columns()));
+  for (cudf::size_type i = 0; i < unpacked.num_columns(); ++i) {
+    types.push_back(unpacked.column(i).type());
+  }
+  auto stream = st.stream.view();
+  // A credited frame is copied inside its reservation: the adaptor charges allocations to the
+  // reservation attached to the allocating thread (ptds tracker), exactly as a pipeline task
+  // binds its reservation for the duration of its execute(). The reservation object goes to the
+  // tracker for the copy and is released right after; the copied bytes stay allocated and
+  // accounted like any task output, and the credit's bytes stay booked against the ingress
+  // budget until the receiver takes the batch. An uncredited frame (legacy sender, credits
+  // disabled) takes the bare pool allocator, the pre-credit path.
   std::unique_ptr<cudf::table> table;
   try {
-    table = credit.reservation != nullptr
-              ? std::make_unique<cudf::table>(unpacked, stream, credit.reservation->get_memory_resource())
-              : std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
-  } catch (...) {
+    struct tracker_binding {
+      cucascade::memory::reservation_aware_resource_adaptor* allocator{nullptr};
+      rmm::cuda_stream_view stream;
+      ~tracker_binding()
+      {
+        if (allocator != nullptr) { allocator->reset_stream_reservation(stream); }
+      }
+    } binding{nullptr, stream};
     if (credit.reservation != nullptr) {
+      auto* allocator = credit.reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+      if (allocator != nullptr &&
+          allocator->attach_reservation_to_tracker(
+            stream,
+            std::move(credit.reservation),
+            nullptr,
+            std::make_unique<sirius::memory::defragmenter_oom_policy>())) {
+        binding.allocator = allocator;
+      } else {
+        SIRIUS_LOG_WARN("inbound store: could not bind a {} byte credit to the copying thread; "
+                        "copying unreserved",
+                        credit.bytes);
+        credit.reservation.reset();
+      }
+    }
+    table = std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
+    // The lease is reusable the moment this returns, so the copy must be complete, not queued;
+    // it also has to finish before the binding above releases the reservation.
+    stream.synchronize();
+  } catch (...) {
+    if (credit.bytes != 0) {
       std::lock_guard<std::mutex> lock(st.mutex);
       st.credited -= std::min(st.credited, credit.bytes);
     }
     throw;
   }
-  // The lease is reusable the moment this returns, so the copy must be complete, not queued.
-  stream.synchronize();
   // The packed payload is the table's device bytes to within pack padding; good enough for
   // the store's accounting line.
   auto const bytes = length;
@@ -530,13 +686,15 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
 
   std::lock_guard<std::mutex> lock(st.mutex);
   if (st.gpu_space == nullptr) {
-    if (credit.reservation != nullptr) { st.credited -= std::min(st.credited, credit.bytes); }
+    if (credit.bytes != 0) { st.credited -= std::min(st.credited, credit.bytes); }
     throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
   }
   auto const ticket = st.next_ticket++;
   st.staged.emplace(ticket, std::move(data_batch));
   st.staged_bytes.emplace(ticket, bytes);
-  if (credit.reservation != nullptr) { st.staged_credits.emplace(ticket, std::move(credit)); }
+  st.staged_types.emplace(ticket, std::move(types));
+  // The reservation was consumed by the copy; only the budget booking rides with the ticket.
+  if (credit.bytes != 0) { st.staged_credits.emplace(ticket, State::Credit{nullptr, credit.bytes}); }
   return ticket;
 }
 
@@ -557,7 +715,6 @@ bool InboundStore::credit(std::uint64_t offset, std::uint64_t length) const
         length,
         st.budget);
     }
-    if (st.credited + length > st.budget) { return false; }
     if (auto stale = st.credits.find(offset); stale != st.credits.end()) {
       // The arena reused an offset whose credit was never staged or released: a leak upstream,
       // repaired here so the accounting cannot drift.
@@ -567,13 +724,58 @@ bool InboundStore::credit(std::uint64_t offset, std::uint64_t length) const
     }
     gpu_space = st.gpu_space;
   }
-  // The pool's own admission decides whether the copy can land at all. Taken outside the store
-  // lock: the reservation manager has its own, and a refusal here is the common case under
-  // pressure. The deep copy needs the payload plus per-column padding, hence the slack.
+  // Two gates, both taken outside the store lock: the ingress budget (bytes staged and not yet
+  // taken, plus credits in flight) and the pool's own admission (the reservation manager has its
+  // own lock). The deep copy needs the payload plus per-column padding, hence the slack.
   auto const reserve_bytes = length + length / 16 + (std::uint64_t{4} << 20);
-  auto reservation         = gpu_space->make_reservation_or_null(reserve_bytes);
-  if (reservation == nullptr || reservation->size() < static_cast<std::size_t>(reserve_bytes)) {
-    return false;
+  std::unique_ptr<cucascade::memory::reservation> reservation;
+  auto budget_has_room = [&] {
+    std::lock_guard<std::mutex> lock(st.mutex);
+    return st.credited + length <= st.budget;
+  };
+  auto try_reserve = [&] {
+    if (!budget_has_room()) { return false; }
+    if (reservation == nullptr) {
+      auto res = gpu_space->make_reservation_or_null(reserve_bytes);
+      if (res != nullptr && res->size() >= static_cast<std::size_t>(reserve_bytes)) {
+        reservation = std::move(res);
+      }
+    }
+    return reservation != nullptr;
+  };
+  if (!try_reserve()) {
+    // Either the budget is full of frames whose receivers have not started, or the pool is full
+    // of running fragments' data. Idle staged frames (ours first, then any query's idle data)
+    // can move to host: spilling a staged frame returns its credit AND its pool bytes, so one
+    // request serves both gates. Ask for exactly enough, the same way the pipeline executor does
+    // when a task's reservation falls short; the wait is bounded by the candidates it finds.
+    sirius::parallel::downgrade_executor* downgrade = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(st.mutex);
+      downgrade = st.downgrade;
+    }
+    if (downgrade == nullptr) { return false; }
+    std::mutex reservation_mutex;
+    std::uint64_t freed = 0;
+    try {
+      freed = downgrade
+                ->request_downgrade([&] {
+                  std::lock_guard<std::mutex> lock(reservation_mutex);
+                  return try_reserve();
+                })
+                .get();
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_INFO("inbound store: spill request for a {} byte credit cancelled: {}",
+                      length,
+                      e.what());
+    }
+    std::lock_guard<std::mutex> lock(reservation_mutex);
+    bool const granted = try_reserve();
+    SIRIUS_LOG_INFO("inbound store: credit for a {} byte frame {} after a spill request freed {} bytes",
+                    length,
+                    granted ? "granted" : "still refused",
+                    freed);
+    if (!granted) { return false; }
   }
   std::lock_guard<std::mutex> lock(st.mutex);
   if (st.gpu_space == nullptr) { return false; }
@@ -603,6 +805,20 @@ std::uint64_t InboundStore::credit_budget() const
 {
   std::lock_guard<std::mutex> lock(state_->mutex);
   return state_->budget;
+}
+
+std::uint64_t InboundStore::spill_staged_for_testing() const
+{
+  sirius::parallel::downgrade_executor* downgrade = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    downgrade = state_->downgrade;
+  }
+  if (downgrade == nullptr) {
+    throw sirius::invalid_input_exception("InboundStore: no downgrade executor to spill through");
+  }
+  // A predicate that is never satisfied moves every idle candidate the executor can find.
+  return downgrade->request_downgrade([] { return false; }).get();
 }
 
 void InboundStore::drop(std::uint64_t ticket) const { (void)state_->take(ticket); }
@@ -1176,25 +1392,27 @@ void Fragment::push_inbound(std::uint64_t stream_id, std::uint64_t ticket)
     throw sirius::invalid_input_exception(
       "Fragment: push_inbound() needs a staging arena (SIRIUS_EXCHANGE_STAGING_BYTES unset)");
   }
-  auto batch = impl_->ctx.inbound->take(ticket);
+  // The column types were captured from the pack metadata at stage time: the guard below must
+  // not touch a GPU view, because a staged batch may have been spilled to host under pressure
+  // (the consuming operator reloads it through lock_or_prepare_batch).
+  auto const types = impl_->ctx.inbound->types_of(ticket);
+  auto batch       = impl_->ctx.inbound->take(ticket);
 
   // Same guard as push_packed: the engine reads these columns through the declared schema, so
-  // a disagreement must fail here. Checked on the staged table; a bad batch is dropped with it.
+  // a disagreement must fail here. Checked on the staged types; a bad batch is dropped with it.
   if (auto it = impl_->resolved_inputs.find(stream_id); it != impl_->resolved_inputs.end()) {
     const auto& declared = it->second;
-    auto read_only       = batch->to_read_only();
-    auto view            = sirius::get_cudf_table_view(read_only);
-    if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
+    if (types.size() != declared.types.size()) {
       throw sirius::invalid_input_exception(
         "Fragment: staged batch {} for stream {} carries {} columns but the stream declares {}",
         ticket,
         stream_id,
-        view.num_columns(),
+        types.size(),
         declared.types.size());
     }
     for (std::size_t i = 0; i < declared.types.size(); ++i) {
       const auto expected = sirius::get_cudf_type(declared.types[i]);
-      const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
+      const auto actual   = types[i];
       if (actual != expected) {
         throw sirius::invalid_input_exception(
           "Fragment: staged batch {} for stream {} column {} ({}) is declared {} ({}) but "

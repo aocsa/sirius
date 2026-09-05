@@ -603,6 +603,13 @@ impl InboundStore {
     pub fn credit_budget(&self) -> Result<u64, Exception> {
         self.inner.credit_budget()
     }
+
+    /// Test hook: spill every idle downgrade candidate (staged frames first) to host through
+    /// the GPU space's downgrade executor, exactly what pressure does in production; returns the
+    /// bytes moved.
+    pub fn spill_staged_for_testing(&self) -> Result<u64, Exception> {
+        self.inner.spill_staged_for_testing()
+    }
 }
 
 impl std::fmt::Debug for InboundStore {
@@ -1490,6 +1497,107 @@ mod tests {
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// Staged frames are spill candidates (path 04 with the path 03 prerequisite): under
+    /// pressure the downgrade executor moves idle staged frames to host first, and a receiver
+    /// that later takes them still produces the right rows -- the consuming operator reloads
+    /// them, and the schema guard runs on the types captured at stage time, not on a GPU view.
+    /// Requires a GPU.
+    #[test]
+    fn inbound_store_spilled_frames_still_feed_the_receiver() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let receiver_plan = stream_read_plan(0);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let arena = ctx.staging_arena().expect("arena configured");
+        let store = ctx.inbound_store().expect("inbound store follows the arena");
+
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&sender_plan).unwrap();
+        sender.run().unwrap();
+        let mut tickets = Vec::new();
+        let mut rows_total = 0u64;
+        while let Some(batch) = sender.export_packed(0).unwrap() {
+            rows_total += batch.rows;
+            assert!(store.credit(batch.offset, batch.len).unwrap());
+            tickets.push(store.stage(&batch).unwrap());
+            if batch.len > 0 {
+                arena.release(batch.offset).unwrap();
+            }
+        }
+        assert!(!tickets.is_empty());
+        let staged_bytes = store.outstanding_bytes().unwrap();
+        assert!(staged_bytes > 0);
+
+        // Pressure, on demand: every idle staged frame leaves the GPU. The store still holds the
+        // tickets and their accounting; only the residency changed.
+        let moved = store.spill_staged_for_testing().unwrap();
+        assert!(moved > 0, "the staged frames were offered to the downgrade executor");
+        assert_eq!(store.outstanding().unwrap(), tickets.len());
+        assert_eq!(store.outstanding_bytes().unwrap(), staged_bytes);
+        assert_eq!(
+            store.credited_bytes().unwrap(),
+            0,
+            "frames offered for spilling leave the ingress budget so new credits can be granted"
+        );
+
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.declare_input_cardinality(0, rows_total).unwrap();
+        receiver.build(&receiver_plan).unwrap();
+        for &ticket in &tickets {
+            receiver.push_inbound(0, ticket).unwrap();
+        }
+        assert_eq!(store.outstanding().unwrap(), 0);
+        assert_eq!(store.credited_bytes().unwrap(), 0, "taken frames leave the budget");
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        let result = receiver.result_to_arrow().unwrap();
+        assert_eq!(
+            rows(&result),
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ]
+        );
+
+        // The schema guard still fires on a spilled frame, from the captured types.
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&sender_plan).unwrap();
+        sender.run().unwrap();
+        let batch = sender.export_packed(0).unwrap().expect("one batch");
+        let ticket = store.stage(&batch).unwrap();
+        arena.release(batch.offset).unwrap();
+        let _ = store.spill_staged_for_testing().unwrap();
+        let mut wrong = ctx.fragment().unwrap();
+        wrong.declare_input_column(0, "id", "BIGINT").unwrap();
+        wrong.declare_input_column(0, "name", "BIGINT").unwrap();
+        wrong.declare_input_cardinality(0, batch.rows).unwrap();
+        wrong.build(&receiver_plan).unwrap();
+        let err = wrong.push_inbound(0, ticket).unwrap_err();
+        assert!(err.what().contains("is declared"), "{}", err.what());
+        assert_eq!(store.outstanding().unwrap(), 0, "a refused batch is dropped with the guard");
+        while sender.export_packed(0).unwrap().is_some() {}
+
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }
 
     /// Copy-out-on-arrival through the inbound store: frames exported into the arena are staged
