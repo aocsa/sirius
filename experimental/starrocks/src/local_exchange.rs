@@ -2,7 +2,8 @@
 //!
 //! The exchange matches StarRocks' receiver-first dispatch with the senders that arrive later.
 //! A same-node sender's rows stay on the GPU, parked in the engine as native batches; a remote
-//! sender's batches arrive as staged packed bytes in this CN's arena (nixl tier).
+//! sender's batches arrive as staged packed bytes in this CN's arena (nixl tier) or as decoded
+//! Arrow record batches in host memory (arrow tier).
 //! Either way, what is tracked here is which senders have finished and where their output sits.
 //!
 //! A third kind of sender never runs at all: a same-node leaf whose plan was deferred into its
@@ -10,7 +11,7 @@
 //! complete the moment it is recorded, and the receiver splices the plan over its exchange node
 //! before translating (`compute_node_service.rs`, `fold_deferred_plans`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 
@@ -38,8 +39,10 @@ pub(crate) enum SenderSource {
         /// Where the engine parked this sender's batches.
         slot: SenderSlot,
     },
-    /// A remote sender whose packed batches were nixl-WRITTEN into this CN's staging arena and
-    /// announced over `transmit_packed`. Counts toward readiness only once `closed`.
+    /// A remote sender whose batches arrived over `transmit_packed`: packed bytes nixl-WRITTEN
+    /// into this CN's staging arena, or Arrow IPC frames decoded into host `RecordBatch`es (the
+    /// arrow tier keeps a receiver's whole remote input in host RAM until dispatch; nothing but
+    /// the host bounds it). Counts toward readiness only once `closed`.
     Remote {
         /// Sender output names carried on every `transmit_packed` frame (first frame wins,
         /// later frames must match).
@@ -200,6 +203,12 @@ struct ExchangeState {
     /// dropped idempotently — brpc reconnect-retry can replay a frame — and a gap (above) is a
     /// lost frame, which must fail the query rather than silently drop rows.
     remote_seq: HashMap<(ExchangeKey, i32), i64>,
+    /// Arrow data frames that overtook their predecessor on the wire, held per remote sender
+    /// until the sequence is contiguous again. The Arrow drain ships frames over several
+    /// connections at once (`SIRIUS_CN_ARROW_SEND_WORKERS`), so frame `n + 1` may land before
+    /// frame `n`; it sends the eos only after every data frame was acknowledged, so an eos that
+    /// leaves a hole, and a packed (nixl) frame out of order, are still lost frames.
+    remote_pending: HashMap<(ExchangeKey, i32), BTreeMap<i64, StagedBatch>>,
     /// Receivers the FE cancelled (`retire_receiver`), so a frame from a peer's still-draining
     /// sender is refused instead of re-creating the entry. `HashSet` twin of the FIFO so the
     /// per-frame check is O(1).
@@ -316,6 +325,10 @@ impl LocalExchange {
 
     /// Records one `transmit_packed` frame from a remote sender: a staged batch, eos, or both.
     /// Returns the receiver when the eos completes its sender set.
+    ///
+    /// Frames are appended in `seq` order. An Arrow data frame that arrives ahead of its
+    /// predecessor is held and appended once the frames before it have landed; every other kind
+    /// of gap fails the query (a lost frame).
     pub(crate) fn push_remote_frame(
         &self,
         key: ExchangeKey,
@@ -337,10 +350,36 @@ impl LocalExchange {
                  neither a batch nor eos"
             ));
         }
+        if let Some(batch) = &batch {
+            // A frame that claims a batch must carry one: pack metadata for a packed frame,
+            // at least one record batch for an Arrow frame.
+            match &batch.arrow {
+                None if batch.metadata.is_empty() => {
+                    return Err(format!(
+                        "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} \
+                         with empty pack metadata"
+                    ));
+                }
+                Some(arrow) if arrow.is_empty() => {
+                    return Err(format!(
+                        "remote sender {sender_id} for exchange {key:?} sent Arrow frame seq \
+                         {seq} with no record batches"
+                    ));
+                }
+                _ => {}
+            }
+        }
         let mut state = self.lock();
+        let ExchangeState {
+            sources,
+            remote_seq,
+            remote_pending,
+            ..
+        } = &mut *state;
 
-        let expected_seq = state.remote_seq.entry((key, sender_id)).or_insert(0);
-        if seq < *expected_seq {
+        let expected_seq = remote_seq.entry((key, sender_id)).or_insert(0);
+        let pending = remote_pending.entry((key, sender_id)).or_default();
+        if seq < *expected_seq || pending.contains_key(&seq) {
             // brpc reconnect-retry can replay a frame the peer already processed; its batch (if
             // any) landed in the same lease the first delivery recorded, so dropping the replay
             // loses nothing and leaks nothing.
@@ -350,15 +389,8 @@ impl LocalExchange {
             );
             return Ok(None);
         }
-        if seq > *expected_seq {
-            return Err(format!(
-                "remote sender {sender_id} for exchange {key:?} skipped from frame seq \
-                 {expected_seq} to {seq}; a frame was lost"
-            ));
-        }
-        *expected_seq += 1;
 
-        let senders = state.sources.entry(key).or_default();
+        let senders = sources.entry(key).or_default();
         let source = senders
             .entry(sender_id)
             .or_insert_with(|| SenderSource::Remote {
@@ -390,17 +422,45 @@ impl LocalExchange {
                  {known_names:?} to {names:?}"
             ));
         }
+        if seq > *expected_seq {
+            // Only an Arrow data frame may overtake its predecessor: the Arrow drain ships over
+            // several connections at once and sends its eos after every data frame was
+            // acknowledged; packed frames travel one at a time. Anything else out of order is
+            // a lost frame, which must fail the query rather than silently drop rows.
+            return match batch {
+                Some(batch) if batch.arrow.is_some() && !eos => {
+                    pending.insert(seq, batch);
+                    Ok(None)
+                }
+                _ => Err(format!(
+                    "remote sender {sender_id} for exchange {key:?} skipped from frame seq \
+                     {expected_seq} to {seq}; a frame was lost"
+                )),
+            };
+        }
         if let Some(batch) = batch {
-            if batch.metadata.is_empty() {
-                return Err(format!(
-                    "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} with \
-                     empty pack metadata"
-                ));
-            }
             batches.push(batch);
         }
+        *expected_seq += 1;
         if eos {
+            // The eos is the last frame of its sender: a held frame numbered after it means the
+            // sender's sequence and the receiver's disagree, so rows would be missing.
+            if let Some(&beyond) = pending.keys().next() {
+                return Err(format!(
+                    "remote sender {sender_id} for exchange {key:?} sent eos at seq {seq} but \
+                     frame seq {beyond} arrived after it; a frame was lost"
+                ));
+            }
             *closed = true;
+        } else {
+            // This frame may have filled the hole in front of frames that overtook it.
+            while let Some(entry) = pending.first_entry() {
+                if *entry.key() != *expected_seq {
+                    break;
+                }
+                batches.push(entry.remove());
+                *expected_seq += 1;
+            }
         }
         Self::take_ready(&mut state, key.fragment_instance_id)
     }
@@ -462,9 +522,13 @@ impl LocalExchange {
                 ReadyExchangeInput { node_id, sources }
             })
             .collect();
-        // The receiver is leaving the rendezvous; drop its remote-sender sequence tracking too.
+        // The receiver is leaving the rendezvous; drop its remote-sender sequence tracking too
+        // (every remote sender is closed here, so nothing is pending).
         state
             .remote_seq
+            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        state
+            .remote_pending
             .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
         Ok(Some(ReadyFragment {
             params: receiver.params,
@@ -503,6 +567,11 @@ impl LocalExchange {
         }
         state
             .remote_seq
+            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        // Frames held out of order for the cancelled receiver drop with it: an Arrow frame holds
+        // no lease, and only Arrow frames are ever held.
+        state
+            .remote_pending
             .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
         if state.retired.insert(fragment_instance_id) {
             state.retired_order.push_back(fragment_instance_id);
@@ -589,6 +658,8 @@ mod tests {
             offset: u64::from(fill) * 1024,
             len: 512,
             rows: Some(u64::from(fill)),
+            arrow: None,
+            ipc_bytes: 0,
         }
     }
 
@@ -935,6 +1006,178 @@ mod tests {
             .push_remote_frame(key, 0, 0, false, names(), Some(staged(1)))
             .unwrap_err();
         assert!(err.contains("collides with a local parked sender"), "{err}");
+    }
+
+    /// A frame that claims a batch must carry one: a packed frame with empty pack metadata and
+    /// an Arrow frame that decoded to no record batches (a schema-only IPC stream) are both
+    /// refused, naming the frame.
+    #[test]
+    fn a_batch_frame_without_a_payload_is_refused() {
+        let exchange = LocalExchange::default();
+        let packed = StagedBatch {
+            metadata: Vec::new(),
+            ..staged(1)
+        };
+        let err = exchange
+            .push_remote_frame(key(12, 7), 0, 0, false, names(), Some(packed))
+            .unwrap_err();
+        assert!(
+            err.contains("frame seq 0 with empty pack metadata"),
+            "{err}"
+        );
+
+        let arrow = StagedBatch::arrow(Vec::new(), 0);
+        assert_eq!(arrow.rows, Some(0));
+        let err = exchange
+            .push_remote_frame(key(13, 7), 0, 0, false, names(), Some(arrow))
+            .unwrap_err();
+        assert!(
+            err.contains("Arrow frame seq 0 with no record batches"),
+            "{err}"
+        );
+    }
+
+    /// A lease-free Arrow staged batch carrying one row whose value is `fill`, so the order the
+    /// batches come out in can be read back.
+    fn arrow_staged(fill: i64) -> StagedBatch {
+        let batch = arrow_array::RecordBatch::try_from_iter([(
+            "id",
+            std::sync::Arc::new(arrow_array::Int64Array::from(vec![fill])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        StagedBatch::arrow(vec![batch], 64)
+    }
+
+    /// The values of the staged Arrow batches of a ready receiver's single remote source, in
+    /// the order the engine would push them.
+    fn arrow_order(ready: &ReadyFragment) -> Vec<i64> {
+        let SenderSource::Remote { batches, .. } = &ready.inputs[0].sources[0] else {
+            panic!("expected a remote source");
+        };
+        batches
+            .iter()
+            .map(|staged| {
+                staged.arrow.as_ref().unwrap()[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect()
+    }
+
+    /// Arrow data frames travel over several connections and may overtake each other; the
+    /// rendezvous holds the early ones and appends them in `seq` order once the hole is filled.
+    /// A replay of a held frame is dropped like any other duplicate, and the eos (sent after
+    /// every data frame was acknowledged) completes the set with the batches in order.
+    #[test]
+    fn arrow_frames_that_overtake_each_other_are_appended_in_seq_order() {
+        let exchange = LocalExchange::default();
+        let key = key(14, 7);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap();
+        for (seq, fill) in [(2, 20), (3, 30), (0, 0)] {
+            assert!(
+                exchange
+                    .push_remote_frame(key, 0, seq, false, names(), Some(arrow_staged(fill)))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // A replay of a frame that is still held is a duplicate, not a second copy.
+        assert!(
+            exchange
+                .push_remote_frame(key, 0, 2, false, names(), Some(arrow_staged(99)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            exchange
+                .push_remote_frame(key, 0, 1, false, names(), Some(arrow_staged(10)))
+                .unwrap()
+                .is_none(),
+            "the sender has not closed"
+        );
+        let ready = exchange
+            .push_remote_frame(key, 0, 4, true, names(), None)
+            .unwrap()
+            .expect("eos completes the sender set");
+        assert_eq!(arrow_order(&ready), vec![0, 10, 20, 30]);
+    }
+
+    /// The eos is sent after every data frame was acknowledged, so an eos that leaves a hole in
+    /// front of a held frame means a frame was lost; so does an eos that overtakes a data frame.
+    #[test]
+    fn an_arrow_eos_with_a_hole_is_a_lost_frame() {
+        let exchange = LocalExchange::default();
+        let holed = key(15, 7);
+        exchange
+            .push_remote_frame(holed, 0, 0, false, names(), Some(arrow_staged(0)))
+            .unwrap();
+        exchange
+            .push_remote_frame(holed, 0, 2, false, names(), Some(arrow_staged(20)))
+            .unwrap();
+        let err = exchange
+            .push_remote_frame(holed, 0, 3, true, names(), None)
+            .unwrap_err();
+        assert!(err.contains("skipped from frame seq 1 to 3"), "{err}");
+
+        let overtaken = key(16, 7);
+        exchange
+            .push_remote_frame(overtaken, 0, 1, false, names(), Some(arrow_staged(10)))
+            .unwrap();
+        let err = exchange
+            .push_remote_frame(overtaken, 0, 0, true, names(), None)
+            .unwrap_err();
+        assert!(
+            err.contains("sent eos at seq 0 but frame seq 1 arrived after it"),
+            "{err}"
+        );
+    }
+
+    /// Only Arrow data frames may arrive out of order: a packed (nixl) frame travels one at a
+    /// time, so a gap there is still a lost frame, as is an eos ahead of its data.
+    #[test]
+    fn a_packed_frame_out_of_order_is_still_a_lost_frame() {
+        let exchange = LocalExchange::default();
+        let key = key(17, 7);
+        let err = exchange
+            .push_remote_frame(key, 0, 1, false, names(), Some(staged(1)))
+            .unwrap_err();
+        assert!(err.contains("skipped from frame seq 0 to 1"), "{err}");
+    }
+
+    /// A cancelled receiver takes its held frames with it: a frame arriving after the retire is
+    /// judged from seq 0 again and finds nothing held.
+    #[test]
+    fn retire_receiver_drops_held_arrow_frames() {
+        let exchange = LocalExchange::default();
+        let key = key(18, 7);
+        exchange
+            .push_remote_frame(key, 0, 1, false, names(), Some(arrow_staged(10)))
+            .unwrap();
+        exchange.retire_receiver(key.fragment_instance_id);
+        assert!(
+            exchange
+                .push_remote_frame(key, 0, 1, false, names(), Some(arrow_staged(10)))
+                .unwrap()
+                .is_none(),
+            "held again, not a duplicate"
+        );
+        let ready = exchange
+            .push_remote_frame(key, 0, 0, false, names(), Some(arrow_staged(0)))
+            .unwrap();
+        assert!(ready.is_none());
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap();
+        let ready = exchange
+            .push_remote_frame(key, 0, 2, true, names(), None)
+            .unwrap()
+            .expect("eos completes the set");
+        assert_eq!(arrow_order(&ready), vec![0, 10]);
     }
 
     /// An open remote sender is present but not finished; it must not count toward readiness.

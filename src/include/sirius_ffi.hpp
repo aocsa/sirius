@@ -45,6 +45,7 @@ class exchange_staging_arena;
 namespace sirius::ffi {
 
 class Fragment;
+class FragmentInput;
 class StagingArena;
 
 /// RAII handle to a Sirius engine context.
@@ -158,18 +159,79 @@ class SIRIUS_FFI_EXPORT StagingArena {
   std::shared_ptr<sirius::exec::exchange_staging_arena> arena_;
 };
 
+/// Thread-safe producer handle onto a built [`Fragment`]'s input streams.
+///
+/// Why this exists: `Fragment::run()` (and `Fragment::join()`) blocks the thread that owns the
+/// fragment, so a producer that feeds the fragment while it runs needs a second thread and an
+/// object that thread may touch. The handle holds only what a push needs — the fragment's stream
+/// session, the input schemas and senders resolved at `build()`, and the GPU memory space — and
+/// none of what makes the `Fragment` single-threaded (the DuckDB connection, the query lifecycle,
+/// the result). Obtained from `Fragment::input_handle()`, shared with the fragment.
+///
+/// Contract: `push_arrow` and `close_input` are legal from any thread, concurrently with each
+/// other, from the moment `Fragment::build()` returned until `Fragment::join()` (or `run()`)
+/// returned — including while `run()`/`join()` blocks on another thread. After that, after a
+/// `start()` that threw, and after the `Fragment` is destroyed, both throw ("the fragment has
+/// finished") instead of touching freed state: the fragment detaches the handle under a lock that
+/// waits for in-flight pushes, so a push
+/// racing the fragment's teardown completes or is refused, never faults. Every other `Fragment`
+/// and `Context` method keeps the single-threaded rule. There is no backpressure: a producer that
+/// outruns the query grows the GPU tier until the downgrade executor spills.
+class SIRIUS_FFI_EXPORT FragmentInput {
+ public:
+  ~FragmentInput();
+
+  FragmentInput(const FragmentInput&)            = delete;
+  FragmentInput& operator=(const FragmentInput&) = delete;
+
+  /// `Fragment::push_arrow` for any thread: import one host-memory Arrow record batch (Arrow C
+  /// Data Interface) into input stream `stream_id` as sender `sender_id`. Same reconciliation,
+  /// same reservation, same "buffers are copied before this returns" rule; the H2D copy runs and
+  /// synchronizes on a stream taken from the GPU memory space's pool (`acquire_stream()`), not on
+  /// cudf's default stream, so a push never acts as a device-wide barrier for the pipelines.
+  /// @throws on an unknown input stream, a sender not declared for it, null or released structs,
+  /// a schema mismatch, a stream that already ended, or once the fragment has finished.
+  void push_arrow(std::uint64_t stream_id,
+                  std::uint32_t sender_id,
+                  std::uintptr_t array_addr,
+                  std::uintptr_t schema_addr) const;
+
+  /// `Fragment::close_input` for any thread: close sender `sender_id` on input stream
+  /// `stream_id`. Idempotent per sender; the stream ends once every expected sender has closed.
+  /// @throws on an unknown stream or sender, or once the fragment has finished.
+  void close_input(std::uint64_t stream_id, std::uint32_t sender_id) const;
+
+  /// False once the fragment joined (or ran, failed to start, or was destroyed): a push then
+  /// throws.
+  [[nodiscard]] bool is_open() const;
+
+ private:
+  struct Impl;
+  explicit FragmentInput(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+
+  friend class Fragment;
+};
+
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
 ///
 /// A fragment is either **intermediate** (declares output streams, rooted in a streaming sink)
 /// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
 /// streams fed by other fragments without copying.
 ///
-/// Usage order: declare inputs/outputs → build → relay_from every sender → run →
-/// drain via relay_from or result_to_arrow.
+/// Usage order: declare inputs/outputs → build → relay_from every sender (or push_arrow /
+/// push_packed, then close_input) → run → drain via relay_from or result_to_arrow. A producer
+/// that must feed the fragment while it runs uses start() … join() with the `FragmentInput`
+/// handle from input_handle() on its own thread; run() is start() followed by join().
 ///
-/// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
-/// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
-/// build() but before run() closes the lifecycle itself.
+/// build() opens a query lifecycle; run() (or join()) closes it. Exactly one fragment may sit
+/// between its own build() and run()/join() at a time (the engine serializes queries). A
+/// Fragment destroyed after build() but before run() closes the lifecycle itself; one destroyed
+/// between start() and join() joins first.
+///
+/// Threading: every method of this class and of `Context` is single-threaded by contract — one
+/// thread drives a fragment through its lifecycle. The exceptions are `FragmentInput::push_arrow`
+/// and `FragmentInput::close_input` (any thread between build() and join()) and `StagingArena`.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -251,6 +313,36 @@ class SIRIUS_FFI_EXPORT Fragment {
                                                            std::uint64_t& length,
                                                            std::uint64_t& rows);
 
+  /// The host-Arrow twin of `export_packed`: pop the next batch parked on output stream
+  /// `stream_id`, copy it to host memory as one Arrow record batch (Arrow C Data Interface,
+  /// `cudf::to_arrow_host`), and move the resulting `ArrowArray` (a struct array, one child per
+  /// output column) and `ArrowSchema` into the caller's structs at `array_addr` / `schema_addr`.
+  /// The caller owns both and frees them through their `release` callbacks; the engine keeps no
+  /// pointer into them and no staging lease is involved.
+  ///
+  /// Returns false when no batch is parked right now (for a fragment that finished `run()`, the
+  /// stream is drained): `rows` is written as 0 and the caller's structs are left untouched, as
+  /// `export_packed` does. On success writes the batch's exact row count to `rows` — 0 for an
+  /// empty batch, which exports as a zero-length struct array, not as false — and synchronizes
+  /// the copy stream before returning, so the host buffers are complete.
+  /// The schema carries no column names (cudf emits the types only); the transport that moves the
+  /// batch carries the names, exactly as it does for `export_packed`. Decimal columns keep their
+  /// cudf width at cudf's widest precision for it (`cudf::to_arrow_schema`: a DECIMAL64 column is
+  /// `d:18,2,64`), which the receiving `push_arrow` reconciles against the declared precision.
+  /// A strings column whose cudf offsets are 64-bit (a batch holding more than 2 GiB of
+  /// characters in one column) exports as `large_utf8`, which `push_arrow` refuses by name; keep
+  /// a parked batch under that size (the packed hop carries such a batch, this one does not).
+  /// The device scratch the conversion needs (a DECIMAL32/64 column is widened to decimal128 and a
+  /// BOOL8 column packed to a bitmap on the device before the copy) is reserved in the batch's
+  /// memory space for the copy's duration and released before returning; a refused reservation is
+  /// logged and the copy proceeds unreserved.
+  /// @throws before `build()`, on an unknown output stream, on null addresses, or on a parked
+  /// batch that is not GPU-resident (same contract as `export_packed`).
+  bool export_arrow(std::uint64_t stream_id,
+                    std::uintptr_t array_addr,
+                    std::uintptr_t schema_addr,
+                    std::uint64_t& rows);
+
   /// The receive-side mirror of `export_packed`: unpack the `length` packed bytes at staging
   /// offset `offset` using the pack metadata at `metadata_addr` (`metadata_len` bytes, host
   /// memory), deep-copy the table out of the lease into ordinary pool memory, and push it into
@@ -267,15 +359,78 @@ class SIRIUS_FFI_EXPORT Fragment {
                    std::uint64_t offset,
                    std::uint64_t length);
 
+  /// Import one host-memory Arrow record batch (Arrow C Data Interface) into input stream
+  /// `stream_id` as sender `sender_id`. Buffers are copied to the GPU before returning, so the
+  /// caller may release the Arrow structs immediately after. Does not close the sender — call
+  /// close_input(stream_id, sender_id) when the producer is done.
+  ///
+  /// The host-memory twin of `push_packed`: same call site, same `session().push()`, different
+  /// input format. `array_addr` / `schema_addr` are the addresses of the caller's `ArrowArray`
+  /// and `ArrowSchema` (a struct array, one child per declared column), so this header still
+  /// needs no Arrow headers. The batch is reconciled against the declared stream schema column by
+  /// column (see `helper/arrow_host_import.hpp` for the exact rules: decimal width from the
+  /// declared precision, bool bitmap to BOOL8, and by-name refusal of dictionary, large_list,
+  /// large_utf8, large_binary, timezone-aware timestamps, decimal256 and HUGEINT columns). A
+  /// slice taken on the struct itself (its `offset`/`length`, Arrow C++ `StructArray::Slice`) is
+  /// honoured: only that window of every child is imported.
+  /// `sender_id` must be one of the stream's declared senders (declare_input_sender); that is
+  /// a membership check only — the batch carries no sender identity past this call, so a push
+  /// from a sender that already called close_input() is refused only once every sender has
+  /// closed and the stream ended.
+  ///
+  /// Memory: the columns are imported one at a time and narrowed to the declared width before the
+  /// next is copied, so the transient device footprint is the table at the declared widths plus
+  /// one column at its arriving width. Those bytes are reserved in the GPU memory space before the
+  /// copy (`memory_space::make_reservation_or_null`) and charged against the reservation while it
+  /// runs; the reservation is released when the call returns, the batch then owning its memory as
+  /// ordinary pool bytes. A reservation the space cannot grant is logged as a warning and the copy
+  /// proceeds unreserved, never silently more than that.
+  ///
+  /// Threads: this method is the fragment-owning thread's entry; `FragmentInput::push_arrow`
+  /// (from `input_handle()`) is the same operation for any other thread, legal from `build()`
+  /// until `join()`/`run()` returned, including while `run()`/`join()` blocks. Both touch only the
+  /// stream session (mutex-protected), the immutable post-`build()` state (declared schemas and
+  /// senders) and the GPU memory space: the copy, the casts and the synchronize run on a stream
+  /// from the space's pool (`memory_space::acquire_stream()`), never on cudf's default stream, and
+  /// never the DuckDB connection or the query lifecycle. There is no backpressure: the queue is
+  /// unbounded.
+  /// @throws before `build()`, on an unknown input stream, on a sender not declared for the
+  /// stream, on null addresses or already-released structs, on schema mismatch, or when the
+  /// stream already ended (a push after EOS never disappears silently).
+  void push_arrow(std::uint64_t stream_id,
+                  std::uint32_t sender_id,
+                  std::uintptr_t array_addr,
+                  std::uintptr_t schema_addr);
+
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
-  /// (relay_from closes its own sender; push_packed does not). Idempotent per sender; the
-  /// stream ends once every expected sender has closed.
+  /// (relay_from closes its own sender; push_packed and push_arrow do not). Idempotent per
+  /// sender; the stream ends once every expected sender has closed.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
   /// Execute the fragment and close the query lifecycle. Blocks until pipelines finish.
-  /// @throws before build() or on execution failure.
+  /// Equivalent to start() followed by join().
+  /// @throws before build(), after start(), or on execution failure.
   void run();
+
+  /// Begin execution and return once the query is started: the pipelines run on the engine's
+  /// executors while the caller is free to do other work, and a `FragmentInput` (from
+  /// `input_handle()`) may keep feeding the input streams from any thread until join() returns.
+  /// Legal once, after build(). A started fragment must be join()ed; its destructor joins for a
+  /// caller that did not, swallowing the execution error.
+  /// @throws before build(), when already started or run, or when the query cannot be started.
+  void start();
+
+  /// Wait for the fragment started by start() to finish, then close the query lifecycle. On
+  /// failure poisons every output stream and throws the execution error, exactly as run() does.
+  /// After join() returns (normally or by throwing) the input handle refuses further pushes.
+  /// @throws before start() or on execution failure.
+  void join();
+
+  /// The thread-safe producer handle onto this fragment's input streams (the same object every
+  /// call, shared with the fragment). See `FragmentInput` for the contract.
+  /// @throws before build().
+  std::shared_ptr<FragmentInput> input_handle();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at
   /// `out_stream_addr` (Arrow C Data Interface). Same contract as Context::execute_substrait.

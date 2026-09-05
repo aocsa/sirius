@@ -6,8 +6,9 @@ Sessions](streaming-sessions.md) covers the low-level primitives a fragment is b
 (`exec::batch_stream`, `STREAMING_SOURCE`/`STREAMING_SINK`, the id-addressed `exec::stream_session`
 router). This document covers the layer above: how a Substrait or DuckDB plan becomes a fragment,
 how its declared streams get a schema before the plan is even bound, and how multiple fragments —
-possibly owned by different processes — chain together via `relay_from()` (in one process) or
-`export_packed()`/`push_packed()` (across processes, through the exchange staging arena).
+possibly owned by different processes — chain together via `relay_from()` (in one process),
+`export_packed()`/`push_packed()` (across processes, through the exchange staging arena), or
+`push_arrow()` (a host that holds Arrow record batches, not device memory).
 
 Two classes do this, at two different layers:
 
@@ -50,6 +51,21 @@ receiver->declare_input_column(0, "a", "BIGINT");
 receiver->build(other_plan_bytes);     // this plan reads sirius_stream_source(0) / view sirius_stream_0
 receiver->relay_from(*sender, /*source_stream_id=*/0, /*input_stream_id=*/0, /*sender_id=*/0);
 receiver->run();
+```
+
+```cpp
+// sirius::ffi::Fragment fed by a host producer while it runs.
+auto receiver = make_fragment(*ctx);
+receiver->declare_input_column(0, "a", "BIGINT");
+receiver->build(plan_bytes);
+auto input = receiver->input_handle();    // std::shared_ptr<FragmentInput>, any thread from here
+receiver->start();                        // returns once the query is started
+std::thread producer([input] {            // pushes land while the owner blocks in join()
+  input->push_arrow(0, 0, array_addr, schema_addr);
+  input->close_input(0, 0);
+});
+receiver->join();                         // closes the lifecycle; the handle refuses from now on
+producer.join();
 ```
 
 ## `stream_bind_catalog` + `sirius_stream_source` — bridging bind time and plan time
@@ -192,14 +208,20 @@ physical plan, which holds raw pointers into the operators the session also poin
 `_session` last — so it is torn down *first*, before the engine it borrows operator pointers from
 can go away. Reordering these members is a use-after-free waiting to happen, not a style choice.
 
-**`run()`** reuses the caller's query window rather than opening a second one (a second
-`StandaloneQueryScope` would reset the task creator and scan manager `build()` already populated,
-and the fragment would run zero tasks). On any exception from the engine, it poisons every declared
-output (`_session.fail_output(id, ...)`, swallowing secondary failures per id) **before**
-rethrowing — otherwise a peer parked in `wait()` on that stream would block forever with no error
-anywhere, the same S2/S3 hazard [Streaming Sessions](streaming-sessions.md#execbatch_stream)
+**`run()`** is `start()` followed by `join()`. `start()` hands the pipelines to the engine
+(`sirius_engine::start()`: `create_query`, then the scheduler's `start_query()` future) and
+returns; `join()` (`sirius_engine::join()`) waits on that future — the opt-in watchdog included —
+then `wait_for_completion()`, and drains the scheduler after an error before rethrowing, exactly
+as the one-shot `execute()` did. Both reuse the caller's query window rather than opening a second
+one (a second `StandaloneQueryScope` would reset the task creator and scan manager `build()`
+already populated, and the fragment would run zero tasks). Between the two, the session's input
+streams may still be pushed into from any thread: the `STREAMING_SOURCE`'s `on_data` hook is a
+plain `task_creator::schedule()` enqueue. On any exception from the engine, both halves poison
+every declared output (`_session.fail_output(id, ...)`, swallowing secondary failures per id)
+**before** rethrowing — otherwise a peer parked in `wait()` on that stream would block forever with
+no error anywhere, the same S2/S3 hazard [Streaming Sessions](streaming-sessions.md#execbatch_stream)
 documents for `batch_stream` itself. `fail_output()` is idempotent (first failure wins), so this is
-safe to do at this layer even when a caller above it (`sirius::ffi::Fragment::run()`) also poisons
+safe to do at this layer even when a caller above it (`sirius::ffi::Fragment::join()`) also poisons
 the same outputs — see [Other contracts](#other-contracts) below.
 
 **`sink_types()`** exposes the plan root's output column types, set during `build()`. Relay steps
@@ -341,6 +363,92 @@ exactly one device region.
   `run()`); it does not close the sender (`close_input()` is the EOS mirror) and refuses a push
   after the stream has ended.
 
+### `push_arrow()` — a host-memory Arrow batch as input
+
+```cpp
+void push_arrow(std::uint64_t stream_id, std::uint32_t sender_id,
+                std::uintptr_t array_addr, std::uintptr_t schema_addr);
+```
+
+The host-memory twin of `push_packed()`, for an embedding host that did its own scan and holds
+Arrow record batches rather than a device pointer and cudf pack metadata. `array_addr` /
+`schema_addr` are the caller's `ArrowArray` / `ArrowSchema` (Arrow C Data Interface, one struct
+array whose children are the columns), so the header still needs no Arrow headers.
+`helper/arrow_host_import.hpp` imports the batch one column at a time with
+`cudf::from_arrow_column` (every buffer is copied host→device; pinning caller memory into the HOST
+tier does not fit the tier model, whose blocks are cuCascade-owned and spillable), reconciles each
+column against the declared schema with the same `sirius::get_cudf_type` guard `push_packed()`
+uses — narrowing an Arrow `decimal128` to the width the declared precision picks before the next
+column is touched, so the device holds the table at the declared widths plus one column at its
+arriving width, never the whole batch twice — and refuses by name what the engine cannot consume:
+dictionary encoding, `large_list` / `large_utf8` / `large_binary` (64-bit offsets), timezone-aware
+timestamps, `decimal256`, and `HUGEINT` columns. For the scalar formats a plain type mismatch is
+refused from the format string, before the copy; the imported column is the backstop for the rest.
+A slice taken on the struct itself (Arrow C++ `StructArray::Slice`: offset and length on the
+struct, children whole) is honoured — the window is pushed into each child before its import,
+since cudf reads a child by its own offset and would import every child row. The copy is
+synchronized before the call returns (on the error paths too), so the caller may release its Arrow
+structs at once. `sender_id` must be a declared sender of the stream; the call does not close it
+(`close_input()` is the EOS mirror) and a push after the stream ended throws.
+
+**Memory accounting.** `estimate_arrow_import_footprint()` sizes the import from the host structs
+(data, string offsets and characters, null masks, plus the one-column transient) and `push_arrow()`
+reserves that many bytes in the GPU memory space before the copy (`arrow_transfer_reservation`:
+`make_reservation_or_null`, attached to the space's allocation tracker for the copy's stream and
+thread so the copies are charged against the reservation rather than counted a second time). The
+reservation is released when the call returns, once the batch is in the session and owns its memory
+as ordinary pool bytes — the same pattern as the result collector's host reservation, including its
+degrade: a reservation the space cannot grant is logged as a warning and the copy proceeds
+unreserved. `export_arrow()` reserves `cudf::to_arrow_host`'s device scratch
+(`arrow_export_scratch_bytes()`: decimal widening and bool packing) the same way. `push_packed()`
+and `export_packed()` are unchanged and reserve nothing.
+
+**Threads and streams.** The copy, the casts and the synchronize run on a stream taken from the GPU
+memory space's pool (`memory_space::acquire_stream()`), never on `cudf::get_default_stream()`, so a
+push is not a device-wide barrier for the pipelines' streams. Besides that stream and the space's
+allocator, `push_arrow()` touches only the stream session (mutex-protected) and immutable
+post-`build()` state (the declared schemas and senders) — never the DuckDB connection or the query
+lifecycle. `Fragment::push_arrow()` remains the owning thread's entry point; the same operation for
+any other thread, including while the owner blocks in `run()`/`join()`, is `FragmentInput`
+(below). There is no backpressure: the queue is unbounded, and a producer that outruns the query
+grows the GPU tier until the downgrade executor spills.
+
+### `FragmentInput`, `start()` / `join()` — feeding a fragment while it runs
+
+```cpp
+void start();                                        // begins execution, returns
+void join();                                         // waits, closes the lifecycle
+std::shared_ptr<FragmentInput> input_handle();       // after build(); the same handle every call
+
+class FragmentInput {
+  void push_arrow(std::uint64_t stream_id, std::uint32_t sender_id,
+                  std::uintptr_t array_addr, std::uintptr_t schema_addr) const;
+  void close_input(std::uint64_t stream_id, std::uint32_t sender_id) const;
+  bool is_open() const;                              // false once the fragment joined or was destroyed
+};
+```
+
+`run()` is `start()` followed by `join()`. `start()` begins execution exactly as `run()` does — the
+intermediate fragment through `streaming_fragment::start()`, the result fragment through
+`sirius_interface::sirius_start_query()` — and returns once the query is started; `join()` blocks
+until the pipelines finish, closes the lifecycle and, on failure, poisons every output and throws
+the execution error, exactly as `run()` does. A fragment destroyed between `start()` and `join()`
+joins first (the error has no one to go to), so the query window is never torn down under running
+tasks.
+
+`FragmentInput` is what a producer thread holds. It carries only what a push needs — the fragment's
+stream session, the input schemas and senders resolved at `build()`, and the GPU memory space — and
+none of what makes `Fragment` single-threaded. Its contract: `push_arrow` and `close_input` are
+legal from any thread, concurrently, from the moment `build()` returned until `join()` (or `run()`)
+returned, including while `join()` blocks on another thread. After that, and after the `Fragment`
+is destroyed, both throw ("after the fragment has finished") instead of touching freed state: the
+fragment detaches the handle under the exclusive side of a `std::shared_mutex` whose shared side
+every push holds, so a push racing the fragment's teardown completes or is refused, never faults.
+Every other `Fragment` and `Context` method keeps the single-threaded rule. The Rust
+`FragmentInput` is `Send + Sync` on that argument (`rust/crates/sirius/src/lib.rs`, next to
+`StagingArena`'s), which is what lets a `std::thread` push while the fragment's owner is inside
+`join()` — the `!Send` `Fragment` itself never crosses a thread.
+
 `Context::staging_arena_handle()` returns a `StagingArena` sharing ownership of the same allocator
 that the thread-affine `Context::staging_*` methods drive; its `lease`/`release` serialize on the
 arena's mutex and make no CUDA calls, so any thread — an RPC thread while the context thread is
@@ -354,12 +462,14 @@ inside `Fragment::run()` — may call them. The Rust `StagingArena` is `Send + S
   result/intermediate split, so it catches a 0-output result fragment the same as a 1-output
   gather fragment. Without this, every row would go to the single destination either way while the
   call looked like it had configured routing.
-- **`run()` poisons every declared output on failure, redundantly with `streaming_fragment::run()`.**
-  Both layers call `fail_output()` for every id in `outputs` before rethrowing; because
-  `fail_output()` is first-failure-wins, doing it at both the FFI wrapper and the core
-  `streaming_fragment` is safe, not double-poisoning in any harmful sense — it just means a direct
-  `streaming_fragment` caller (a unit test, or any future caller that bypasses the FFI) gets the
-  same protection a `Fragment` caller does.
+- **`run()`, `start()` and `join()` poison every declared output on failure, redundantly with
+  `streaming_fragment`'s own halves.** Both layers call `fail_output()` for every id in `outputs`
+  before rethrowing; because `fail_output()` is first-failure-wins, doing it at both the FFI
+  wrapper and the core `streaming_fragment` is safe, not double-poisoning in any harmful sense — it
+  just means a direct `streaming_fragment` caller (a unit test, or any future caller that bypasses
+  the FFI) gets the same protection a `Fragment` caller does.
+- **A `Fragment` that failed to run cannot be started again.** Its query lifecycle was closed on
+  the failure path; `start()`/`run()` then throw instead of dereferencing it. Build a new fragment.
 
 ## Tests
 
@@ -367,7 +477,7 @@ inside `Fragment::run()` — may call them. The Rust `StagingArena` is `Send + S
 |---|---|
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
 | `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
-| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` |
+| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]`, `[sirius_ffi][arrow_host_import]`, `[.][sirius_ffi_bench][isolated_context]` |
 | `test/cpp/exec/test_exchange_staging_arena.cpp` | `[staging_arena]` |
 
 The packed hop itself is covered from the Rust side, in `rust/crates/sirius/src/lib.rs`:
@@ -377,21 +487,47 @@ The packed hop itself is covered from the Rust side, in `rust/crates/sirius/src/
 whole arena is grantable again afterwards), and `push_packed_rejects_a_mismatched_schema`. They need
 a GPU; CI only compile-checks them.
 
+The Arrow input is covered on both sides. C++ (`test_sirius_ffi_fragment.cpp`): a
+`cudf::to_arrow_host` → `push_arrow` → `run` → `result_to_arrow` round trip over BIGINT, DOUBLE,
+BOOLEAN, VARCHAR, DECIMAL(15,2) and DATE; several batches and senders on one stream; a hash
+partition keyed on the pushed VARCHAR column (the string kernel that requires 32-bit offsets); a
+batch pushed as two slices with non-zero Arrow offsets on the children, and one sliced on the struct
+itself (plus the refusal of a window that runs past the children); nulls in every fixture column,
+whole and struct-sliced; a push that names an already-closed sender while another is open (the
+membership-only rule); schema, column count, decimal scale, unknown stream, undeclared sender,
+null-pointer and post-EOS refusals; a push from a second `std::thread` between `build()` and
+`run()`; `start()`/`join()` with pushes through the input handle from a second thread while
+`join()` blocks (result fragment and intermediate fragment, compared with the pre-materialized
+run), the handle's refusals after `join()` and after the fragment is destroyed, a started fragment
+joined by its destructor, and `run()`/`start()`/`join()` out of order; the helper's by-name
+refusals, its released-struct refusal and its pre-copy type refusals with hand-built Arrow C
+structs, no engine context; the per-column import's transient peak measured through an rmm
+statistics adaptor against the footprint estimate, and `arrow_transfer_reservation` against a
+standalone 256 MiB memory space (granted-and-attached with no double count, degrade on refusal,
+nested hold, zero bytes); and a hidden `[sirius_ffi_bench]` case that prints H2D/D2H GB/s for
+128 MiB, 512 MiB and 2 GiB batches plus a zero-row `run()`. Rust: `arrow_hop_matches_relay_hop`
+(the Arrow hop equals the `relay_from` hop), `push_arrow_carries_nulls_and_sliced_batches`,
+`push_arrow_rejects_a_mismatched_schema` (which also drives the `LargeUtf8` and dictionary
+refusals through arrow-rs's own export) and
+`start_join_takes_arrow_pushes_from_another_thread_while_join_blocks`.
+
 The FFI-level tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
 `SiriusContext` (its own GPU memory pools) — the Catch2 listener in `test/cpp/unittest.cpp` pauses
-the shared test environments around any test with that tag so it doesn't contend with them for GPU
-memory. `sirius::ffi::Context`/`Fragment` have no raw-SQL or catalog-introspection escape hatch, so
+the shared test environments around any test tagged neither `[shared_context]` nor `[integration]`,
+so these do not contend with them for GPU memory. `sirius::ffi::Context`/`Fragment` have no raw-SQL or catalog-introspection escape hatch, so
 FFI-level tests are necessarily built around observable, public-API behavior (a failed `build()`
 throws, and a subsequent independent `Fragment` on the same `Context` can attempt its own `build()`
 right after) rather than inspecting DuckDB catalog state directly.
 
 ## Not yet ported
 
-`Fragment::run()` blocks — it goes through `streaming_fragment::run()` → `sirius_engine::execute()`,
-which takes the future from `start_query()` and waits immediately. Fragments therefore run
-store-and-forward, one at a time (`relay_from(...)` orders strictly before `run()`, and only one
-fragment may sit between its own `build()` and `run()`). The `Fragment` surface exposes no
-`pull`/`wait` and no push *during* `run()`: a remote sender feeds a fragment only store-and-forward,
-through `push_packed()` between `build()` and `run()`, and `relay_from()` only moves batches that
-are already sitting in a *local*, already-finished source fragment's output repository. Non-blocking
-scheduling and a streaming `push`/`pull`/`wait` FFI are tracked separately, not claimed here.
+`Fragment::run()` blocks; `start()`/`join()` split it, and only the Arrow input is fed during the
+run: `FragmentInput::push_arrow()` from any thread between `build()` and `join()`. Everything else
+stays store-and-forward, one fragment at a time: `relay_from(...)` orders strictly before `run()`
+and only moves batches already sitting in a *local*, finished source fragment's output repository;
+`push_packed()` is legal only between `build()` and `run()`, on the owning thread; only one
+fragment may sit between its own `build()` and `run()`/`join()`. The `Fragment` surface exposes no
+`pull`/`wait` on outputs while running (outputs are drained after `join()`), and the input has no
+backpressure — a producer that outruns the query grows the GPU tier until the downgrade executor
+spills. A bounded or blocking push, output streaming during the run, and a `push_packed` twin of
+the handle are tracked separately, not claimed here.

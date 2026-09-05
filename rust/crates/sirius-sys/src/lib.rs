@@ -112,10 +112,23 @@ mod ffi {
         /// batches that outlive its own query) or none (a result fragment, which
         /// produces Arrow).
         ///
-        /// Usage order: `declare_*` → `build` → `relay_from` every sender → `run`
-        /// → drain via `relay_from` or `result_to_arrow`. Exactly one fragment may
-        /// sit between its own `build` and `run`; the engine serializes queries.
+        /// Usage order: `declare_*` → `build` → `relay_from` every sender (or
+        /// `push_arrow`/`push_packed` then `close_input`) → `run` → drain via
+        /// `relay_from` or `result_to_arrow`; `run` is `start` followed by `join`,
+        /// and a producer may feed a started fragment through its
+        /// [`FragmentInput`] from another thread until `join` returns. Exactly one
+        /// fragment may sit between its own `build` and `run`/`join`; the engine
+        /// serializes queries.
         type Fragment;
+
+        /// Thread-safe producer handle onto a built fragment's input streams: the
+        /// stream session, the declared schemas and senders, and the GPU memory
+        /// space, nothing of the fragment's single-threaded state. `push_arrow`
+        /// and `close_input` are legal from any thread from `build` until `join`
+        /// (or `run`) returned, including while `join` blocks elsewhere; after
+        /// that, and after the fragment is dropped, both are `Err` (the fragment
+        /// detaches the handle under a lock that waits for pushes in flight).
+        type FragmentInput;
 
         /// Create a [`Fragment`] on `context`, which must outlive it.
         fn make_fragment(context: Pin<&mut Context>) -> Result<UniquePtr<Fragment>>;
@@ -213,6 +226,31 @@ mod ffi {
             rows: &mut u64,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
 
+        /// Pop the next batch parked on output stream `stream_id`, copy it to
+        /// host memory as one Arrow record batch, and move the resulting
+        /// `ArrowArray` (a struct array, one child per output column) and
+        /// `ArrowSchema` into the caller's structs at `array_addr` /
+        /// `schema_addr`: the host-Arrow twin of `export_packed`. Returns
+        /// `false` when nothing is parked right now, with `rows` written as 0
+        /// and the structs untouched (as `export_packed` does); on success
+        /// writes the exact row count to `rows` (0 for an empty batch, which
+        /// is a zero-length struct array, not `false`) and the host buffers
+        /// are complete (the copy stream is synchronized). The caller owns
+        /// both structs and frees them through their `release` callbacks.
+        ///
+        /// # Safety
+        /// `array_addr` and `schema_addr` must be the addresses of writable,
+        /// released-or-zeroed `ArrowArray` / `ArrowSchema` values that outlive
+        /// this call. The safe [`sirius`](https://docs.rs/sirius) wrapper
+        /// upholds this.
+        unsafe fn export_arrow(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            array_addr: usize,
+            schema_addr: usize,
+            rows: &mut u64,
+        ) -> Result<bool>;
+
         /// Unpack `length` packed bytes at staging offset `offset` with the
         /// cudf pack metadata at `metadata_addr` (`metadata_len` bytes of host
         /// memory), deep-copy the table out of the lease into pool memory, and
@@ -233,15 +271,75 @@ mod ffi {
             length: u64,
         ) -> Result<()>;
 
+        /// Import one host-memory Arrow record batch (Arrow C Data Interface) at
+        /// `array_addr` / `schema_addr` into input stream `stream_id` as sender
+        /// `sender_id`: the host-memory twin of `push_packed`. The buffers are
+        /// copied to the GPU before this returns, so the caller may release the
+        /// Arrow structs right after. Legal between `build()` and `run()`; it
+        /// does not close the sender. A schema mismatch, an undeclared sender
+        /// and a push after the stream ended are all `Err`, never a silent drop.
+        ///
+        /// # Safety
+        /// `array_addr` and `schema_addr` must be the addresses of a valid,
+        /// readable `ArrowArray` (a struct array, one child per declared column)
+        /// and its `ArrowSchema`, both outliving this call. The safe
+        /// [`sirius`](https://docs.rs/sirius) wrapper upholds this.
+        unsafe fn push_arrow(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            sender_id: u32,
+            array_addr: usize,
+            schema_addr: usize,
+        ) -> Result<()>;
+
         /// Close `sender_id` on input stream `stream_id`. The end-of-stream mirror
         /// for senders that are not local fragments — `relay_from` closes its own
-        /// sender; `push_packed` does not. Idempotent per sender; the stream ends
-        /// once every expected sender has closed.
+        /// sender; `push_packed` and `push_arrow` do not. Idempotent per sender;
+        /// the stream ends once every expected sender has closed.
         fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
 
         /// Execute the fragment and close its query lifecycle. Blocks until its
-        /// pipelines finish.
+        /// pipelines finish; `start` followed by `join`.
         fn run(self: Pin<&mut Fragment>) -> Result<()>;
+
+        /// Begin execution and return once the query is started; the pipelines
+        /// run on the engine's executors while a [`FragmentInput`] may keep
+        /// feeding the inputs from any thread. Legal once, after `build`.
+        fn start(self: Pin<&mut Fragment>) -> Result<()>;
+
+        /// Wait for a fragment started by `start` to finish and close its query
+        /// lifecycle; the execution error, if any, surfaces here, and the input
+        /// handle refuses pushes from then on.
+        fn join(self: Pin<&mut Fragment>) -> Result<()>;
+
+        /// The fragment's producer handle (the same object every call). `Err`
+        /// before `build`.
+        fn input_handle(self: Pin<&mut Fragment>) -> Result<SharedPtr<FragmentInput>>;
+
+        /// `Fragment::push_arrow` for any thread, through the handle: same
+        /// reconciliation, same copy-before-return rule, on a copy stream from the
+        /// GPU memory space's pool rather than cudf's default stream. `Err` once
+        /// the fragment has finished.
+        ///
+        /// # Safety
+        /// `array_addr` and `schema_addr` must be the addresses of a valid,
+        /// readable `ArrowArray` (a struct array, one child per declared column)
+        /// and its `ArrowSchema`, both outliving this call. The safe
+        /// [`sirius`](https://docs.rs/sirius) wrapper upholds this.
+        unsafe fn push_arrow(
+            self: &FragmentInput,
+            stream_id: u64,
+            sender_id: u32,
+            array_addr: usize,
+            schema_addr: usize,
+        ) -> Result<()>;
+
+        /// `Fragment::close_input` for any thread, through the handle. `Err` once
+        /// the fragment has finished.
+        fn close_input(self: &FragmentInput, stream_id: u64, sender_id: u32) -> Result<()>;
+
+        /// False once the fragment joined, ran or was dropped: a push then errs.
+        fn is_open(self: &FragmentInput) -> bool;
 
         /// Write a result fragment's rows into the caller-owned `ArrowArrayStream`
         /// at `out_stream_addr`.
@@ -273,6 +371,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, Fragment, StagingArena, make_context, make_context_from_config, make_fragment,
-    stream_view_name,
+    Context, Fragment, FragmentInput, StagingArena, make_context, make_context_from_config,
+    make_fragment, stream_view_name,
 };

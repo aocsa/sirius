@@ -28,7 +28,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
-#[cfg(test)]
 use arrow_array::RecordBatch;
 use sirius::SiriusContext;
 use starrocks_plan_translator::StreamInputSchema;
@@ -39,6 +38,7 @@ use crate::fragment_executor::{
     FragmentExecutor, FragmentLabel, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
 };
 use crate::parked_registry::{ParkedRegistry, QueryId, Release, RetireTrigger, RetiredQueries};
+use crate::tunable::{ResultPath, Tunables};
 
 /// One fragment execution handed to the engine thread.
 ///
@@ -52,9 +52,10 @@ struct ExecuteRequest {
     stream_inputs: Vec<StreamInputSchema>,
     /// Parked sender outputs to relay in, keyed by receiver exchange node id.
     inputs: Vec<(i32, Vec<SenderSlot>)>,
-    /// Remote sender batches staged in this CN's arena, as `(node id, sender id, batches)`:
-    /// pushed via `push_packed` + `close_input` before `run()`, each lease released the moment
-    /// its push returns (copy-out-on-arrival makes that safe).
+    /// Remote sender batches staged on this CN, as `(node id, sender id, batches)`: packed
+    /// batches in the arena are pushed via `push_packed` with each lease released the moment its
+    /// push returns (copy-out-on-arrival makes that safe), Arrow batches via `push_arrow`; then
+    /// `close_input`, all before `run()`.
     remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
     /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
     outputs: Vec<SenderSlot>,
@@ -64,6 +65,9 @@ struct ExecuteRequest {
     hash_keys: Vec<usize>,
     /// The query and instance this run belongs to; parked output is owned by `label.query_id`.
     label: FragmentLabel,
+    /// How a result fragment's rows come back (`SIRIUS_CN_RESULT_PATH`); ignored for a
+    /// fragment with `outputs`.
+    result_path: ResultPath,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
     /// Test-only: runs between `fragment.run()` and the park, standing in for a cancel or a
@@ -90,6 +94,12 @@ enum EngineRequest {
     ExportNext {
         slot: SenderSlot,
         respond: Sender<Result<Option<StagedBatch>, String>>,
+    },
+    /// Pop the next batch parked under `slot` as one host Arrow record batch (`None` when
+    /// drained): the Arrow transport's twin of `ExportNext`, no lease involved.
+    ExportArrowNext {
+        slot: SenderSlot,
+        respond: Sender<Result<Option<RecordBatch>, String>>,
     },
     /// Drop the parked fragment under `slot` (after its output was transmitted, or on a failed
     /// transmit so the GPU memory is not pinned by a dead query).
@@ -136,6 +146,9 @@ pub struct SiriusEngine {
     /// here BEFORE queueing its `RetireQuery`, so a `Run` already sitting in the FIFO ahead of it
     /// is refused when the thread dequeues it (the same off-thread shape as `staging`).
     retired: Arc<Mutex<RetiredQueries>>,
+    /// How result fragments return their rows (`ResultPath::code`), from the registry at
+    /// bring-up; tests override it per instance.
+    result_path: std::sync::atomic::AtomicU8,
 }
 
 impl SiriusEngine {
@@ -164,10 +177,25 @@ impl SiriusEngine {
                 thread: Mutex::new(Some(thread)),
                 staging,
                 retired,
+                result_path: std::sync::atomic::AtomicU8::new(Tunables::get().result_path.code()),
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
         }
+    }
+
+    /// The result path in force for this engine handle.
+    fn result_path(&self) -> ResultPath {
+        ResultPath::from_code(self.result_path.load(std::sync::atomic::Ordering::Relaxed))
+            .expect("result_path only ever holds a ResultPath code")
+    }
+
+    /// Overrides the bring-up result path for this engine handle; tests use it to run both
+    /// paths without touching the process environment.
+    #[cfg(test)]
+    pub(crate) fn set_result_path(&self, path: ResultPath) {
+        self.result_path
+            .store(path.code(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Points the engine's log directory at `<engine_dir>/log` and pins the CUDA device when
@@ -257,6 +285,9 @@ fn engine_thread(
             EngineRequest::ExportNext { slot, respond } => {
                 let _ = respond.send(export_next(&mut registry, &slot));
             }
+            EngineRequest::ExportArrowNext { slot, respond } => {
+                let _ = respond.send(export_arrow_next(&mut registry, &slot));
+            }
             EngineRequest::DropParked { slot, respond } => {
                 let _ = respond.send(drop_parked(&mut registry, &slot));
             }
@@ -325,7 +356,22 @@ fn export_next(
         offset: batch.offset,
         len: batch.len,
         rows: Some(batch.rows),
+        arrow: None,
+        ipc_bytes: 0,
     }))
+}
+
+/// Pops the next batch parked under `slot` as one host Arrow record batch. The batch owns its
+/// buffers (copied off the GPU before this returns), so it crosses the channel like any other
+/// owned value and outlives the parked fragment.
+fn export_arrow_next(
+    registry: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    slot: &SenderSlot,
+) -> Result<Option<RecordBatch>, String> {
+    let (fragment, stream) = registry.claim(slot, "export")?;
+    fragment
+        .export_arrow_next(stream)
+        .map_err(|err| format!("failed to export an Arrow batch for {slot:?}: {err}"))
 }
 
 /// Releases one destination's claim on a parked fragment; the fragment (and the GPU memory its
@@ -492,8 +538,17 @@ fn run_fragment_inner<'ctx>(
     }
 
     // An intermediate fragment sinks into one output stream per destination (stream i belongs
-    // to destination outputs[i]); a result fragment declares none and produces Arrow instead.
-    for stream in 0..request.outputs.len() as u64 {
+    // to destination outputs[i]); a result fragment declares none and produces Arrow through
+    // `result_to_arrow` -- unless the Arrow result path is on, in which case it declares one
+    // output stream, runs as an intermediate fragment and is drained with `export_arrow_next`
+    // (`cudf::to_arrow_host`, one D2H copy per batch) instead of the collector's four copies.
+    let arrow_result = request.outputs.is_empty() && request.result_path == ResultPath::Arrow;
+    let output_streams = if arrow_result {
+        1
+    } else {
+        request.outputs.len() as u64
+    };
+    for stream in 0..output_streams {
         fragment
             .declare_output(stream)
             .map_err(|err| format!("failed to declare fragment output stream {stream}: {err}"))?;
@@ -544,14 +599,34 @@ fn run_fragment_inner<'ctx>(
         }
     }
 
-    // Remote senders: their packed batches already sit in this CN's staging arena. Push each
-    // (deep copy into pool memory), release its lease immediately — copy-out-on-arrival makes
-    // that safe — then close the sender.
+    // Remote senders: their batches already sit on this CN — packed in the staging arena, or
+    // decoded Arrow on the host. Push each (deep copy into pool memory); a packed batch's lease
+    // goes back immediately — copy-out-on-arrival makes that safe — then close the sender.
     for (node_id, sender_id, batches) in &request.remote_inputs {
         let stream_id = stream_id_of(*node_id)?;
         let sender = u32::try_from(*sender_id)
             .map_err(|_| format!("negative remote sender id {sender_id}"))?;
+        let mut arrow_batches = 0usize;
+        let mut arrow_ipc_bytes = 0u64;
+        let mut arrow_host_bytes = 0usize;
+        let pushing = std::time::Instant::now();
         for batch in batches {
+            if let Some(arrow) = &batch.arrow {
+                arrow_ipc_bytes += batch.ipc_bytes;
+                for record_batch in arrow {
+                    fragment
+                        .push_arrow(stream_id, sender, record_batch)
+                        .map_err(|err| {
+                            format!(
+                                "failed to push a staged remote Arrow batch from sender \
+                                 {sender_id} into stream {stream_id}: {err}"
+                            )
+                        })?;
+                    arrow_batches += 1;
+                    arrow_host_bytes += record_batch.get_array_memory_size();
+                }
+                continue;
+            }
             let staged = sirius::PackedBatch {
                 metadata: batch.metadata.clone(),
                 offset: batch.offset,
@@ -585,6 +660,22 @@ fn run_fragment_inner<'ctx>(
             batches = batches.len(),
             "received remote batches"
         );
+        // `bytes` is the IPC payload the sender's `transmitted batches via arrow` line counts
+        // (the two totals match per stream and sender); `host_bytes` is the decoded footprint
+        // this CN held in host RAM for these batches from their arrival until now; `push_ms`
+        // is the time the engine thread spent copying them onto the GPU (`push_arrow`) and
+        // closing the sender.
+        if arrow_batches > 0 {
+            info!(
+                stream_id,
+                sender_id,
+                batches = arrow_batches,
+                bytes = arrow_ipc_bytes,
+                host_bytes = arrow_host_bytes,
+                push_ms = pushing.elapsed().as_millis() as u64,
+                "received remote batches via arrow"
+            );
+        }
     }
 
     fragment
@@ -608,6 +699,29 @@ fn run_fragment_inner<'ctx>(
         // two claims race over one stream — the registry refuses before inserting anything.
         registry.park(request.label.query_id, &request.outputs, fragment)?;
         return Ok(None);
+    }
+    if arrow_result {
+        // The one-copy result path: pop every parked GPU batch as host Arrow (the batch owns its
+        // buffers, so it crosses to the caller's thread like a `result_to_arrow` batch). The
+        // schema carries types only; the MySQL encoder renders by type and needs no names.
+        let draining = std::time::Instant::now();
+        let mut batches = Vec::new();
+        let mut host_bytes = 0usize;
+        while let Some(batch) = fragment
+            .export_arrow_next(0)
+            .map_err(|err| format!("failed to export a result batch as Arrow: {err}"))?
+        {
+            host_bytes += batch.get_array_memory_size();
+            batches.push(batch);
+        }
+        info!(
+            batches = batches.len(),
+            rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            host_bytes,
+            elapsed_ms = draining.elapsed().as_millis() as u64,
+            "drained result via arrow"
+        );
+        return Ok(Some(FragmentResult::new(batches)));
     }
     // `result_to_arrow` drains the stream and drops the context-referencing wrapper here, on the
     // engine thread, returning owned batches whose buffers are released via their own Arrow C
@@ -681,6 +795,7 @@ impl FragmentExecutor for SiriusEngine {
                 broadcast: run.broadcast,
                 hash_keys: run.hash_keys,
                 label: run.label,
+                result_path: self.result_path(),
                 respond,
                 #[cfg(test)]
                 after_run: None,
@@ -710,6 +825,10 @@ impl FragmentExecutor for SiriusEngine {
 
     fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
         self.engine_call(|respond| EngineRequest::ExportNext { slot, respond })
+    }
+
+    fn export_arrow_next(&self, slot: SenderSlot) -> Result<Option<RecordBatch>, String> {
+        self.engine_call(|respond| EngineRequest::ExportArrowNext { slot, respond })
     }
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
@@ -999,6 +1118,7 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 label: FragmentLabel::default(),
+                result_path: ResultPath::DuckDb,
                 respond: respond_tx,
                 after_run: None,
             }))
@@ -1029,6 +1149,106 @@ mod tests {
         let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
+    }
+
+    /// Writes a parquet fixture covering the MySQL encoder's type set at `path`: `id BIGINT,
+    /// name VARCHAR, price DECIMAL(15,2), day DATE, flag BOOLEAN, x DOUBLE`, three rows with a
+    /// null in every nullable column. Returns the column names in file order.
+    fn write_typed_parquet(path: &std::path::Path) -> Vec<String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Decimal128(15, 2), true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("x", DataType::Float64, true),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            Arc::new(
+                arrow_array::Decimal128Array::from(vec![Some(-123456), Some(5), None])
+                    .with_precision_and_scale(15, 2)
+                    .unwrap(),
+            ),
+            Arc::new(arrow_array::Date32Array::from(vec![
+                None,
+                Some(10471),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                None,
+            ])),
+            Arc::new(arrow_array::Float64Array::from(vec![
+                Some(0.5),
+                None,
+                Some(-2.25),
+            ])),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    /// The M4 one-copy result path (`SIRIUS_CN_RESULT_PATH=arrow`): a result fragment run with
+    /// one declared output stream and drained through `export_arrow_next` renders, cell for
+    /// cell, the same MySQL text rows as `result_to_arrow` over the encoder's whole type set
+    /// (the DECIMAL(15,2) arrives as decimal64(18,2) instead of decimal128(15,2) and the
+    /// columns carry no names, neither of which the encoder needs). Requires a GPU.
+    #[test]
+    fn arrow_result_path_renders_the_same_mysql_rows_as_the_duckdb_path() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed.parquet");
+        let names = write_typed_parquet(&path);
+        let plan = local_files_plan(path.to_str().unwrap(), names);
+
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+        let rows_of = |result: FragmentResult| -> Vec<Vec<u8>> {
+            let mut rows = crate::result_encoder::MysqlResultEncoder::encode(&result.batches, 0)
+                .expect("encode as MySQL text rows")
+                .rows;
+            rows.sort();
+            rows
+        };
+
+        engine.set_result_path(ResultPath::DuckDb);
+        let duckdb = run_result(&engine, &plan);
+        assert_eq!(
+            duckdb.batches[0].schema_ref().field(2).data_type(),
+            &DataType::Decimal128(15, 2),
+            "the DuckDB path hands the decimal out at its declared width"
+        );
+        let duckdb_rows = rows_of(duckdb);
+        assert_eq!(duckdb_rows.len(), 3);
+
+        engine.set_result_path(ResultPath::Arrow);
+        let arrow = run_result(&engine, &plan);
+        assert_eq!(
+            arrow.batches[0].schema_ref().field(2).data_type(),
+            &DataType::Decimal64(18, 2),
+            "the Arrow path hands the decimal out at the cudf width"
+        );
+        let arrow_rows = rows_of(arrow);
+        assert_eq!(arrow_rows, duckdb_rows);
+
+        // Both paths keep working when alternated: the engine's lifecycle closed cleanly.
+        engine.set_result_path(ResultPath::DuckDb);
+        assert_eq!(rows_of(run_result(&engine, &plan)), duckdb_rows);
+        engine.set_result_path(ResultPath::Arrow);
+        assert_eq!(rows_of(run_result(&engine, &plan)), duckdb_rows);
     }
 
     /// The engine-actor mirror of the sirius crate's `packed_hop_matches_relay_hop`: a sender
@@ -1115,6 +1335,97 @@ mod tests {
         // Keep the arena out of the other tests' context bring-ups.
         // SAFETY: the GPU lock is still held.
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// The Arrow twin of `engine_pushes_staged_remote_batches`: a sender fragment parks the
+    /// users fixture, `export_arrow_next` drains it as owned host `RecordBatch`es (no arena, no
+    /// lease), and a receiver run with those batches staged as Arrow `remote_inputs` delivers
+    /// exactly the fixture rows through `push_arrow` — the two engine halves of the Arrow
+    /// exchange transport, GPU-side, without any network. Requires a GPU.
+    #[test]
+    fn engine_pushes_staged_remote_arrow_batches() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+
+        const EXCHANGE_NODE: i32 = 11;
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(5, 6),
+            node_id: EXCHANGE_NODE,
+            sender_id: 0,
+        };
+        engine
+            .run(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: vec![slot],
+                broadcast: false,
+                hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
+            })
+            .expect("run the sender fragment");
+
+        let mut exported = Vec::new();
+        while let Some(batch) = engine.export_arrow_next(slot).expect("export arrow") {
+            assert!(batch.num_rows() > 0);
+            assert_eq!(batch.num_columns(), 2);
+            exported.push(batch);
+        }
+        assert!(!exported.is_empty(), "the sender parked batches to export");
+        assert_eq!(
+            exported.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            3,
+            "the exported batches carry the fixture"
+        );
+        // The batches own their buffers, independent of the parked fragment.
+        engine.drop_parked(slot).expect("drop the drained sender");
+
+        // Staged exactly as the receiving CN stages a decoded `arrow_ipc` frame: lease-free,
+        // rows from `num_rows` (which feed the exact cardinality declaration before build()),
+        // the IPC length the frame would have carried.
+        let ipc_bytes: u64 = exported
+            .iter()
+            .map(|batch| crate::arrow_exchange::encode_ipc(batch).unwrap().len() as u64)
+            .sum();
+        let staged = StagedBatch::arrow(exported, ipc_bytes);
+        assert_eq!((staged.offset, staged.len), (0, 0));
+        assert_eq!(staged.rows, Some(3));
+
+        let receiver = stream_plan(EXCHANGE_NODE, &[("id", false), ("name", true)]);
+        let result = engine
+            .run(FragmentRun {
+                plan: &receiver,
+                inputs: Vec::new(),
+                remote_inputs: vec![(EXCHANGE_NODE, 0, vec![staged])],
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
+            })
+            .expect("execute the Arrow-fed receiver on GPU")
+            .expect("a result fragment returns rows");
+        let mut rows = users_rows(result);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string())
+            ],
+            "the Arrow hop preserved every row"
+        );
     }
 
     /// The regression guard for the q02 lease starvation: a peer's `request_staging_lease`
@@ -1543,6 +1854,8 @@ mod tests {
                         offset: lease,
                         len: 4096,
                         rows: Some(1),
+                        arrow: None,
+                        ipc_bytes: 0,
                     }],
                 )],
                 outputs: Vec::new(),
@@ -1673,6 +1986,7 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 label: labelled(204, 1),
+                result_path: ResultPath::DuckDb,
                 respond: respond_tx,
                 // The cancel lands while the fragment runs.
                 after_run: Some(Box::new(move || {

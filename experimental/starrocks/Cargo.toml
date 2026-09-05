@@ -13,8 +13,12 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1"
 # Pinned to the arrow version `parquet` already pulls in, so the engine→CN result interchange
-# (Arrow C Data Interface) and the parquet schema reader share one arrow build.
+# (Arrow C Data Interface, inside the `sirius` crate, which enables arrow-array's `ffi` feature
+# for its own bindings) and the parquet schema reader share one arrow build. The CN itself uses
+# no `arrow_array::ffi` item, so no feature is named here.
 arrow-array = "59"
+# Arrow IPC stream framing for the Arrow exchange transport (`SIRIUS_CN_EXCHANGE_TRANSPORT=arrow`).
+arrow-ipc = "59"
 arrow-schema = "59"
 backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -58,6 +62,7 @@ nixl-transport = ["sirius-engine", "dep:nixl-sys"]
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true
+arrow-ipc.workspace = true
 arrow-schema.workspace = true
 backon.workspace = true
 clap.workspace = true

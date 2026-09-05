@@ -85,11 +85,22 @@ class streaming_fragment {
   /// @throws whatever the plan source, binder, or plan generator raises.
   void build(sirius::query_id_t query_id);
 
-  /// Submit and block. Shared query window (don't open a second StandaloneQueryScope between
-  /// build and run).
+  /// Submit and block: start() followed by join(). Shared query window (don't open a second
+  /// StandaloneQueryScope between build and run).
   /// @throws sirius::invalid_input_exception when build() has not run.
   /// @throws whatever the engine's execution raises.
   void run();
+
+  /// Submit the pipelines and return without waiting, so a producer may keep pushing into the
+  /// session's input streams (from any thread) while they run. Poisons every output on failure.
+  /// @throws sirius::invalid_input_exception when build() has not run or start() already ran.
+  void start();
+
+  /// Block until the pipelines started by start() finish. Poisons every output before rethrowing
+  /// an execution error, exactly as run() does.
+  /// @throws sirius::invalid_input_exception when start() has not run.
+  /// @throws whatever the engine's execution raises.
+  void join();
 
   [[nodiscard]] stream_session& session() { return _session; }
 
@@ -121,7 +132,11 @@ class streaming_fragment {
   stream_session _session;
 
   bool _built{false};
+  bool _started{false};
   duckdb::vector<sirius::logical_type> _sink_types;
+
+  /// fail_output every declared output with `cause` (idempotent, first failure wins).
+  void poison_outputs(std::exception_ptr cause) noexcept;
 };
 
 }  // namespace sirius::exec

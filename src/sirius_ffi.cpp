@@ -43,6 +43,8 @@
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/arrow_c_device.hpp"      // ArrowDeviceArray (cudf::to_arrow_host result)
+#include "helper/arrow_host_import.hpp"   // sirius::import_arrow_host_table
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
@@ -52,6 +54,7 @@
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
 #include <cudf/contiguous_split.hpp>           // cudf::chunked_pack, cudf::unpack
+#include <cudf/interop.hpp>                    // cudf::to_arrow_host, cudf::to_arrow_schema
 #include <cudf/table/table.hpp>                // cudf::table
 #include <cudf/utilities/default_stream.hpp>   // cudf::get_default_stream
 #include <cudf/utilities/span.hpp>             // cudf::device_span
@@ -62,8 +65,10 @@
 #include <algorithm>  // std::find
 #include <cstdlib>    // std::getenv
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <vector>
 
 namespace sirius::ffi {
@@ -346,6 +351,130 @@ std::uint64_t StagingArena::capacity() const noexcept { return arena_->capacity(
 std::size_t StagingArena::outstanding() const { return arena_->outstanding(); }
 
 // ---------------------------------------------------------------------------
+// FragmentInput
+// ---------------------------------------------------------------------------
+
+// What a push needs and nothing else. `session` points into the owning Fragment (the
+// streaming_fragment's session or the result session) and is valid while `open`; the Fragment
+// detaches the handle — under the exclusive side of `lifetime`, so it waits for pushes in flight —
+// when it joins or is destroyed. `inputs` and `gpu_space` are immutable after build().
+struct FragmentInput::Impl {
+  std::shared_mutex lifetime;
+  bool open{true};
+  sirius::exec::stream_session* session{nullptr};
+  std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> inputs;
+  cucascade::memory::memory_space* gpu_space{nullptr};
+
+  void detach()
+  {
+    std::unique_lock guard(lifetime);
+    open    = false;
+    session = nullptr;
+  }
+
+  [[noreturn]] void throw_finished(const char* verb, std::uint64_t stream_id) const
+  {
+    throw sirius::invalid_input_exception(
+      "Fragment: {}() on input stream {} after the fragment has finished (join()/run() returned "
+      "or the Fragment was destroyed)",
+      verb,
+      stream_id);
+  }
+};
+
+FragmentInput::FragmentInput(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+FragmentInput::~FragmentInput() = default;
+
+bool FragmentInput::is_open() const
+{
+  std::shared_lock guard(impl_->lifetime);
+  return impl_->open;
+}
+
+void FragmentInput::close_input(std::uint64_t stream_id, std::uint32_t sender_id) const
+{
+  std::shared_lock guard(impl_->lifetime);
+  if (!impl_->open) { impl_->throw_finished("close_input", stream_id); }
+  impl_->session->close_input(stream_id, sender_id);
+}
+
+void FragmentInput::push_arrow(std::uint64_t stream_id,
+                               std::uint32_t sender_id,
+                               std::uintptr_t array_addr,
+                               std::uintptr_t schema_addr) const
+{
+  if (array_addr == 0 || schema_addr == 0) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_arrow() requires non-null ArrowArray and ArrowSchema addresses");
+  }
+  // Shared for the whole push: the Fragment cannot finish or die under it, and pushes from
+  // several producers proceed concurrently (the session serializes on the stream's own mutex).
+  std::shared_lock guard(impl_->lifetime);
+  if (!impl_->open) { impl_->throw_finished("push_arrow", stream_id); }
+
+  // Unlike push_packed, which tolerates an undeclared stream (the session then throws), the
+  // declared schema is what this batch is reconciled against, so it has to exist.
+  auto declared_it = impl_->inputs.find(stream_id);
+  if (declared_it == impl_->inputs.end()) {
+    throw sirius::invalid_input_exception("Fragment: push_arrow() target input stream " +
+                                          std::to_string(stream_id) +
+                                          " was never declared on this fragment");
+  }
+  const auto& declared = declared_it->second;
+  if (!declared.expected_senders.contains(sender_id)) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_arrow() into stream {} from sender {}, which was not declared for it (an "
+      "undeclared sender could never close the stream)",
+      stream_id,
+      sender_id);
+  }
+  auto* gpu_space = impl_->gpu_space;
+  if (gpu_space == nullptr) {
+    throw sirius::internal_exception("Fragment: push_arrow() found no GPU memory space");
+  }
+
+  const auto* schema = reinterpret_cast<const ArrowSchema*>(schema_addr);
+  const auto* array  = reinterpret_cast<const ArrowArray*>(array_addr);
+  const auto what    = "Fragment: Arrow batch for stream " + std::to_string(stream_id);
+
+  // The H2D copy is mandatory: the HOST tier is addressed by offsets inside cuCascade-owned
+  // blocks and spill assumes it owns the memory, so caller memory cannot be pinned into it. The
+  // batch the engine keeps lives in ordinary pool memory — fully accounted and spillable like any
+  // other — and the synchronize below is what lets the caller release its Arrow structs on return.
+  //
+  // What the import is about to allocate (the table at the declared widths plus one column at its
+  // arriving width) is reserved in the space first and charged against that reservation while it
+  // is copied; the reservation is released when this call returns, once the batch is in the
+  // session and owns its memory as ordinary pool bytes. A refused reservation degrades with a
+  // warning rather than failing the push.
+  //
+  // The copy runs on a stream from the space's pool, not on cudf's default stream: with the
+  // legacy default stream a synchronize there is a device-wide barrier, which a push arriving
+  // while the pipelines run must not be. STREAM-LINEAGE: that stream is the batch's writer.
+  const auto footprint =
+    sirius::estimate_arrow_import_footprint(schema, array, what, declared.names, declared.types);
+  auto stream = gpu_space->acquire_stream();
+  sirius::arrow_transfer_reservation reservation(*gpu_space, stream, footprint.peak_bytes(), what);
+  auto table = sirius::import_arrow_host_table(schema,
+                                               array,
+                                               what,
+                                               declared.names,
+                                               declared.types,
+                                               stream,
+                                               gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  // A host batch has no local producing operator, so there is no telemetry lineage to thread.
+  auto data_batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, telemetry::batch_telemetry_info{});
+  if (!impl_->session->push(stream_id, std::move(data_batch))) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused an Arrow batch; it had already ended");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fragment
 // ---------------------------------------------------------------------------
 
@@ -354,6 +483,17 @@ struct Fragment::Impl {
 
   ~Impl()
   {
+    // A Fragment dropped between start() and join() is joined first: tearing the query window
+    // down under running pipelines is the use-after-free QueryEnd's repository cleanup guards
+    // against, and join() is what drains them. The execution error, if any, has no one to go to.
+    if (started && !ran) {
+      try {
+        join();
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
+    // Producers still holding the input handle get a refusal, not a dangling session.
+    if (input) { input->impl_->detach(); }
     // If the caller dropped a Fragment between build() and run(), close the lifecycle so the
     // engine's mutex doesn't wedge every subsequent statement on this connection.
     end_lifecycle();
@@ -375,9 +515,10 @@ struct Fragment::Impl {
   bool broadcast_outputs{false};
   std::vector<int> hash_key_columns;
 
-  // Resolved at build() time; kept so the hop entry points (relay_from, push_packed) can
-  // validate an arriving batch against the schema the plan was bound against — a disagreement
-  // there would otherwise reinterpret cudf columns silently.
+  // Resolved at build() time; kept so the hop entry points (relay_from, push_packed, push_arrow)
+  // can validate an arriving batch against the schema the plan was bound against — a
+  // disagreement there would otherwise reinterpret cudf columns silently. push_arrow also
+  // requires the entry to exist (it reconciles the batch against it).
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved_inputs;
 
   // Intermediate fragment (has output streams).
@@ -389,8 +530,16 @@ struct Fragment::Impl {
   sirius::exec::stream_session result_session;
   duckdb::shared_ptr<sirius::sirius_prepared_statement_data> result_plan;
   duckdb::unique_ptr<duckdb::QueryResult> result;
+  // Alive between start() and join() of a result fragment: the interface owns the engine that
+  // runs the plan, the pending result is what join() fetches.
+  std::unique_ptr<sirius::sirius_interface> result_iface;
+  duckdb::unique_ptr<duckdb::PendingQueryResult> result_pending;
+
+  // Created at the end of build(); shared with every producer that asked for input_handle().
+  std::shared_ptr<FragmentInput> input;
 
   bool built{false};
+  bool started{false};
   bool ran{false};
   bool transaction_open{false};
 
@@ -465,6 +614,78 @@ struct Fragment::Impl {
       auto res = ctx.conn->Query(sql);
       if (res->HasError()) { res->ThrowError(); }
     }
+  }
+
+  // fail_output every declared output with `cause` before unwinding. Without this the streams are
+  // neither closed nor failed, so a peer parked in wait() blocks forever with no error anywhere —
+  // the S2/S3 hazard the design doc calls out. First-failure-wins, so this cannot mask a real
+  // cause. A result fragment has no outputs, so this is a no-op there.
+  void poison_outputs(std::exception_ptr cause) noexcept
+  {
+    for (auto id : outputs) {
+      try {
+        session().fail_output(id, cause);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
+  }
+
+  // The first half of run(): hand the query to the engine and return. The lifecycle stays open.
+  void start()
+  {
+    if (!lifecycle) {
+      throw sirius::invalid_input_exception(
+        "Fragment: the query lifecycle is closed (a previous run failed); build a new fragment");
+    }
+    try {
+      if (is_result()) {
+        auto& client = *ctx.conn->context;
+        result_iface = std::make_unique<sirius::sirius_interface>(
+          client, std::optional<std::string>(kQueryLabel));
+        result_pending = result_iface->sirius_start_query(client,
+                                                          kQueryLabel,
+                                                          result_plan,
+                                                          duckdb::PendingQueryParameters{},
+                                                          lifecycle->query_id());
+      } else {
+        fragment->start();
+      }
+      started = true;
+    } catch (...) {
+      poison_outputs(std::current_exception());
+      // The query window closes below, so the fragment has finished as far as a producer is
+      // concerned: the handle refuses from here on, as it does after join().
+      if (input) { input->impl_->detach(); }
+      end_lifecycle();
+      throw;
+    }
+  }
+
+  // The second half: wait, close the input handle, close the lifecycle, surface the error.
+  void join()
+  {
+    // Consumed whatever happens below: neither the caller nor the destructor joins twice.
+    started = false;
+    try {
+      if (is_result()) {
+        result = result_iface->sirius_join_query(*result_pending);
+        result_pending.reset();
+        result_iface.reset();
+      } else {
+        fragment->join();
+      }
+      ran = true;
+    } catch (...) {
+      poison_outputs(std::current_exception());
+      if (input) { input->impl_->detach(); }
+      end_lifecycle();
+      throw;
+    }
+    // Pushes after join() are refused from here on, whatever the outcome below.
+    if (input) { input->impl_->detach(); }
+    lifecycle->finish();
+    lifecycle.reset();
+    if (result && result->HasError()) { result->ThrowError(); }
   }
 
   // Idempotent; called from run() and ~Impl().
@@ -624,6 +845,15 @@ void Fragment::build(const std::string& substrait_plan)
       impl_->fragment = std::make_unique<sirius::exec::streaming_fragment>(client, std::move(spec));
       impl_->fragment->build(impl_->lifecycle->query_id());
     }
+
+    // The producer handle: the session is now wired and the schemas are final. The GPU space is
+    // resolved here once so a push never reaches back into the context.
+    auto input_state       = std::make_unique<FragmentInput::Impl>();
+    input_state->session   = &impl_->session();
+    input_state->inputs    = impl_->resolved_inputs;
+    input_state->gpu_space = impl_->ctx.context->get_memory_manager().get_memory_space(
+      cucascade::memory::Tier::GPU, /*device_id=*/0);
+    impl_->input = std::shared_ptr<FragmentInput>(new FragmentInput(std::move(input_state)));
     impl_->built = true;
   } catch (...) {
     impl_->end_lifecycle();
@@ -783,6 +1013,89 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
   return metadata;
 }
 
+namespace {
+/// Nameless Arrow metadata for every column and nested child of `view`: `cudf::to_arrow_schema`
+/// requires one entry per column with the children spelled out, and the transport carries the
+/// names (as it does for export_packed's pack metadata, which has none either).
+cudf::column_metadata nameless_metadata(cudf::column_view const& column)
+{
+  cudf::column_metadata metadata;
+  for (cudf::size_type i = 0; i < column.num_children(); ++i) {
+    metadata.children_meta.push_back(nameless_metadata(column.child(i)));
+  }
+  return metadata;
+}
+}  // namespace
+
+bool Fragment::export_arrow(std::uint64_t stream_id,
+                            std::uintptr_t array_addr,
+                            std::uintptr_t schema_addr,
+                            std::uint64_t& rows)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before export_arrow()");
+  }
+  if (array_addr == 0 || schema_addr == 0) {
+    throw sirius::invalid_input_exception(
+      "Fragment: export_arrow() requires non-null ArrowArray and ArrowSchema addresses");
+  }
+
+  rows       = 0;
+  auto batch = impl_->session().pull(stream_id);
+  if (!batch) { return false; }
+
+  // The shared lock holds residency and immutability for the whole D2H copy; it releases when
+  // this scope ends, after the copy stream has been synchronized and the data lives on the host.
+  auto read_only = (*batch)->to_read_only();
+  if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
+    throw sirius::invalid_input_exception(
+      "Fragment: batch on output stream " + std::to_string(stream_id) +
+      " is not GPU-resident; exporting a spilled batch is not supported yet");
+  }
+  auto view   = sirius::get_cudf_table_view(read_only);
+  auto* space = read_only.get_memory_space();
+  if (space == nullptr) {
+    throw sirius::invalid_input_exception("Fragment: batch on output stream " +
+                                          std::to_string(stream_id) + " has no memory space");
+  }
+  rows = static_cast<std::uint64_t>(view.num_rows());
+
+  auto stream = cudf::get_default_stream();
+  // STREAM-LINEAGE: order the copy after the batch's writer.
+  if (cudaEvent_t writer = read_only.get_writer_event()) {
+    if (auto err = cudaStreamWaitEvent(stream.value(), writer, 0); err != cudaSuccess) {
+      throw sirius::internal_exception("Fragment: cudaStreamWaitEvent failed: {}",
+                                       cudaGetErrorString(err));
+    }
+  }
+
+  std::vector<cudf::column_metadata> metadata;
+  metadata.reserve(static_cast<std::size_t>(view.num_columns()));
+  for (auto const& column : view) {
+    metadata.push_back(nameless_metadata(column));
+  }
+  auto schema = cudf::to_arrow_schema(view, metadata);
+  // Temporary device allocations of the conversion (decimal widening, bool packing) come from the
+  // batch's own memory space and are reserved there for the copy's duration; the host buffers are
+  // Arrow-owned and freed through the release callback the caller now holds.
+  sirius::arrow_transfer_reservation scratch(
+    *space,
+    stream,
+    sirius::arrow_export_scratch_bytes(view),
+    "Fragment: export_arrow() of output stream " + std::to_string(stream_id));
+  auto host = cudf::to_arrow_host(view, stream, space->get_default_allocator());
+  // The caller may read (and release) the host buffers the moment this returns.
+  stream.synchronize();
+
+  // Move both structs into the caller's storage (Arrow C ABI move: copy the struct, then mark
+  // the source released so cudf's deleters free only their own allocations).
+  *reinterpret_cast<ArrowArray*>(array_addr)   = host->array;
+  host->array.release                          = nullptr;
+  *reinterpret_cast<ArrowSchema*>(schema_addr) = *schema;
+  schema->release                              = nullptr;
+  return true;
+}
+
 void Fragment::push_packed(std::uint64_t stream_id,
                            std::uintptr_t metadata_addr,
                            std::size_t metadata_len,
@@ -860,6 +1173,26 @@ void Fragment::push_packed(std::uint64_t stream_id,
   }
 }
 
+void Fragment::push_arrow(std::uint64_t stream_id,
+                          std::uint32_t sender_id,
+                          std::uintptr_t array_addr,
+                          std::uintptr_t schema_addr)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before push_arrow()");
+  }
+  // One implementation for both entry points: the handle is what a producer thread holds.
+  impl_->input->push_arrow(stream_id, sender_id, array_addr, schema_addr);
+}
+
+std::shared_ptr<FragmentInput> Fragment::input_handle()
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before input_handle()");
+  }
+  return impl_->input;
+}
+
 void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
 {
   if (!impl_->built) {
@@ -874,38 +1207,31 @@ void Fragment::run()
     throw sirius::invalid_input_exception("Fragment: build() must run before run()");
   }
   if (impl_->ran) { throw sirius::invalid_input_exception("Fragment: already run"); }
-
-  try {
-    if (impl_->is_result()) {
-      auto& client = *impl_->ctx.conn->context;
-      sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
-      impl_->result = iface.sirius_execute_query(client,
-                                                 kQueryLabel,
-                                                 impl_->result_plan,
-                                                 duckdb::PendingQueryParameters{},
-                                                 impl_->lifecycle->query_id());
-    } else {
-      impl_->fragment->run();
-    }
-    impl_->ran = true;
-  } catch (...) {
-    // Poison every output before unwinding. Without this the streams are neither closed nor
-    // failed, so a peer parked in wait() blocks forever with no error anywhere — the S2/S3
-    // hazard the design doc calls out. First-failure-wins, so this cannot mask a real cause.
-    // A result fragment has no outputs, so this is a no-op there.
-    auto const cause = std::current_exception();
-    for (auto id : impl_->outputs) {
-      try {
-        impl_->session().fail_output(id, cause);
-      } catch (...) {  // NOLINT(bugprone-empty-catch)
-      }
-    }
-    impl_->end_lifecycle();
-    throw;
+  if (impl_->started) {
+    throw sirius::invalid_input_exception(
+      "Fragment: already started; call join() instead of run()");
   }
-  impl_->lifecycle->finish();
-  impl_->lifecycle.reset();
-  if (impl_->result && impl_->result->HasError()) { impl_->result->ThrowError(); }
+  impl_->start();
+  impl_->join();
+}
+
+void Fragment::start()
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before start()");
+  }
+  if (impl_->ran) { throw sirius::invalid_input_exception("Fragment: already run"); }
+  if (impl_->started) { throw sirius::invalid_input_exception("Fragment: already started"); }
+  impl_->start();
+}
+
+void Fragment::join()
+{
+  if (impl_->ran) { throw sirius::invalid_input_exception("Fragment: already run"); }
+  if (!impl_->started) {
+    throw sirius::invalid_input_exception("Fragment: start() must run before join()");
+  }
+  impl_->join();
 }
 
 void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)

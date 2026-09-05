@@ -120,6 +120,37 @@ const WARMUP_PEERS: PeerList = PeerList {
     name: "SIRIUS_CN_NIXL_WARMUP_PEERS",
 };
 
+/// Encode-and-send workers per remote Arrow drain (`arrow_exchange.rs`, `send_fragment`).
+///
+/// A drain exports parked batches on the engine thread and hands each chunk of at most 64 MiB
+/// to one of these workers, which IPC-encodes it and ships it over its own connection while the
+/// others do the same: N frames in flight per destination instead of one round trip at a time
+/// (the first SF1000 run moved 0.29 GB/s per stream that way). The receiver reorders frames that
+/// overtake each other. `1` is the sequential wire shape. Host memory per drain is bounded by
+/// about three chunks per worker.
+const ARROW_SEND_WORKERS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_ARROW_SEND_WORKERS",
+    default: 4,
+    min: 1,
+    max: 64,
+};
+
+/// Threads of the brpc server's tokio runtime (`main.rs`, `BrpcRuntime`).
+///
+/// `1` is the current-thread runtime the CN has always used: every connection's frames are
+/// read and decoded on that one thread, and handlers run on the blocking pool. The Arrow
+/// exchange transport's receiver reads 64 MiB frames from several sender connections at once,
+/// and one thread caps that on loopback here (single runs, 8 frames of 64 MiB): 1.3 GB/s for a
+/// 4-worker drain and 1.4 for an 8-worker one, which 4 threads lift to 2.0 and 2.7 GB/s (one
+/// worker on one thread: 0.64). The default stays 1 because it changes the threading of every
+/// RPC the CN serves, FE traffic included.
+const BRPC_IO_THREADS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_BRPC_IO_THREADS",
+    default: 1,
+    min: 1,
+    max: 64,
+};
+
 /// One environment-backed knob: where it is read from, what it is when unset, and the range
 /// outside which a value is an error rather than a clamp.
 struct Knob<T> {
@@ -343,6 +374,132 @@ impl FusionMode {
     }
 }
 
+/// How a sender fragment's parked output reaches a REMOTE receiver (`compute_node_service.rs`,
+/// `execute_ready_fragment`'s remote drain). Same-CN exchanges are untouched by this knob: they
+/// stay native relays (or fusions) on the GPU either way.
+///
+/// Not a [`Knob`]: the value is a word, not a number in a range, so it has its own reader with
+/// the same three rules (reject, log, unset means the default) — the [`FusionMode`] pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ExchangeTransport {
+    /// `export_packed` into a staging lease, nixl WRITE into the peer's lease, `transmit_packed`
+    /// with the pack metadata (the shipped default; needs the staging arena and libnixl).
+    Nixl = 0,
+    /// `export_arrow` to host Arrow, one Arrow IPC stream per `transmit_packed` attachment
+    /// (`arrow_ipc = true`), `push_arrow` on the receiver. No staging lease, no nixl.
+    Arrow = 1,
+}
+
+/// Environment name of the exchange transport.
+const EXCHANGE_TRANSPORT_NAME: &str = "SIRIUS_CN_EXCHANGE_TRANSPORT";
+
+impl ExchangeTransport {
+    /// The transport when the variable is unset.
+    pub(crate) const DEFAULT: Self = Self::Nixl;
+
+    /// The accepted spellings, for the rejection message.
+    const ACCEPTED: &'static str = "nixl, arrow";
+
+    /// The configured transport, or the default when unset. Trimmed and case-insensitive.
+    ///
+    /// # Errors
+    /// Any other value, naming the variable, the value and the accepted set.
+    fn read() -> Result<Self, String> {
+        let Some(raw) = env_value(EXCHANGE_TRANSPORT_NAME) else {
+            return Ok(Self::DEFAULT);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "nixl" => Ok(Self::Nixl),
+            "arrow" => Ok(Self::Arrow),
+            _ => Err(format!(
+                "{EXCHANGE_TRANSPORT_NAME}: expected one of {}, got \"{raw}\" (unset means the \
+                 default, nixl)",
+                Self::ACCEPTED
+            )),
+        }
+    }
+
+    /// The transport as the byte an `AtomicU8` holds; [`from_code`](Self::from_code) inverts it.
+    pub(crate) const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`code`](Self::code); `None` for a byte no transport produces.
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Nixl),
+            1 => Some(Self::Arrow),
+            _ => None,
+        }
+    }
+}
+
+/// How a RESULT_SINK fragment's rows come back from the engine (`engine.rs`,
+/// `run_fragment_inner`): the M4 one-copy Arrow output path behind a knob.
+///
+/// Not a [`Knob`]: a word, read with the same three rules (reject, log, unset means the
+/// default) — the [`ExchangeTransport`] pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ResultPath {
+    /// `result_to_arrow`: the engine's result collector materializes a DuckDB result (D2H copy,
+    /// host table to `DataChunk`, `ColumnDataCollection`) and DuckDB's Arrow stream wrapper
+    /// converts it (four copies per byte). The shipped default.
+    DuckDb = 0,
+    /// The result fragment declares one output stream and runs as an intermediate fragment; its
+    /// parked GPU batches are drained with `export_arrow_next` (`cudf::to_arrow_host`, one D2H
+    /// copy per batch) into the same `RecordBatch`es the MySQL encoder reads.
+    Arrow = 1,
+}
+
+/// Environment name of the result path.
+const RESULT_PATH_NAME: &str = "SIRIUS_CN_RESULT_PATH";
+
+impl ResultPath {
+    /// The path when the variable is unset.
+    pub(crate) const DEFAULT: Self = Self::DuckDb;
+
+    /// The accepted spellings, for the rejection message.
+    const ACCEPTED: &'static str = "duckdb, arrow";
+
+    /// The configured path, or the default when unset. Trimmed and case-insensitive.
+    ///
+    /// # Errors
+    /// Any other value, naming the variable, the value and the accepted set.
+    fn read() -> Result<Self, String> {
+        let Some(raw) = env_value(RESULT_PATH_NAME) else {
+            return Ok(Self::DEFAULT);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "duckdb" => Ok(Self::DuckDb),
+            "arrow" => Ok(Self::Arrow),
+            _ => Err(format!(
+                "{RESULT_PATH_NAME}: expected one of {}, got \"{raw}\" (unset means the default, \
+                 duckdb)",
+                Self::ACCEPTED
+            )),
+        }
+    }
+
+    /// The path as the byte an `AtomicU8` holds; [`from_code`](Self::from_code) inverts it.
+    /// Read by the engine handle, which only exists with the `sirius-engine` feature.
+    #[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
+    pub(crate) const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`code`](Self::code); `None` for a byte no path produces.
+    #[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::DuckDb),
+            1 => Some(Self::Arrow),
+            _ => None,
+        }
+    }
+}
+
 /// The resolved transport tunables. Clone so call sites can hold one cheaply: the peer list is
 /// the one heap field, and it is `None` in every configuration but an explicit
 /// `SIRIUS_CN_NIXL_WARMUP_PEERS`.
@@ -370,6 +527,14 @@ pub struct Tunables {
     pub warmup_peers: Option<Vec<(String, u16)>>,
     /// See [`FusionMode`].
     pub(crate) fusion_mode: FusionMode,
+    /// See [`ExchangeTransport`].
+    pub(crate) exchange_transport: ExchangeTransport,
+    /// See [`ARROW_SEND_WORKERS`].
+    pub arrow_send_workers: usize,
+    /// See [`BRPC_IO_THREADS`].
+    pub brpc_io_threads: usize,
+    /// See [`ResultPath`].
+    pub(crate) result_path: ResultPath,
 }
 
 impl Tunables {
@@ -385,6 +550,10 @@ impl Tunables {
         warmup: WARMUP.default,
         warmup_peers: None,
         fusion_mode: FusionMode::DEFAULT,
+        exchange_transport: ExchangeTransport::DEFAULT,
+        arrow_send_workers: ARROW_SEND_WORKERS.default as usize,
+        brpc_io_threads: BRPC_IO_THREADS.default as usize,
+        result_path: ResultPath::DEFAULT,
     };
 
     /// Reads and validates every knob without touching the global.
@@ -409,6 +578,10 @@ impl Tunables {
             warmup: WARMUP.read()?,
             warmup_peers: WARMUP_PEERS.read()?,
             fusion_mode: FusionMode::read()?,
+            exchange_transport: ExchangeTransport::read()?,
+            arrow_send_workers: ARROW_SEND_WORKERS.read()? as usize,
+            brpc_io_threads: BRPC_IO_THREADS.read()? as usize,
+            result_path: ResultPath::read()?,
         })
     }
 
@@ -446,6 +619,10 @@ impl Tunables {
             warmup = published.warmup,
             warmup_peers = ?published.warmup_peers,
             fusion_mode = ?published.fusion_mode,
+            exchange_transport = ?published.exchange_transport,
+            arrow_send_workers = published.arrow_send_workers,
+            brpc_io_threads = published.brpc_io_threads,
+            result_path = ?published.result_path,
             "resolved CN transport tunables"
         );
         Ok(published)
@@ -518,6 +695,10 @@ pub(crate) mod tests {
                 (WARMUP.name, None),
                 (WARMUP_PEERS.name, None),
                 (FUSION_MODE_NAME, None),
+                (EXCHANGE_TRANSPORT_NAME, None),
+                (ARROW_SEND_WORKERS.name, None),
+                (BRPC_IO_THREADS.name, None),
+                (RESULT_PATH_NAME, None),
             ],
             Tunables::from_env,
         )
@@ -533,6 +714,83 @@ pub(crate) mod tests {
         assert!(resolved.warmup);
         assert_eq!(resolved.warmup_peers, None);
         assert_eq!(resolved.fusion_mode, FusionMode::Leaf);
+        assert_eq!(resolved.exchange_transport, ExchangeTransport::Nixl);
+        assert_eq!(resolved.arrow_send_workers, 4);
+        assert_eq!(resolved.brpc_io_threads, 1);
+        assert_eq!(resolved.result_path, ResultPath::DuckDb);
+    }
+
+    /// The result path knob: unset is `duckdb`; case and whitespace are tolerated; anything else
+    /// fails the whole resolution naming the variable, the value and the accepted set.
+    #[test]
+    fn result_path_parses_duckdb_arrow_and_rejects_others() {
+        assert_eq!(
+            with_env(&[(RESULT_PATH_NAME, None)], ResultPath::read),
+            Ok(ResultPath::DuckDb)
+        );
+        for duckdb in ["duckdb", "DuckDB", " duckdb "] {
+            assert_eq!(
+                with_env(&[(RESULT_PATH_NAME, Some(duckdb))], ResultPath::read),
+                Ok(ResultPath::DuckDb),
+                "{duckdb:?}"
+            );
+        }
+        assert_eq!(
+            with_env(&[(RESULT_PATH_NAME, Some("ARROW"))], ResultPath::read),
+            Ok(ResultPath::Arrow)
+        );
+        for bad in ["off", "cudf", "1"] {
+            let error = with_env(&[(RESULT_PATH_NAME, Some(bad))], ResultPath::read)
+                .expect_err("not an accepted result path");
+            assert!(
+                error.contains(RESULT_PATH_NAME)
+                    && error.contains(bad)
+                    && error.contains("duckdb, arrow"),
+                "{error}"
+            );
+        }
+        let resolved = with_env(&[(RESULT_PATH_NAME, Some("arrow"))], Tunables::from_env)
+            .expect("arrow resolves");
+        assert_eq!(resolved.result_path, ResultPath::Arrow);
+        for path in [ResultPath::DuckDb, ResultPath::Arrow] {
+            assert_eq!(ResultPath::from_code(path.code()), Some(path));
+        }
+        assert_eq!(ResultPath::from_code(2), None);
+    }
+
+    /// The brpc I/O thread count: unset is 1 (the current-thread runtime), a value in 1..=64 is
+    /// taken, `0` fails the whole resolution naming the variable.
+    #[test]
+    fn brpc_io_threads_takes_a_count_and_rejects_zero() {
+        let four = with_env(&[(BRPC_IO_THREADS.name, Some("4"))], Tunables::from_env)
+            .expect("four threads resolve");
+        assert_eq!(four.brpc_io_threads, 4);
+        let error = with_env(&[(BRPC_IO_THREADS.name, Some("0"))], Tunables::from_env)
+            .expect_err("zero threads cannot serve");
+        assert!(error.contains(BRPC_IO_THREADS.name), "{error}");
+    }
+
+    /// The Arrow send-worker count: unset is 4, a value in 1..=64 is taken, `0` (no worker could
+    /// ever send) and anything unparsable fail the whole resolution naming the variable.
+    #[test]
+    fn arrow_send_workers_takes_a_count_and_rejects_zero() {
+        let one = with_env(&[(ARROW_SEND_WORKERS.name, Some("1"))], Tunables::from_env)
+            .expect("one worker resolves");
+        assert_eq!(one.arrow_send_workers, 1);
+        let eight = with_env(
+            &[(ARROW_SEND_WORKERS.name, Some(" 8 "))],
+            Tunables::from_env,
+        )
+        .expect("eight workers resolve");
+        assert_eq!(eight.arrow_send_workers, 8);
+        for bad in ["0", "65", "four"] {
+            let error = with_env(&[(ARROW_SEND_WORKERS.name, Some(bad))], Tunables::from_env)
+                .expect_err("not an accepted worker count");
+            assert!(
+                error.contains(ARROW_SEND_WORKERS.name) && error.contains(bad),
+                "{error}"
+            );
+        }
     }
 
     /// The fusion knob: unset is `leaf`; the off spellings, case and whitespace are tolerated;
@@ -576,6 +834,75 @@ pub(crate) mod tests {
         let error = with_env(&[(FUSION_MODE_NAME, Some("all"))], Tunables::from_env)
             .expect_err("a bad mode fails the whole resolution");
         assert!(error.contains(FUSION_MODE_NAME), "{error}");
+    }
+
+    /// The exchange transport knob: unset is `nixl`; case and whitespace are tolerated; anything
+    /// else fails the whole resolution naming the variable, the value and the accepted set (so
+    /// `off`, `ucx` or a typo is a bring-up error, not a silent `nixl`).
+    #[test]
+    fn exchange_transport_parses_nixl_arrow_and_rejects_others() {
+        assert_eq!(
+            with_env(&[(EXCHANGE_TRANSPORT_NAME, None)], ExchangeTransport::read),
+            Ok(ExchangeTransport::Nixl)
+        );
+        for nixl in ["nixl", "NIXL", " nixl "] {
+            assert_eq!(
+                with_env(
+                    &[(EXCHANGE_TRANSPORT_NAME, Some(nixl))],
+                    ExchangeTransport::read
+                ),
+                Ok(ExchangeTransport::Nixl),
+                "{nixl:?}"
+            );
+        }
+        for arrow in ["arrow", "Arrow", " ARROW "] {
+            assert_eq!(
+                with_env(
+                    &[(EXCHANGE_TRANSPORT_NAME, Some(arrow))],
+                    ExchangeTransport::read
+                ),
+                Ok(ExchangeTransport::Arrow),
+                "{arrow:?}"
+            );
+        }
+        for bad in ["off", "ucx", "arrow-ipc", "1"] {
+            let error = with_env(
+                &[(EXCHANGE_TRANSPORT_NAME, Some(bad))],
+                ExchangeTransport::read,
+            )
+            .expect_err("not an accepted transport");
+            assert!(
+                error.contains(EXCHANGE_TRANSPORT_NAME)
+                    && error.contains(bad)
+                    && error.contains("nixl, arrow"),
+                "{error}"
+            );
+        }
+
+        let resolved = with_env(
+            &[(EXCHANGE_TRANSPORT_NAME, Some("arrow"))],
+            Tunables::from_env,
+        )
+        .expect("arrow resolves");
+        assert_eq!(resolved.exchange_transport, ExchangeTransport::Arrow);
+        let error = with_env(
+            &[(EXCHANGE_TRANSPORT_NAME, Some("ucx"))],
+            Tunables::from_env,
+        )
+        .expect_err("a bad transport fails the whole resolution");
+        assert!(error.contains(EXCHANGE_TRANSPORT_NAME), "{error}");
+    }
+
+    /// The byte an `AtomicU8` holds round-trips; a byte no transport produces decodes to nothing.
+    #[test]
+    fn exchange_transport_codes_round_trip() {
+        for transport in [ExchangeTransport::Nixl, ExchangeTransport::Arrow] {
+            assert_eq!(
+                ExchangeTransport::from_code(transport.code()),
+                Some(transport)
+            );
+        }
+        assert_eq!(ExchangeTransport::from_code(2), None);
     }
 
     /// The byte an `AtomicU8` holds round-trips; a byte no mode produces decodes to nothing.

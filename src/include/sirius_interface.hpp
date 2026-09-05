@@ -117,6 +117,18 @@ class sirius_interface {
   //! Execute the pending query result
   duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_pending_query_result(
     duckdb::PendingQueryResult& pending);
+  //! The first half of sirius_execute_query: plan the pending result and start the engine
+  //! without waiting. A planning failure comes back as an error-carrying pending result (same
+  //! contract as sirius_execute_query); a started query is finished with sirius_join_query.
+  duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_start_query(
+    duckdb::ClientContext& context,
+    const duckdb::string& query,
+    duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
+    const duckdb::PendingQueryParameters& parameters,
+    sirius::query_id_t query_id);
+  //! The second half: wait for the engine started by sirius_start_query and fetch the result.
+  //! Execution errors come back as an error-carrying result, as sirius_execute_query returns them.
+  duckdb::unique_ptr<duckdb::QueryResult> sirius_join_query(duckdb::PendingQueryResult& pending);
   //! Get the sirius engine
   sirius_engine& get_sirius_engine();
 };
