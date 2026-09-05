@@ -18,8 +18,11 @@ the declared stream schema, with Catch2 tests (the `[sirius_ffi]` suite is 18 ca
 Arrow hop test that returns the same rows as the `relay_from` and `push_packed` hops, and a micro-benchmark of both
 PCIe legs at 128 MiB, 512 MiB and 2 GiB; (M3, delivered) the Arrow-over-brpc exchange transport in the StarRocks CN,
 drained off the RPC thread and pipelined over several connections; (M4, delivered behind `SIRIUS_CN_RESULT_PATH=arrow`)
-a one-copy Arrow output through `cudf::to_arrow_host`; (M5) the end-to-end comparison against NIXL at the byte totals
-of 5.1: run once (below); the rerun with the M3 closing fixes is pending. Open outside this branch: the engine's
+a one-copy Arrow output through `cudf::to_arrow_host`; (M5) the end-to-end comparison against NIXL, run twice: six queries
+on 2026-09-04 and all 22 TPC-H queries on 2026-09-05 with the closing fixes in (M5 below). In the second run both
+transports pass the same 16 queries with identical oracle verdicts, the six failures are the 60 GiB pool on both, and
+the Arrow arm's warm sum is 186.8 s against NIXL's 103.2 s (Presto on two GPUs: 95.9 s) over those 16 queries, the
+gap proportional to the bytes exchanged (about 0.45 s per GB) and paid on the brpc wire, not on PCIe. Open outside this branch: the engine's
 task-creation error path that the first M5 run's out-of-memory took (`src/creator/task_creator.cpp`; it stops the
 scheduler from its own pool thread and the next fragment ran against the torn-down scheduler) is being fixed in a
 separate change; the CN-side trigger is closed here (M3, "Closing changes").
@@ -29,8 +32,9 @@ device pointers or pack metadata (in hand); the widened threading contract, `sta
 input handle (section 3, in hand);
 numbers for what the Arrow path pays (D2H, host copies, H2D, all PCIe-bound) against what NIXL pays (one
 device-to-device write at 48-56 GB/s here). The per-leg numbers are measured: 10 GB/s in, 1.1-1.2 GB/s out through the
-default result path, 4.1-4.3 GB/s through `to_arrow_host`. The end-to-end arms ran once (M5, 4.3); the rerun with the
-closing fixes is pending.
+default result path, 4.1-4.3 GB/s through `to_arrow_host`. The end-to-end arms ran twice (M5): with the closing fixes the Arrow
+transport moves 0.6-1.3 GB/s per query on loopback brpc, 2-4x the first run and still 40-80x under the
+device-to-device write, and no query fails or crashes for a transport reason.
 
 ## 1. The current design
 
@@ -527,7 +531,9 @@ Original plan, kept for the record:
 - Risks: the `sirius_interface` result path (2.5); decimal precision fidelity at the MySQL edge. Dependencies: M1;
   independent of M2 and M3.
 
-### M5: measured comparison against NIXL (first end-to-end run, 2026-09-04 20:00 UTC)
+### M5: measured comparison against NIXL
+
+#### First end-to-end run (2026-09-04 20:00 UTC, six queries)
 
 Same CN binary (this branch at 664653c5), 2 CNs, `GPU_MEM=60GiB STAGING=32GiB`, SF1000, cold + 2 warm, six queries,
 knob `SIRIUS_CN_EXCHANGE_TRANSPORT=nixl` then `=arrow` (`harness/arms-arrow-vs-nixl.sh`; arms `X-nixl`, `X-arrow`).
@@ -565,7 +571,7 @@ What the failure analysis of that run and the closing changes established (M3, "
   the table is a retry). The crash did not reproduce in five gdb-wrapped cluster runs; three induced OOMs took the
   executor path and recovered. The engine fix (report, do not stop, from the creation catch) is out of this branch's
   scope; the CN-side trigger is closed: the RPC replies before the drain, and the drain is 4-7x faster on loopback.
-- The arm has not been rerun with these changes yet. The numbers to expect
+- (Written before the second run.) The numbers to expect
   from the loopback bench: a 19.7 GB q03 stream at 1.3 GB/s takes ~15 s instead of 68 s (4 workers, one I/O thread),
   ~10 s with `SIRIUS_CN_BRPC_IO_THREADS=4`. That bench excludes both PCIe legs: its export is host-resident
   (`export_ms` = 0) and its peer stages the frames without running `push_arrow`, so a stream's wall time in the arm is
@@ -574,6 +580,68 @@ What the failure analysis of that run and the closing changes established (M3, "
   competes with the other drains for the one engine thread. Both are logged per stream so the next run can attribute
   what is left. Knobs for the rerun: `SIRIUS_CN_EXCHANGE_TRANSPORT=arrow SIRIUS_CN_ARROW_SEND_WORKERS=4
   SIRIUS_CN_BRPC_IO_THREADS=4`, and `SIRIUS_CN_RESULT_PATH=arrow` for the M4 leg.
+
+#### Second end-to-end run (2026-09-05 00:49 UTC, all 22 queries, closing fixes in)
+
+Same harness and conditions (2 CNs, one per GPU, `GPU_MEM=60GiB STAGING=32GiB`, SF1000, cold + 2 warm, warm medians
+below), this branch at d2724704 with the closing fixes 5503e422, 2f09fdea, dbdaa350 and 18683658 in, knob
+`SIRIUS_CN_EXCHANGE_TRANSPORT=nixl` then `=arrow` on the same CN binary, `SIRIUS_CN_ARROW_SEND_WORKERS` at its default
+of 4, `SIRIUS_CN_BRPC_IO_THREADS` and `SIRIUS_CN_RESULT_PATH` at their defaults. Arms `X-nixl` and `X-arrow` (the
+six-query run moved to `X-nixl.six` / `X-arrow.six`); tables `arms/arrow-vs-nixl.md` and
+`arms/presto-nixl-arrow-sf1000.md`. The two arms took 17 minutes together.
+
+| query | NIXL warm | Arrow warm | Arrow minus NIXL | Arrow IPC bytes | drain: export / encode / send (worker-s) / elapsed, summed over streams | Arrow GB/s (bytes / elapsed) |
+|---|---|---|---|---|---|---|
+| q01 | 6.5 s | 6.5 s | 0 | KB | | |
+| q02 | 2.3 | 10.4 | +8.1 | 16.1 GB | 7.1 / 8.9 / 54.4 / 23.2 s | 0.70 |
+| q03 | 7.4 | 23.4 | +16.0 | 40.7 GB | 14.8 / 21.8 / 90.8 / 37.7 s | 1.08 |
+| q04 | 5.5 | 16.9 | +11.4 | 30.8 GB | 9.0 / 16.4 / 59.7 / 23.9 s | 1.29 |
+| q06 | 5.5 | 5.5 | 0 | KB | | |
+| q07 | 9.7 | 31.5 | +21.8 | 49.4 GB | 19.8 / 26.9 / 231.0 / 80.5 s | 0.61 |
+| q10 | 8.0 | 11.3 | +3.3 | 7.0 GB | 1.8 / 4.0 / 17.1 / 10.1 s | 0.70 |
+| q11 | 1.8 | 2.7 | +0.9 | 0.26 GB | 0.1 / 0.1 / 0.6 / 1.3 s | 0.21 |
+| q12 | 5.5 | 11.5 | +6.0 | 15.7 GB | 13.9 / 8.9 / 34.0 / 22.1 s | 0.71 |
+| q13 | 5.9 | 9.6 | +3.7 | 9.4 GB | 2.9 / 5.1 / 21.6 / 9.2 s | 1.02 |
+| q14 | 8.1 | 9.7 | +1.6 | 3.7 GB | 1.4 / 1.9 / 10.2 / 4.3 s | 0.85 |
+| q15 | 15.5 | 15.4 | 0 | 0.6 GB | | |
+| q16 | 1.0 | 5.6 | +4.6 | 9.3 GB | 3.5 / 5.2 / 21.2 / 10.0 s | 0.93 |
+| q19 | 8.1 | 8.5 | +0.4 | 1.9 GB | | |
+| q20 | 9.9 | 13.1 | +3.2 | 8.9 GB | 6.5 / 4.9 / 27.7 / 12.7 s | 0.70 |
+| q22 | 2.5 | 5.2 | +2.7 | 6.2 GB | 1.8 / 3.4 / 14.0 / 6.9 s | 0.89 |
+| q05 q08 q09 q17 q18 q21 | fail | fail | | | `out_of_memory` in the 60 GiB pool on both transports, the same six as every 2-CN arm of the demo build | |
+
+Sums over the 16 queries both transports complete: NIXL 103.2 s, Arrow 186.8 s, Presto on two GPUs 95.9 s (its
+`gpu2_sf1000_*` timings), Sirius on one CN 109.3 s (15 of them; q16 was not in the 1-CN arm).
+
+Reading.
+
+- Correctness: both transports pass the same 16 queries and return identical oracle verdicts (q02 q04 q06 q12 q13 q14
+  q20 q22 MATCH; q01 q03 q07 q10 q15 q19 the known decimal class, the same cells on both; q16 has no oracle). No CN
+  crashed, no drain tripped the FE's RPC deadline, no query was cancelled and retried: the reply-before-drain change
+  removed the chain the first run died of. One q15 run of three returned 0 rows on the Arrow arm; the NIXL arm did the
+  same on its q15 r1, and so did the `B2`, `P-2cn` and `V3b` arms of the demo build before this branch existed, so it
+  is a pre-existing demo-build defect and not the transport (reported separately).
+- Against the first run: q03 84 s to 23.4 s, q04 out-of-memory to 16.9 s, q07 crash to 31.5 s; the aggregate rate
+  0.28 GB/s to 0.6-1.3 GB/s per query.
+- Where the Arrow time goes. The extra time is proportional to the bytes exchanged, about 0.45 s per GB (q07 21.8 s
+  for 49.4 GB, q03 16.0 s for 40.7 GB, q02 8.1 s for 16.1 GB), and queries exchanging under 2 GB are identical (q01
+  q06 q15 q19). Inside a drain the wire dominates: on q07 the four send workers spent 231 worker-seconds shipping
+  49.4 GB of 64 MiB frames over loopback brpc, about 0.85 GB/s together, behind 80.5 s of summed drain time; the D2H
+  export (19.8 s, 2.5 GB/s through `export_arrow`) and the IPC encode (26.9 s) are serialized on the drain thread per
+  stream and take the rest. The receiver's `push_arrow` totals 5.0 s for the same bytes (about 10 GB/s H2D, as the
+  micro-benchmark predicted) and is off the critical path. So on this box the Arrow exchange is bounded by the brpc
+  wire and the per-stream serialization, not by PCIe; NIXL moves the same bytes device to device at 48-56 GB/s and
+  shows no measurable exchange cost at all.
+- What would move the Arrow number, untested in the arm: `SIRIUS_CN_BRPC_IO_THREADS=4` (the loopback bench put a
+  19.7 GB stream at ~10 s instead of ~15 s), overlapping export and encode with the send instead of running them
+  ahead of it per stream, and sending the Arrow buffers without the IPC framing (the encode is a third of the drain).
+- Conclusion for the design question, unchanged: for CN-to-CN exchange on one host NIXL stays. The Arrow path is the
+  host-input contract for a CPU-side producer, and a producer whose data already lives in host memory (a Doris BE
+  scan) pays only the H2D leg of these numbers, about 10 GB/s; the table above is the cost of routing a GPU-resident
+  exchange through the host path, D2H plus encode plus wire plus H2D.
+
+Evidence: `arms/X-nixl`, `arms/X-arrow` (`runs/runs.csv`, `compare.txt`, `cnlog.txt`, `cluster.log`), the two tables
+above, and copies under `starrocks-tools/evidence/rtxpro6000-fix4/{X-nixl-22q,X-arrow-22q}`.
 
 ## 5. Performance comparison against NIXL
 
@@ -682,6 +750,10 @@ q03 at the measured rates (40.10 GB, table 5.1), arithmetic rather than a measur
 | Arrow out through today's result path | 1.2 GB/s | 33 s |
 | Arrow out through `to_arrow_host` (M4) | 4.1 GB/s | 9.8 s |
 | NIXL, sum of `write_ms` / sum of `elapsed_ms` | 54 GB/s / 28 GB/s | 0.74 s / 1.41 s |
+
+Measured end to end (M5, second run): q03 exchanged 40.7 GB over Arrow in 37.7 s of summed drain time (1.08 GB/s) and
+took 23.4 s against 7.4 s over NIXL, +16.0 s; q07 exchanged 49.4 GB and paid +21.8 s. The arithmetic above under-counts
+the wire: the brpc loopback leg, not the two PCIe legs, is the largest term (M5).
 
 The gap shrinks on q22 (6.19 GB) and disappears only where the data already lives on the host: a CPU scan (an internal
 table on a Doris BE) pays the H2D leg instead of a GPU scan, and there the Arrow path buys the host's tables and
