@@ -23,12 +23,14 @@
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/retry_futility.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
 
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <optional>
@@ -174,6 +176,19 @@ class task_scheduler {
   void terminate_query(std::exception_ptr error);
 
   /**
+   * @brief Fail the running query as stalled.
+   *
+   * Reports an error through the completion handler (first-call-wins: a query that completes
+   * concurrently keeps its real outcome) WITHOUT stopping the scheduler or draining executors —
+   * draining after an error belongs to the engine's execute() catch path, which observes the
+   * failed future. Called from the engine thread by the opt-in query watchdog (see
+   * sirius_engine::execute); never from the task creator's manager thread.
+   *
+   * @param stalled_secs How long the watchdog observed no scheduling progress, for the message.
+   */
+  void fail_stalled_query(uint64_t stalled_secs);
+
+  /**
    * @brief Drain all in-flight tasks after a query error.
    *
    * Drains the top-level task queue and waits for each GPU executor to finish
@@ -214,6 +229,11 @@ class task_scheduler {
   /// Only mutated by the management thread (matches device_ready signals from
   /// _task_request_channel and erases on dispatch), so no synchronization needed.
   std::vector<int> _ready_devices;
+
+  /// Progress signals shared by every GPU executor below (the OOM fail-fast reads them so a
+  /// completion on one GPU counts as progress for a retry on another). Declared before the
+  /// executors, which also hold a shared_ptr, so it outlives them either way.
+  std::shared_ptr<execution_progress> _execution_progress = std::make_shared<execution_progress>();
 
   /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;

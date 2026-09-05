@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::opcodes::TExprOpcode;
@@ -10,17 +10,22 @@ use substrait::proto::read_rel::local_files::file_or_files::{
 };
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
-    AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel,
-    Rel, RelCommon, SortField, SortRel, aggregate_rel, expression, fetch_rel, function_argument,
-    join_rel, rel, rel_common, sort_field,
+    AggregateFunction, AggregateRel, AggregationPhase, Expression, FetchRel, FilterRel, JoinRel,
+    ProjectRel, ReadRel, Rel, RelCommon, SortField, SortRel, aggregate_rel, expression, fetch_rel,
+    function_argument, join_rel, rel, rel_common, sort_field,
 };
 
+use crate::agg_phase::{self, AggPhase};
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
-use crate::expr_translator::{self, ExprContext, TranslateExpr};
+use crate::expr_translator::{self, CarriedSlot, ExprContext, TranslateExpr};
+use crate::partial_state::{self, WireColumn};
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
-use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON};
+use crate::{
+    ExchangeInput, ExtensionRegistry, StreamInputColumn, StreamInputSchema, URN_AGGREGATE,
+    URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
+};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
@@ -41,6 +46,15 @@ pub(crate) struct TranslatedRel {
     /// that silently produced a wrong offset the moment an unknown relation
     /// appeared mid-tree. Every relation built here MUST set its true width.
     pub output_width: usize,
+    /// Common-expr columns carried past the descriptor row (see [`translate_project_node`]).
+    ///
+    /// Invariant: columns `[0, output_width - carried_slots.len())` are exactly the
+    /// concatenation of `materialized_slot_ids(t)` for `t` in `row_tuples`; the carried
+    /// columns occupy the tail `[output_width - carried_slots.len(), output_width)`.
+    /// Deliberately no `Default` impl: every construction site must decide whether carried
+    /// columns survive it. Width-preserving nodes pass them through, re-materializing nodes
+    /// drop them by construction, joins refuse them, and the fragment root narrows them away.
+    pub carried_slots: Vec<CarriedSlot>,
 }
 
 /// Mutable state shared by plan-node translators.
@@ -51,8 +65,63 @@ struct PlanContext<'a> {
     /// scan ranges. Scans with paths emit a `local_files` read; path-less scans
     /// fall back to a named-table read.
     scan_paths: &'a ScanFilePaths,
+    /// Input streams keyed by receiver exchange node id.
+    exchange_inputs: &'a HashMap<i32, &'a ExchangeInput>,
     /// Substrait extension registry shared across the whole plan.
     registry: &'a mut ExtensionRegistry,
+    /// Schema of every exchange lowered to a stream read, in translation order. The caller has to
+    /// declare these on the engine before the plan can bind.
+    stream_inputs: Vec<StreamInputSchema>,
+    /// Positional wire-column overrides, keyed by exchange node id, for exchanges that feed
+    /// merge aggregations: the FE declares those columns with intermediate slot types that lie
+    /// about what the sender ships, and allocates one slot for a state that can be wider (see
+    /// `partial_state`). Computed by [`merge_exchange_overrides`] before translation starts.
+    exchange_state_overrides: HashMap<i32, Vec<StateColumns>>,
+    /// Set when a partial aggregation emitted more columns than its FE output tuple declares.
+    /// The fragment's root output names come from here instead of the descriptor table.
+    partial_expansion: Option<PartialExpansion>,
+    /// Common-expr slots each project must physically carry because an ancestor consumes them,
+    /// keyed by project node id with slot ids ascending. Computed by
+    /// [`common_slots_consumed_above`] before translation starts.
+    consumed_above: HashMap<i32, Vec<i32>>,
+}
+
+/// The wire columns one merge measure's partial state occupies on the exchange row.
+///
+/// `position` indexes the row the *FE* declared (one column per intermediate slot); the extra
+/// types of a wider state are inserted behind it, which is where the partial fragment emitted
+/// them.
+struct StateColumns {
+    /// Index of the measure's own column in the FE-declared exchange row.
+    position: usize,
+    /// Modeled wire types: the first replaces the FE slot type, the rest are inserted after it.
+    types: Vec<substrait::proto::Type>,
+}
+
+/// A partial aggregation that emits more columns than its FE output tuple declares, because an
+/// avg measure expanded into a sum and a count.
+///
+/// Every consumer of the fragment's output row layout has to be told: the FE tuple no longer
+/// describes what the sender ships, so deriving names or column indices from it would mislabel
+/// (or misread) every column at or after the avg.
+pub(crate) struct PartialExpansion {
+    /// The aggregation node that expanded.
+    node_id: i32,
+    /// Grouping-key count. Keys keep their FE column index; measures may not.
+    pub(crate) keys: usize,
+    /// Root output names for the emitted row: the FE's names with the extras inserted.
+    pub(crate) names: Vec<String>,
+}
+
+/// One translated fragment: its relation tree plus everything the caller has to declare or
+/// name because the FE's descriptor table no longer describes it alone.
+pub(crate) struct TranslatedFragment {
+    /// Root relation and its row layout.
+    pub root: TranslatedRel,
+    /// Schema of every exchange lowered to a stream read, in translation order.
+    pub stream_inputs: Vec<StreamInputSchema>,
+    /// Set when a partial aggregation widened the output row (see [`PartialExpansion`]).
+    pub partial_expansion: Option<PartialExpansion>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -60,12 +129,18 @@ impl<'a> PlanContext<'a> {
     fn new(
         desc: &'a DescriptorTable,
         scan_paths: &'a ScanFilePaths,
+        exchange_inputs: &'a HashMap<i32, &'a ExchangeInput>,
         registry: &'a mut ExtensionRegistry,
     ) -> Self {
         Self {
             desc,
             scan_paths,
+            exchange_inputs,
             registry,
+            stream_inputs: Vec::new(),
+            exchange_state_overrides: HashMap::new(),
+            partial_expansion: None,
+            consumed_above: HashMap::new(),
         }
     }
 
@@ -167,6 +242,7 @@ fn translate_plan_node(
         TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
         TPlanNodeType::HASH_JOIN_NODE => translate_hash_join(node, children, ctx),
         TPlanNodeType::NESTLOOP_JOIN_NODE => translate_nestloop_join(node, children, ctx),
+        TPlanNodeType::EXCHANGE_NODE => translate_exchange(node, children, ctx),
         _ => Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
@@ -188,6 +264,11 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         .sort_node
         .as_ref()
         .and_then(|sort| sort.offset)
+        .or_else(|| {
+            node.exchange_node
+                .as_ref()
+                .and_then(|exchange| exchange.offset)
+        })
         .unwrap_or(0);
     if node.limit < 0 && offset == 0 {
         return input;
@@ -196,6 +277,7 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         rel,
         row_tuples,
         output_width,
+        carried_slots,
     } = input;
     // For an offset-only fetch, emit an explicit unlimited count: the consumer reads the plain
     // count field without checking the oneof, and an unset count would decode as `LIMIT 0`.
@@ -213,6 +295,8 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         },
         row_tuples,
         output_width,
+        // A fetch keeps the row layout, carried columns included.
+        carried_slots,
     }
 }
 
@@ -270,6 +354,7 @@ fn translate_scan(
         rel: scan_rel(ctx.desc, tuple_id, file_paths)?,
         row_tuples: vec![tuple_id],
         output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
+        carried_slots: Vec::new(),
     };
     apply_conjuncts(input, node, ctx)
 }
@@ -329,22 +414,409 @@ fn translate_project(
 }
 
 /// Translates a flat preorder StarRocks plan into a Substrait relation tree.
+///
+/// `root_output_exprs` are the fragment's output expressions (empty when absent); they count
+/// as consumers sitting above the fragment root for [`common_slots_consumed_above`].
 pub(crate) fn translate_plan(
     plan: &TPlan,
+    root_output_exprs: &[TExpr],
     desc: &DescriptorTable,
     scan_paths: &ScanFilePaths,
+    exchange_inputs: &HashMap<i32, &ExchangeInput>,
     registry: &mut ExtensionRegistry,
-) -> Result<TranslatedRel> {
-    let mut ctx = PlanContext::new(desc, scan_paths, registry);
-    plan.translate(&mut ctx)
+) -> Result<TranslatedFragment> {
+    let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
+    ctx.exchange_state_overrides = merge_exchange_overrides(plan)?;
+    ctx.consumed_above = common_slots_consumed_above(plan, root_output_exprs, desc)?;
+    let root = plan.translate(&mut ctx)?;
+    if let Some(expansion) = &ctx.partial_expansion {
+        // Only the fragment root's row leaves this CN by name. Any node above the expanded
+        // aggregation would resolve the aggregation's slots at their FE positions, which the
+        // expansion moved -- a wrong column read, not a type error the engine would catch.
+        if plan.nodes.first().map(|node| node.node_id) != Some(expansion.node_id) {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: expansion.node_id,
+                node_type: TPlanNodeType::AGGREGATION_NODE,
+                reason: "a partial aggregation over avg must be the fragment root; a node above \
+                         it reads the aggregate's columns at the positions the avg state moved \
+                         (SET new_planner_agg_stage = 1)",
+            });
+        }
+        if root.output_width != expansion.names.len() {
+            return Err(TranslateError::malformed(format!(
+                "partial aggregation emits {} columns but named {} of them",
+                root.output_width,
+                expansion.names.len()
+            )));
+        }
+    }
+    Ok(TranslatedFragment {
+        root,
+        stream_inputs: std::mem::take(&mut ctx.stream_inputs),
+        partial_expansion: ctx.partial_expansion,
+    })
 }
 
-/// Translates a one-phase `AGGREGATION_NODE` into a Substrait aggregate relation.
+/// Computes the positional wire-column overrides for exchanges that feed merge aggregations.
 ///
-/// Only finalized single-phase aggregation is supported (run StarRocks with
-/// `new_planner_agg_stage = 1`); merge/update phases would require modeling partial aggregate
-/// states. The output row layout is the aggregation output tuple, whose materialized slots are
-/// the grouping keys followed by the aggregate results (StarRocks allocates them in that order).
+/// Runs over the flat preorder node list before translation, because the exchange is
+/// translated before its parent aggregation and must already declare the stream with the
+/// modeled partial-state columns — their types, and the extra column a wider state (avg)
+/// occupies. In preorder a merge aggregation's single child is simply the next node; anything
+/// but an exchange there means the plan reads partial states from a shape this translator
+/// cannot type, so it is refused.
+fn merge_exchange_overrides(plan: &TPlan) -> Result<HashMap<i32, Vec<StateColumns>>> {
+    let mut overrides = HashMap::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        if node.node_type != TPlanNodeType::AGGREGATION_NODE {
+            continue;
+        }
+        // A node without agg_node fails in translate_aggregation with its own error.
+        let Some(agg) = node.agg_node.as_ref() else {
+            continue;
+        };
+        if agg_phase::classify(node.node_id, node.node_type, agg)? != AggPhase::Merge {
+            continue;
+        }
+        let child = plan
+            .nodes
+            .get(index + 1)
+            .filter(|child| child.node_type == TPlanNodeType::EXCHANGE_NODE);
+        let Some(child) = child else {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "a merge aggregation must read its partial states directly from an \
+                         exchange (SET new_planner_agg_stage = 1)",
+            });
+        };
+        let keys = agg.grouping_exprs.as_deref().unwrap_or_default().len();
+        let mut columns = Vec::with_capacity(agg.aggregate_functions.len());
+        for (position, measure) in agg.aggregate_functions.iter().enumerate() {
+            // The exchange row is the intermediate tuple's materialized slots: grouping keys
+            // first, then one state slot per measure -- the same layout invariant the
+            // aggregation's output tuple uses. A state wider than its slot (avg) claims the
+            // columns behind it, which is where the partial fragment emitted them.
+            columns.push(StateColumns {
+                position: keys + position,
+                types: partial_state::wire_columns(measure_function(measure)?)?
+                    .into_iter()
+                    .map(|column| column.ty)
+                    .collect(),
+            });
+        }
+        overrides.insert(child.node_id, columns);
+    }
+    Ok(overrides)
+}
+
+/// Finds, for every project node, the common-expr slots an ancestor consumes even though no
+/// output tuple materializes them.
+///
+/// StarRocks' BE physically outputs a project's common slots when a node above references
+/// them, and the FE plans against that; this pre-pass reproduces the FE's view so
+/// [`translate_project_node`] can widen the project with the consumed columns. One walk over
+/// the flat preorder node list, keeping the open ancestors on a stack (the same span math
+/// `PlanNodeCursor` uses): when a `PROJECT_NODE` with a non-empty `common_slot_map` is
+/// visited, every expression payload of its strict ancestors, plus `root_output_exprs`,
+/// which sit above the fragment root, is scanned for references to its non-materialized
+/// common slots. Matching is by slot id alone: new-optimizer slot ids are query-global and an
+/// ancestor ref can carry a stale tuple id (see `DescriptorTable::slot_global_index`). A
+/// false positive only widens the row with a column the root confinement drops; a false
+/// negative leaves today's loud zero-candidate descriptor error. Neither is silent.
+fn common_slots_consumed_above(
+    plan: &TPlan,
+    root_output_exprs: &[TExpr],
+    desc: &DescriptorTable,
+) -> Result<HashMap<i32, Vec<i32>>> {
+    let mut consumed = HashMap::new();
+    // Open ancestors of the node being visited: (node index, children not yet completed).
+    let mut stack: Vec<(usize, i32)> = Vec::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        if node.node_type == TPlanNodeType::PROJECT_NODE
+            && let Some(common) = node
+                .project_node
+                .as_ref()
+                .and_then(|project| project.common_slot_map.as_ref())
+                .filter(|common| !common.is_empty())
+        {
+            let mut candidates = BTreeSet::new();
+            for &slot_id in common.keys() {
+                let mut materialized = false;
+                for &tuple_id in &node.row_tuples {
+                    if desc.materialized_slot_ids(tuple_id)?.contains(&slot_id) {
+                        materialized = true;
+                        break;
+                    }
+                }
+                if !materialized {
+                    candidates.insert(slot_id);
+                }
+            }
+            if !candidates.is_empty() {
+                let mut hits = BTreeSet::new();
+                for &(ancestor, _) in &stack {
+                    collect_slot_ref_hits(&plan.nodes[ancestor], &candidates, &mut hits);
+                }
+                for expr in root_output_exprs {
+                    collect_expr_slot_ref_hits(expr, &candidates, &mut hits);
+                }
+                if !hits.is_empty() {
+                    consumed.insert(node.node_id, hits.into_iter().collect());
+                }
+            }
+        }
+        if node.num_children > 0 {
+            stack.push((index, node.num_children));
+        } else {
+            // A leaf completes itself, and possibly the subtrees of the ancestors above it.
+            while let Some(top) = stack.last_mut() {
+                top.1 -= 1;
+                if top.1 == 0 {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(consumed)
+}
+
+/// Adds to `hits` every candidate slot id referenced by any expression payload of `node`.
+fn collect_slot_ref_hits(node: &TPlanNode, candidates: &BTreeSet<i32>, hits: &mut BTreeSet<i32>) {
+    let mut exprs: Vec<&TExpr> = Vec::new();
+    exprs.extend(node.conjuncts.as_deref().unwrap_or_default());
+    if let Some(agg) = node.agg_node.as_ref() {
+        exprs.extend(agg.grouping_exprs.as_deref().unwrap_or_default());
+        exprs.extend(&agg.aggregate_functions);
+    }
+    if let Some(sort) = node.sort_node.as_ref() {
+        exprs.extend(&sort.sort_info.ordering_exprs);
+        exprs.extend(
+            sort.sort_info
+                .sort_tuple_slot_exprs
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        // Deprecated node-level duplicate some senders populate instead (see translate_sort).
+        exprs.extend(sort.sort_tuple_slot_exprs.as_deref().unwrap_or_default());
+    }
+    if let Some(join) = node.hash_join_node.as_ref() {
+        for eq in &join.eq_join_conjuncts {
+            exprs.push(&eq.left);
+            exprs.push(&eq.right);
+        }
+        exprs.extend(join.other_join_conjuncts.as_deref().unwrap_or_default());
+    }
+    if let Some(join) = node.nestloop_join_node.as_ref() {
+        exprs.extend(join.join_conjuncts.as_deref().unwrap_or_default());
+    }
+    if let Some(project) = node.project_node.as_ref() {
+        exprs.extend(
+            project
+                .slot_map
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|(_, expr)| expr),
+        );
+        exprs.extend(
+            project
+                .common_slot_map
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|(_, expr)| expr),
+        );
+    }
+    for expr in exprs {
+        collect_expr_slot_ref_hits(expr, candidates, hits);
+    }
+}
+
+/// Adds to `hits` every candidate slot id one flat preorder expression references.
+fn collect_expr_slot_ref_hits(expr: &TExpr, candidates: &BTreeSet<i32>, hits: &mut BTreeSet<i32>) {
+    for node in &expr.nodes {
+        if node.node_type == starrocks_thrift::exprs::TExprNodeType::SLOT_REF
+            && let Some(slot_ref) = node.slot_ref.as_ref()
+            && candidates.contains(&slot_ref.slot_id)
+        {
+            hits.insert(slot_ref.slot_id);
+        }
+    }
+}
+
+/// Translates an `EXCHANGE_NODE` into a read of the engine stream its senders' batches arrive on.
+///
+/// An exchange is a fragment boundary: the receiver has nothing of its own to read, so the
+/// compute node binds one [`ExchangeInput`] per exchange node, naming the engine view
+/// (`sirius_stream_<node_id>`) the input stream is read through. The read's schema comes from
+/// the FE's `input_row_tuples`; its column names are the sender's, bound positionally, because
+/// the receiver's tuple can spell them differently from what the sender ships. The same schema
+/// is recorded on the context as the declaration the engine needs before the plan can bind.
+///
+/// A merging exchange (`sort_info` present) merges its senders' sorted runs; here it becomes a
+/// `SortRel` over the stream read, which yields the same rows in the same order.
+fn translate_exchange(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 0)?;
+    let exchange = node
+        .exchange_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "EXCHANGE_NODE",
+            field: "exchange_node",
+        })?;
+    if exchange.input_row_tuples.is_empty() {
+        return Err(TranslateError::MissingField {
+            context: "TExchangeNode",
+            field: "input_row_tuples",
+        });
+    }
+    let input =
+        ctx.exchange_inputs
+            .get(&node.node_id)
+            .ok_or(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "exchange node has no bound input stream; the compute node binds one per \
+                         receiver exchange",
+            })?;
+    // The view name is the only thing tying this read to the stream the engine fills. An empty
+    // one would emit a read of a table named "" and fail at bind time with no mention of the
+    // exchange.
+    if input.stream_view.is_empty() {
+        return Err(TranslateError::malformed(format!(
+            "exchange node {} is bound to an input stream with an empty view name",
+            node.node_id
+        )));
+    }
+    let mut schema = ctx
+        .desc
+        .named_struct_for_tuples(&exchange.input_row_tuples)?;
+    // An exchange feeding a merge aggregation carries partial-state columns; rewrite their
+    // FE-declared slot types to the modeled wire types, and make room for any state the FE
+    // declares in fewer columns than Sirius ships. One `Type`, two consumers: the ReadRel
+    // base_schema below and the engine's stream declaration derive from the same rewritten
+    // entry, so the plan's view of the column and the engine's cannot drift apart.
+    if let Some(state_overrides) = ctx.exchange_state_overrides.get(&node.node_id) {
+        let types = schema
+            .r#struct
+            .as_mut()
+            .map(|structure| &mut structure.types)
+            .ok_or_else(|| TranslateError::malformed("exchange schema has no struct"))?;
+        let width = types.len();
+        // Positions index the FE-declared row, so every insertion shifts the ones after it.
+        let mut inserted = 0usize;
+        for column in state_overrides {
+            let position = column.position + inserted;
+            let slot = types.get_mut(position).ok_or_else(|| {
+                TranslateError::malformed(format!(
+                    "merge aggregation state column {} is outside the exchange row \
+                     ({width} columns)",
+                    column.position
+                ))
+            })?;
+            *slot = column.types[0].clone();
+            for (offset, ty) in column.types.iter().enumerate().skip(1) {
+                types.insert(position + offset, ty.clone());
+            }
+            inserted += column.types.len() - 1;
+        }
+    }
+    let output_width = schema
+        .r#struct
+        .as_ref()
+        .map(|structure| structure.types.len())
+        .unwrap_or(0);
+    // The stream's columns are the sender's, named by the sender and bound by position: one
+    // name per column of the declared row layout, or a column would be read under the wrong
+    // name.
+    if input.names.len() != output_width {
+        return Err(TranslateError::descriptor(format!(
+            "row layout {:?} has {} fields but exchange input has {} names",
+            exchange.input_row_tuples,
+            output_width,
+            input.names.len()
+        )));
+    }
+    schema.names = input.names.clone();
+
+    // The declaration the engine needs, derived from the very types the read carries so the
+    // plan's view of a column and the engine's cannot drift apart.
+    let columns = schema
+        .names
+        .iter()
+        .cloned()
+        .zip(
+            schema
+                .r#struct
+                .as_ref()
+                .map(|structure| structure.types.as_slice())
+                .unwrap_or_default(),
+        )
+        .map(|(name, ty)| {
+            Ok(StreamInputColumn {
+                name,
+                ty: type_mapper::duckdb_type_name(ty)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ctx.stream_inputs.push(StreamInputSchema {
+        node_id: node.node_id,
+        stream_view: input.stream_view.clone(),
+        columns,
+    });
+
+    let mut translated = TranslatedRel {
+        rel: stream_read_rel(schema, &input.stream_view),
+        row_tuples: exchange.input_row_tuples.clone(),
+        output_width,
+        // Streams never carry: the sender's root narrowed any carried columns away, and the
+        // declared stream schema describes exactly the descriptor row.
+        carried_slots: Vec::new(),
+    };
+    if let Some(sort_info) = &exchange.sort_info {
+        let sorts = sort_fields(sort_info, &translated, ctx)?;
+        let row_tuples = translated.row_tuples.clone();
+        translated = TranslatedRel {
+            rel: Rel {
+                rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                    input: Some(Box::new(translated.rel)),
+                    sorts,
+                    ..Default::default()
+                }))),
+            },
+            row_tuples,
+            output_width,
+            carried_slots: Vec::new(),
+        };
+    }
+    apply_conjuncts(translated, node, ctx)
+}
+
+/// Translates an `AGGREGATION_NODE` into a Substrait aggregate relation.
+///
+/// The node's phase (one-shot / partial / merge, see [`agg_phase::classify`]) decides how the
+/// measures are emitted. The output row layout is the aggregation output tuple, whose
+/// materialized slots are the grouping keys followed by the aggregate results (StarRocks
+/// allocates them in that order).
+///
+/// The grouping keys are emitted in the output tuple's materialized-slot order, not GROUP BY
+/// order (see [`grouping_materialization_order`]): every consumer of the tuple — slot refs
+/// above this node, the next hop's declared stream schema, output names, hash-partition
+/// indices — resolves its columns through the descriptor's order, so the sender reorders to
+/// it, exactly as [`translate_sort`] does for its sort tuple.
+///
+/// Two-phase avg is the one aggregate that does not fit that layout one slot at a time: it is
+/// emitted as a sum and a count on the partial side, merged as two sums, and divided back into
+/// an average by a projection on top on the merge side. Both sides take the extra column from
+/// the same [`partial_state::wire_columns`] model that types the exchange, so the two ends of
+/// the hop agree by construction.
 fn translate_aggregation(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -356,41 +828,55 @@ fn translate_aggregation(
         context: "AGGREGATION_NODE",
         field: "agg_node",
     })?;
-    if !agg.need_finalize || agg.intermediate_tuple_id != agg.output_tuple_id {
+    let phase = agg_phase::classify(node.node_id, node.node_type, agg)?;
+    // Never observed in new-optimizer plans (the FE sets the two ids equal in every phase);
+    // kept as its own loud error so a plan shape that does split them cannot slip through the
+    // slot-layout assumptions below.
+    if agg.intermediate_tuple_id != agg.output_tuple_id {
         return Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
-            reason: "only finalized one-phase aggregation is supported (new_planner_agg_stage=1)",
+            reason: "aggregation node has distinct intermediate and output tuples \
+                     (SET new_planner_agg_stage = 1)",
         });
     }
     let output_tuple = agg.output_tuple_id;
-
     let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
-    let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());
-    for expr in grouping_exprs {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
-        grouping_expressions.push(expr.translate(&mut expr_ctx)?);
-    }
+    let keys = grouping_exprs.len();
 
     // Aggregate output types come from the output tuple's slots, which carry the grouping keys
     // first and then one slot per aggregate function.
     let output_slots = ctx.desc.materialized_slot_ids(output_tuple)?;
-    let output_width = output_slots.len();
-    if output_width != grouping_expressions.len() + agg.aggregate_functions.len() {
+    if output_slots.len() != keys + agg.aggregate_functions.len() {
         return Err(TranslateError::descriptor(format!(
             "AGGREGATION_NODE {} output tuple {} has {} slots for {} keys + {} aggregates",
             node.node_id,
             output_tuple,
-            output_width,
-            grouping_expressions.len(),
+            output_slots.len(),
+            keys,
             agg.aggregate_functions.len()
         )));
     }
 
-    // A count check alone cannot see a permuted output tuple, so also require each grouping
-    // key's type to match the slot it is paired with. Compare only the type kind: the slot's
-    // nullability and decimal width are allowed to differ from the key expression's.
-    for (index, (expr, slot_id)) in grouping_exprs.iter().zip(&output_slots).enumerate() {
+    // The FE lists the grouping expressions in GROUP BY order, but the output tuple's
+    // materialized slots -- the order every consumer above this node resolves the row
+    // through -- are sorted by slot id (the FE serializes every aggregation-output slot with
+    // column_pos -1). Emitting the keys in GROUP BY order would make the engine row and the
+    // descriptor view permutations of each other whenever the GROUP BY list is not in
+    // ascending ref-id order, so the keys are emitted in the tuple's order instead. One key
+    // needs no pairing: a single grouping expression can only fill the single key slot.
+    let key_order: Vec<usize> = if keys > 1 {
+        grouping_materialization_order(node, grouping_exprs, &output_slots[..keys])?
+    } else {
+        (0..keys).collect()
+    };
+    // The slot pairing above cannot see a mistyped key (nor does it run for a single key), so
+    // also require each grouping key's type to match the slot it is paired with. Compare only
+    // the type kind: the slot's nullability and decimal width are allowed to differ from the
+    // key expression's.
+    for (slot_index, &grouping_index) in key_order.iter().enumerate() {
+        let expr = &grouping_exprs[grouping_index];
+        let slot_id = output_slots[slot_index];
         let Some(key_type) = expr
             .nodes
             .first()
@@ -399,7 +885,7 @@ fn translate_aggregation(
         else {
             continue;
         };
-        let slot = ctx.desc.slot(output_tuple, *slot_id)?;
+        let slot = ctx.desc.slot(output_tuple, slot_id)?;
         let Some(slot_type) = slot.substrait_type.as_ref() else {
             continue;
         };
@@ -407,67 +893,163 @@ fn translate_aggregation(
         if kind_of(&key_type) != kind_of(slot_type) {
             return Err(TranslateError::descriptor(format!(
                 "AGGREGATION_NODE {} output tuple {} slot {} does not match grouping key {}",
-                node.node_id, output_tuple, slot_id, index
+                node.node_id, output_tuple, slot_id, grouping_index
             )));
         }
     }
 
+    // A two-phase measure occupies its modeled partial-state columns rather than the single
+    // slot the FE allocated for it; one-shot measures always occupy exactly their own slot,
+    // which is why the model is not consulted for them at all.
+    let wire_columns = match phase {
+        AggPhase::OneShot => Vec::new(),
+        _ => agg
+            .aggregate_functions
+            .iter()
+            .map(|expr| partial_state::wire_columns(measure_function(expr)?))
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let expanded = wire_columns.iter().any(|columns| columns.len() > 1);
+    // Where the aggregate finalizes, every FE-declared decimal measure the type mapper lowered
+    // to FP64 is rounded back to its scale (see `round_to_scale`); a partial state ships raw.
+    let finalize_scales: Vec<Option<i32>> = match phase {
+        AggPhase::Partial => vec![None; agg.aggregate_functions.len()],
+        _ => agg
+            .aggregate_functions
+            .iter()
+            .map(|expr| type_mapper::lowered_decimal_scale(&measure_function(expr)?.ret_type))
+            .collect::<Result<_>>()?,
+    };
+    // A merge measure reads the exchange row, which is wider than the FE's intermediate tuple
+    // wherever a state expanded, so every slot's column is resolved explicitly instead of
+    // through the descriptor's one-slot-per-column view.
+    let merge_slots = match phase {
+        AggPhase::Merge => Some(merge_state_columns(
+            node,
+            &child.row_tuples,
+            keys,
+            &wire_columns,
+            ctx.desc,
+        )?),
+        _ => None,
+    };
+    // Unreachable today (a merge child must be an exchange, see merge_exchange_overrides, and
+    // streams never carry); kept as a guard so the two column-remapping mechanisms can never
+    // silently combine.
+    if merge_slots.is_some() && !child.carried_slots.is_empty() {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "a merge aggregation cannot read partial states from a child that carries \
+                     common-expr columns",
+        });
+    }
+
+    let mut grouping_expressions = Vec::with_capacity(keys);
+    for &grouping_index in &key_order {
+        let mut expr_ctx = match &merge_slots {
+            Some(slots) => ctx.expr_context_with_slots(&child.row_tuples, &slots.columns),
+            None => ctx.expr_context(&child.row_tuples),
+        }
+        .with_carried(&child.carried_slots);
+        grouping_expressions.push(grouping_exprs[grouping_index].translate(&mut expr_ctx)?);
+    }
+
     let mut measures = Vec::with_capacity(agg.aggregate_functions.len());
-    for (expr, slot_id) in agg
-        .aggregate_functions
-        .iter()
-        .zip(&output_slots[grouping_expressions.len()..])
-    {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
-        let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
+    // Where each StarRocks measure's own state starts among the emitted measures.
+    let mut measure_starts = Vec::with_capacity(agg.aggregate_functions.len());
+    // Two-phase DISTINCT counts. The engine has no partial state for a distinct count, so the
+    // partial node groups by the distinct argument as an extra key (after the FE's keys) and
+    // ships that column as the measure's state; the merge node then counts DISTINCT over it.
+    // Grouping the other measures' partial states per (keys, argument) instead of per keys is
+    // harmless: their merges (sum/min/max/sum-of-counts) are associative over the finer groups.
+    // `distinct_keys` are the appended grouping expressions, `distinct_state[i]` names which of
+    // them is FE measure i's state (None for a measure with an ordinary state).
+    let mut distinct_keys: Vec<Expression> = Vec::new();
+    let mut distinct_state: Vec<Option<usize>> = Vec::with_capacity(agg.aggregate_functions.len());
+    for (index, expr) in agg.aggregate_functions.iter().enumerate() {
+        measure_starts.push(measures.len());
+        let call = {
+            let mut expr_ctx = match &merge_slots {
+                Some(slots) => ctx.expr_context_with_slots(&child.row_tuples, &slots.columns),
+                None => ctx.expr_context(&child.row_tuples),
+            }
+            .with_carried(&child.carried_slots);
+            expr_translator::aggregate_call(expr, &mut expr_ctx, phase == AggPhase::Merge)?
+        };
         // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
         // grouping-free DISTINCT measure would translate fine and then fail at execution.
-        if call.distinct && grouping_expressions.is_empty() {
+        if call.distinct && keys == 0 {
             return Err(TranslateError::UnsupportedPlanNode {
                 node_id: node.node_id,
                 node_type: node.node_type,
                 reason: "distinct aggregates without grouping keys are not supported",
             });
         }
-        let output_type = ctx
-            .desc
-            .slot(output_tuple, *slot_id)?
-            .substrait_type
-            .clone()
-            .ok_or(TranslateError::MissingField {
-                context: "aggregate output slot",
-                field: "slotType",
-            })?;
-        // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by
-        // the arithmetic extension.
-        let urn = if call.name == "count" {
-            URN_AGGREGATE
+        if call.distinct && phase == AggPhase::Partial {
+            let argument = sole_argument(node, &call.raw_arguments)?.clone();
+            distinct_state.push(Some(distinct_keys.len()));
+            distinct_keys.push(argument);
+            continue;
+        }
+        distinct_state.push(None);
+        if let Some(state) = wire_columns.get(index).filter(|columns| columns.len() > 1) {
+            let state_column = merge_slots.as_ref().map(|slots| slots.measures[index]);
+            expand_avg(node, phase, &call, state, state_column, &mut measures, ctx)?;
+            continue;
+        }
+        // Merge functions over partial states -- the engine's own internal merge table:
+        // sum->sum, min->min, max->max, and count->SUM. Merging counts must sum the partial
+        // counts; merging them with count would count rows and be silently wrong. This
+        // substitution is the mechanism that makes the plan phase-correct for the engine,
+        // which executes exactly what the function names say.
+        let function_name = if phase == AggPhase::Merge {
+            match call.name.as_str() {
+                "sum" | "min" | "max" => call.name.clone(),
+                // A distinct count's state is the distinct column itself (see partial_state), so
+                // the merge counts DISTINCT over it; a plain count's state is a partial count.
+                "count" if call.distinct => call.name.clone(),
+                "count" => "sum".to_string(),
+                _ => {
+                    return Err(TranslateError::UnsupportedPlanNode {
+                        node_id: node.node_id,
+                        node_type: node.node_type,
+                        reason: "merging this aggregate function is not supported \
+                                 (SET new_planner_agg_stage = 1)",
+                    });
+                }
+            }
         } else {
-            URN_ARITHMETIC
+            call.name.clone()
         };
-        let anchor = ctx.registry.register_function(urn, &call.name);
-        measures.push(aggregate_rel::Measure {
-            measure: Some(AggregateFunction {
-                function_reference: anchor,
-                arguments: call
-                    .arguments
-                    .into_iter()
-                    .map(|expr| substrait::proto::FunctionArgument {
-                        arg_type: Some(function_argument::ArgType::Value(expr)),
-                    })
-                    .collect(),
-                output_type: Some(output_type),
-                invocation: if call.distinct {
-                    substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
-                } else {
-                    substrait::proto::aggregate_function::AggregationInvocation::All as i32
-                },
-                ..Default::default()
-            }),
-            filter: None,
-        });
+        // A partial measure's output is its partial state, whose wire type is modeled: the
+        // FE's intermediate slot type lies about what Sirius emits (see partial_state). The
+        // engine ignores measure output types either way; carrying the modeled type keeps
+        // dumped plans honest about what is actually on the wire.
+        let output_type = match phase {
+            AggPhase::Partial => wire_columns[index][0].ty.clone(),
+            _ => ctx
+                .desc
+                .slot(output_tuple, output_slots[keys + index])?
+                .substrait_type
+                .clone()
+                .ok_or(TranslateError::MissingField {
+                    context: "aggregate output slot",
+                    field: "slotType",
+                })?,
+        };
+        measures.push(build_measure(
+            &function_name,
+            call.arguments,
+            output_type,
+            call.distinct,
+            phase,
+            ctx,
+        ));
     }
 
+    let distinct_key_count = distinct_keys.len();
+    grouping_expressions.extend(distinct_keys);
     let groupings = if grouping_expressions.is_empty() {
         Vec::new()
     } else {
@@ -479,6 +1061,7 @@ fn translate_aggregation(
         vec![grouping]
     };
 
+    let output_width = keys + distinct_key_count + measures.len();
     let aggregated = TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
@@ -491,9 +1074,544 @@ fn translate_aggregation(
         },
         row_tuples: vec![output_tuple],
         output_width,
+        // The child's carried columns were consumed by the key/measure contexts above; the
+        // aggregate materializes a fresh tuple, so nothing is carried past it.
+        carried_slots: Vec::new(),
+    };
+
+    // A distinct key sits among the grouping columns, ahead of every measure; put the row back
+    // in the FE's order (keys, then one state per measure) before anything reads it by position.
+    let aggregated = if distinct_key_count > 0 {
+        distinct_partial_projection(
+            aggregated,
+            keys,
+            distinct_key_count,
+            &distinct_state,
+            &measure_starts,
+            &wire_columns,
+        )
+    } else {
+        aggregated
+    };
+
+    let aggregated = match phase {
+        // Every merge node leaves through the finalizing projection, not only the avg-expanded
+        // ones: the engine binds a merged integer count/sum as HUGEINT (the plan-level downcast
+        // relabels the aggregate node, not a fragment sink above it), so without the projection's
+        // throwing casts the fragment's wire row carries a type its FE-declared slot never
+        // announced and the next hop's schema guard refuses it. Where a state expanded, the
+        // projection also folds the extra columns back to one column per FE measure -- everything
+        // above this node sees the row the descriptor describes, types included.
+        AggPhase::Merge => {
+            let measure_types =
+                declared_measure_types(ctx.desc, output_tuple, &output_slots[keys..])?;
+            merge_projection(
+                aggregated,
+                keys,
+                &measure_starts,
+                &wire_columns,
+                &measure_types,
+                &finalize_scales,
+                ctx,
+            )
+        }
+        AggPhase::OneShot => round_lowered_decimals(aggregated, keys, &finalize_scales, ctx),
+        // The emitted row is wider than the FE's output tuple, so the fragment's output names
+        // are built here: the descriptor table has no slot to name the extra column from.
+        AggPhase::Partial if expanded => {
+            if has_conjuncts(node) {
+                return Err(TranslateError::UnsupportedPlanNode {
+                    node_id: node.node_id,
+                    node_type: node.node_type,
+                    reason: "conjuncts over a partial aggregation with an avg state would read \
+                             the aggregate's columns at the positions the state moved \
+                             (SET new_planner_agg_stage = 1)",
+                });
+            }
+            if ctx.partial_expansion.is_some() {
+                return Err(TranslateError::malformed(
+                    "two partial aggregations in one fragment expanded an avg state; only the \
+                     fragment root's row is named",
+                ));
+            }
+            let names =
+                expanded_output_names(ctx.desc, output_tuple, &output_slots, keys, &wire_columns)?;
+            ctx.partial_expansion = Some(PartialExpansion {
+                node_id: node.node_id,
+                keys,
+                names,
+            });
+            aggregated
+        }
+        _ => aggregated,
     };
     // Node conjuncts evaluate over the aggregation output (HAVING predicates).
     apply_conjuncts(aggregated, node, ctx)
+}
+
+/// Reorders a partial aggregation whose distinct counts were emitted as extra grouping keys
+/// into the FE's row: the `keys` grouping columns, then each FE measure's state in measure
+/// order (a distinct key where `distinct_state` names one, the measure's wire columns
+/// otherwise). Same width as the aggregate; only positions move.
+fn distinct_partial_projection(
+    input: TranslatedRel,
+    keys: usize,
+    distinct_key_count: usize,
+    distinct_state: &[Option<usize>],
+    measure_starts: &[usize],
+    wire_columns: &[Vec<WireColumn>],
+) -> TranslatedRel {
+    let mut expressions: Vec<Expression> = (0..keys as i32).map(field_selection).collect();
+    for (index, state) in distinct_state.iter().enumerate() {
+        match state {
+            Some(distinct) => expressions.push(field_selection((keys + distinct) as i32)),
+            None => {
+                let start = keys + distinct_key_count + measure_starts[index];
+                let width = wire_columns.get(index).map_or(1, Vec::len);
+                expressions
+                    .extend((start..start + width).map(|field| field_selection(field as i32)));
+            }
+        }
+    }
+    let row_tuples = input.row_tuples.clone();
+    project_rel(input, expressions, row_tuples, Vec::new())
+}
+
+/// Emits the two Sirius measures one StarRocks avg becomes in a two-phase plan.
+///
+/// Partial: `sum(cast(arg AS DOUBLE))` and `count(arg)`. Merge: both halves merge with `sum`,
+/// reading the state columns the exchange row already carries side by side, which is what
+/// `state_column` (the physical column the state starts at) points at.
+fn expand_avg(
+    node: &TPlanNode,
+    phase: AggPhase,
+    call: &expr_translator::AggregateCall,
+    state: &[WireColumn],
+    state_column: Option<usize>,
+    measures: &mut Vec<aggregate_rel::Measure>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<()> {
+    if call.name != "avg" {
+        return Err(TranslateError::malformed(format!(
+            "aggregate {:?} has a multi-column partial state but no expansion",
+            call.name
+        )));
+    }
+    match phase {
+        AggPhase::Partial => {
+            let argument = sole_argument(node, &call.raw_arguments)?.clone();
+            // The modeled sum column is FP64 for every avg input, so the cast is emitted here
+            // rather than left to the decimal-only lowering in `aggregate_call`: an integer
+            // avg would otherwise ship a BIGINT sum the receiver reads as a DOUBLE.
+            measures.push(build_measure(
+                "sum",
+                vec![expr_translator::cast_to_fp64(argument.clone())],
+                state[0].ty.clone(),
+                false,
+                phase,
+                ctx,
+            ));
+            // Counting the uncast argument keeps the count over the values avg averages: the
+            // cast changes no NULLs, and reading it here would only obscure that.
+            measures.push(build_measure(
+                "count",
+                vec![argument],
+                state[1].ty.clone(),
+                false,
+                phase,
+                ctx,
+            ));
+        }
+        AggPhase::Merge => {
+            let position = state_column.ok_or_else(|| {
+                TranslateError::malformed("merge measure without a resolved state column")
+            })?;
+            // The column behind the sum is this avg's count only if the measure really reads
+            // its own state column; anything else means the FE laid the row out differently
+            // than the expansion assumes, and the count would be some other measure's state.
+            if direct_field(sole_argument(node, &call.arguments)?) != Some(position as i32) {
+                return Err(TranslateError::UnsupportedPlanNode {
+                    node_id: node.node_id,
+                    node_type: node.node_type,
+                    reason: "a merged avg must read its partial state straight from the \
+                             exchange row (SET new_planner_agg_stage = 1)",
+                });
+            }
+            // Both halves merge with sum: the division that finalizes them divides summed
+            // sums by summed counts, where count here would count arriving rows instead.
+            measures.push(build_measure(
+                "sum",
+                vec![field_selection(position as i32)],
+                state[0].ty.clone(),
+                false,
+                phase,
+                ctx,
+            ));
+            measures.push(build_measure(
+                "sum",
+                vec![field_selection(position as i32 + 1)],
+                state[1].ty.clone(),
+                false,
+                phase,
+                ctx,
+            ));
+        }
+        AggPhase::OneShot => {
+            return Err(TranslateError::malformed(
+                "a one-shot aggregate has no partial state to expand",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Builds one Substrait measure over already-translated arguments.
+fn build_measure(
+    name: &str,
+    arguments: Vec<Expression>,
+    output_type: substrait::proto::Type,
+    distinct: bool,
+    phase: AggPhase,
+    ctx: &mut PlanContext<'_>,
+) -> aggregate_rel::Measure {
+    // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by the
+    // arithmetic extension. Keyed on the emitted name, so a merged count registers as the
+    // arithmetic `sum` it became.
+    let urn = if name == "count" {
+        URN_AGGREGATE
+    } else {
+        URN_ARITHMETIC
+    };
+    let anchor = ctx.registry.register_function(urn, name);
+    aggregate_rel::Measure {
+        measure: Some(AggregateFunction {
+            function_reference: anchor,
+            arguments: arguments
+                .into_iter()
+                .map(|expr| substrait::proto::FunctionArgument {
+                    arg_type: Some(function_argument::ArgType::Value(expr)),
+                })
+                .collect(),
+            output_type: Some(output_type),
+            invocation: if distinct {
+                substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+            } else {
+                substrait::proto::aggregate_function::AggregationInvocation::All as i32
+            },
+            // Advisory only: the engine's Substrait consumer ignores phases and executes
+            // exactly what the function names say, so the plan must be correct for a
+            // phase-ignoring reader first (substitute functions, then label). The label
+            // makes dumped plans self-describing.
+            phase: match phase {
+                AggPhase::OneShot => AggregationPhase::InitialToResult,
+                AggPhase::Partial => AggregationPhase::InitialToIntermediate,
+                AggPhase::Merge => AggregationPhase::IntermediateToResult,
+            } as i32,
+            ..Default::default()
+        }),
+        filter: None,
+    }
+}
+
+/// Physical columns of the intermediate row a merge aggregation reads.
+struct MergeStateColumns {
+    /// Physical column of each `(tuple id, slot id)`, for the expression translator.
+    columns: HashMap<(i32, i32), usize>,
+    /// Physical column where each measure's state starts, in FE measure order.
+    measures: Vec<usize>,
+}
+
+/// Resolves every intermediate-tuple slot a merge aggregation reads to its physical column.
+///
+/// The FE numbers those slots as if every state were one column; a wider state (avg) shifts
+/// every slot behind it, so the descriptor's index is the wrong column from that point on.
+/// Grouping keys come first and never shift.
+fn merge_state_columns(
+    node: &TPlanNode,
+    row_tuples: &[i32],
+    keys: usize,
+    wire_columns: &[Vec<WireColumn>],
+    desc: &DescriptorTable,
+) -> Result<MergeStateColumns> {
+    let mut slots = Vec::new();
+    for &tuple_id in row_tuples {
+        for slot_id in desc.materialized_slot_ids(tuple_id)? {
+            slots.push((tuple_id, slot_id));
+        }
+    }
+    if slots.len() != keys + wire_columns.len() {
+        return Err(TranslateError::descriptor(format!(
+            "AGGREGATION_NODE {} merges {} keys + {} aggregates from an intermediate row \
+             {row_tuples:?} of {} slots",
+            node.node_id,
+            keys,
+            wire_columns.len(),
+            slots.len()
+        )));
+    }
+    let mut columns = HashMap::with_capacity(slots.len());
+    let mut measures = Vec::with_capacity(wire_columns.len());
+    let mut position = 0usize;
+    for (index, slot) in slots.into_iter().enumerate() {
+        columns.insert(slot, position);
+        position += match index.checked_sub(keys) {
+            Some(measure) => {
+                measures.push(position);
+                wire_columns[measure].len()
+            }
+            None => 1,
+        };
+    }
+    Ok(MergeStateColumns { columns, measures })
+}
+
+/// Adds the projection that turns a merge aggregation's emitted columns back into the FE's
+/// output row: the grouping keys, then one column per StarRocks measure.
+///
+/// Every measure column is cast to `measure_types`, the types the FE's output tuple declares,
+/// which is what the next fragment derives its stream schema from. Stating them is not
+/// cosmetic: DuckDB binds `sum(BIGINT)` as HUGEINT, and the engine's HUGEINT-to-BIGINT
+/// downcast happens at the aggregate's own sink, which this projection now sits in front of.
+/// Without the cast a merged count leaves this fragment as a HUGEINT the receiver declared
+/// BIGINT, and the hop refuses it.
+///
+/// A measure with a `finalize_scales` entry is a decimal the type mapper lowered to FP64; it is
+/// rounded back to that scale before the cast (see [`round_to_scale`]).
+fn merge_projection(
+    input: TranslatedRel,
+    keys: usize,
+    measure_starts: &[usize],
+    wire_columns: &[Vec<WireColumn>],
+    measure_types: &[substrait::proto::Type],
+    finalize_scales: &[Option<i32>],
+    ctx: &mut PlanContext<'_>,
+) -> TranslatedRel {
+    let mut expressions: Vec<Expression> = (0..keys as i32).map(field_selection).collect();
+    for (index, start) in measure_starts.iter().enumerate() {
+        let field = (keys + start) as i32;
+        let value = if wire_columns[index].len() > 1 {
+            avg_from_state(field, field + 1, ctx)
+        } else {
+            field_selection(field)
+        };
+        let value = match finalize_scales[index] {
+            Some(scale) => round_to_scale(value, scale, ctx),
+            None => value,
+        };
+        expressions.push(expr_translator::cast_to(
+            value,
+            measure_types[index].clone(),
+        ));
+    }
+    let row_tuples = input.row_tuples.clone();
+    project_rel(input, expressions, row_tuples, Vec::new())
+}
+
+/// Adds the projection that rounds a one-phase aggregation's FP64-lowered decimal measures to
+/// their declared scale (see [`round_to_scale`]); keys and every other measure pass through in
+/// place. A plan with nothing to round keeps its shape.
+fn round_lowered_decimals(
+    input: TranslatedRel,
+    keys: usize,
+    finalize_scales: &[Option<i32>],
+    ctx: &mut PlanContext<'_>,
+) -> TranslatedRel {
+    if finalize_scales.iter().all(Option::is_none) {
+        return input;
+    }
+    let mut expressions: Vec<Expression> = (0..keys as i32).map(field_selection).collect();
+    for (index, scale) in finalize_scales.iter().enumerate() {
+        let value = field_selection((keys + index) as i32);
+        expressions.push(match scale {
+            Some(scale) => round_to_scale(value, *scale, ctx),
+            None => value,
+        });
+    }
+    let row_tuples = input.row_tuples.clone();
+    project_rel(input, expressions, row_tuples, Vec::new())
+}
+
+/// Rounds a finalized FP64 measure back to the scale the FE declared for it.
+///
+/// The FE types a decimal sum or avg DECIMAL128(38, s); the type mapper lowers that to FP64,
+/// so the aggregate is an FP64 sum whose last bits depend on the order the rows were added in
+/// (partial states arrive from several CNs, and the GPU hash aggregate itself is unordered).
+/// StarRocks inlines a CTE once per reference, so a query that compares two evaluations of the
+/// same aggregate -- TPC-H q15 joins `revenue` against `max(total_revenue)` taken from a second
+/// copy of it -- saw them differ by one ULP often enough to return no rows (one run in three at
+/// SF1000 with 2 CNs). Rounding both to the declared scale with DuckDB's arithmetic makes each
+/// the one double nearest the exact decimal the FE promised: the FP64 error of a money sum is
+/// ~1e-9, the nearest rounding boundary 0.5 * 10^-s away. The engine evaluates `round` on the
+/// GPU (`function_id::round`); the value count here is the aggregate's output, so the kernel is
+/// negligible.
+fn round_to_scale(value: Expression, scale: i32, ctx: &mut PlanContext<'_>) -> Expression {
+    let anchor = ctx.registry.register_function(URN_ARITHMETIC, "round");
+    expr_translator::scalar_function(
+        anchor,
+        vec![value, i32_literal(scale)],
+        type_mapper::fp64_type(true),
+    )
+}
+
+/// Divides a merged avg state back into an average, with SQL's empty-input NULL.
+///
+/// A group whose avg argument was NULL in every row arrives with a zero count; dividing by it
+/// is a division by zero where SQL defines NULL, so the zero case is answered explicitly.
+fn avg_from_state(sum: i32, count: i32, ctx: &mut PlanContext<'_>) -> Expression {
+    let equal_anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
+    let no_values = expr_translator::scalar_function(
+        equal_anchor,
+        vec![field_selection(count), i64_literal(0)],
+        type_mapper::bool_type(),
+    );
+    let divide_anchor = ctx.registry.register_function(URN_ARITHMETIC, "divide");
+    // Both operands FP64: the summed sum already is, and dividing it by a BIGINT count would
+    // leave the operand widening to whatever rule the consumer happens to apply.
+    let average = expr_translator::scalar_function(
+        divide_anchor,
+        vec![
+            field_selection(sum),
+            expr_translator::cast_to_fp64(field_selection(count)),
+        ],
+        type_mapper::fp64_type(true),
+    );
+    use substrait::proto::expression::{IfThen, RexType, if_then};
+    Expression {
+        rex_type: Some(RexType::IfThen(Box::new(IfThen {
+            ifs: vec![if_then::IfClause {
+                r#if: Some(no_values),
+                then: Some(null_literal(type_mapper::fp64_type(true))),
+            }],
+            r#else: Some(Box::new(average)),
+        }))),
+    }
+}
+
+/// The types the FE's output tuple declares for an aggregation's measures.
+///
+/// This is the receiver's view of the row (a downstream exchange builds its stream schema
+/// from these very slots), so it is what the emitting fragment has to produce.
+fn declared_measure_types(
+    desc: &DescriptorTable,
+    output_tuple: i32,
+    measure_slots: &[i32],
+) -> Result<Vec<substrait::proto::Type>> {
+    measure_slots
+        .iter()
+        .map(|slot_id| {
+            desc.slot(output_tuple, *slot_id)?
+                .substrait_type
+                .clone()
+                .ok_or(TranslateError::MissingField {
+                    context: "aggregate output slot",
+                    field: "slotType",
+                })
+        })
+        .collect()
+}
+
+/// Names the row a partial aggregation emits: the FE's output-tuple names, plus one suffixed
+/// name per extra state column so the receiver spells the column the same way.
+fn expanded_output_names(
+    desc: &DescriptorTable,
+    output_tuple: i32,
+    output_slots: &[i32],
+    keys: usize,
+    wire_columns: &[Vec<WireColumn>],
+) -> Result<Vec<String>> {
+    let mut names = Vec::with_capacity(output_slots.len());
+    for (index, slot_id) in output_slots.iter().enumerate() {
+        let name = desc.slot(output_tuple, *slot_id)?.output_name();
+        match index.checked_sub(keys) {
+            Some(measure) => names.extend(
+                wire_columns[measure]
+                    .iter()
+                    .map(|column| format!("{name}{}", column.suffix)),
+            ),
+            None => names.push(name),
+        }
+    }
+    Ok(names)
+}
+
+/// The FE allocates one output slot per grouping expression, reusing the expression's own
+/// column-ref id (verified against FE fragment dumps: grouping refs [18, 13, 16] over the
+/// input tuple pair with output key slots 18/13/16), and serializes every aggregation-output
+/// slot with column_pos -1 -- so `key_slots` lists the keys in ascending slot id, not GROUP BY
+/// order. Each grouping expression must be a bare slot ref and the pairing must be a
+/// bijection; anything else means the FE laid the tuple out differently than this model
+/// (including a measure slot sorted in among the keys, which would also mis-type every
+/// declared measure), and reordering on a wrong model would ship wrong columns -- silently.
+fn grouping_materialization_order(
+    node: &TPlanNode,
+    grouping_exprs: &[TExpr],
+    key_slots: &[i32],
+) -> Result<Vec<usize>> {
+    let mut by_slot = std::collections::HashMap::with_capacity(grouping_exprs.len());
+    for (index, expr) in grouping_exprs.iter().enumerate() {
+        let slot_id = grouping_slot_id(expr).ok_or(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "a grouping expression that is not a bare slot ref leaves the output key \
+                     column order unrecoverable",
+        })?;
+        if by_slot.insert(slot_id, index).is_some() {
+            return Err(TranslateError::descriptor(format!(
+                "AGGREGATION_NODE {} lists grouping slot {slot_id} twice",
+                node.node_id
+            )));
+        }
+    }
+    key_slots
+        .iter()
+        .map(|slot_id| {
+            by_slot.remove(slot_id).ok_or_else(|| {
+                TranslateError::descriptor(format!(
+                    "AGGREGATION_NODE {} output key slot {slot_id} pairs with no grouping \
+                     expression",
+                    node.node_id
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Returns the slot id a grouping expression names, if it is a bare slot ref.
+///
+/// The ref's tuple is the aggregation's input row, not the output tuple, so only the slot id
+/// is read: the FE gives one column the same ref id in both tuples.
+fn grouping_slot_id(expr: &TExpr) -> Option<i32> {
+    let [node] = expr.nodes.as_slice() else {
+        return None;
+    };
+    if node.node_type != starrocks_thrift::exprs::TExprNodeType::SLOT_REF {
+        return None;
+    }
+    Some(node.slot_ref.as_ref()?.slot_id)
+}
+
+/// Returns the FE's serialized function for one aggregate measure.
+fn measure_function(expr: &TExpr) -> Result<&starrocks_thrift::types::TFunction> {
+    expr.nodes
+        .first()
+        .and_then(|root| root.fn_.as_ref())
+        .ok_or(TranslateError::MissingField {
+            context: "aggregate expression",
+            field: "fn",
+        })
+}
+
+/// Returns the single argument of a measure that expands into several Sirius measures.
+fn sole_argument<'a>(node: &TPlanNode, arguments: &'a [Expression]) -> Result<&'a Expression> {
+    match arguments {
+        [argument] => Ok(argument),
+        _ => Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "a two-phase avg over anything but exactly one argument has no sum/count \
+                     expansion (SET new_planner_agg_stage = 1)",
+        }),
+    }
 }
 
 /// Translates a `SORT_NODE` into a Substrait sort (plus the fetch added by `apply_fetch` for
@@ -587,22 +1705,53 @@ fn translate_sort(
         .as_ref()
         .or(sort.sort_tuple_slot_exprs.as_ref());
     let input = if let Some(slot_exprs) = sort_tuple_slot_exprs.filter(|exprs| !exprs.is_empty()) {
-        let expected = ctx.desc.materialized_slot_ids(sort_tuple)?.len();
-        if slot_exprs.len() != expected {
+        let materialized = ctx.desc.materialized_slot_ids(sort_tuple)?;
+        if slot_exprs.len() != materialized.len() {
             return Err(TranslateError::descriptor(format!(
                 "SORT_NODE {} materializes {} exprs for sort tuple {} with {} slots",
                 node.node_id,
                 slot_exprs.len(),
                 sort_tuple,
-                expected
+                materialized.len()
             )));
         }
-        let mut expressions = Vec::with_capacity(slot_exprs.len());
-        for expr in slot_exprs {
-            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
-            expressions.push(expr.translate(&mut expr_ctx)?);
+        // The FE lists the materialization expressions with the ordering keys first, but every
+        // consumer of the sort tuple resolves its columns through the descriptor's materialized
+        // slot order: the ordering slot refs below, this fragment's output names and sink row,
+        // and the receiving fragment's exchange schema on the other side of the wire. So the
+        // projection is emitted in materialized-slot order -- the sender is reordered to the
+        // one order all consumers already use. The alternative (overriding the receiver's
+        // declared stream schema to the FE list order) would satisfy the wire-schema guard and
+        // then feed every downstream slot reference, which still resolves through the
+        // descriptor order, the wrong column -- silently. The same invariant governs the
+        // aggregation node's grouping keys (see grouping_materialization_order): every node
+        // that materializes a new tuple must ship it in the tuple's materialized-slot order.
+        let fe_slot_order = sort_materialization_order(
+            node,
+            &sort.sort_info.ordering_exprs,
+            sort_tuple,
+            &materialized,
+        )?;
+        let mut translated_by_slot = std::collections::HashMap::with_capacity(slot_exprs.len());
+        for (slot_id, expr) in fe_slot_order.iter().zip(slot_exprs) {
+            let mut expr_ctx = ctx
+                .expr_context(&child.row_tuples)
+                .with_carried(&child.carried_slots);
+            translated_by_slot.insert(*slot_id, expr.translate(&mut expr_ctx)?);
         }
-        project_rel(child, expressions, vec![sort_tuple])
+        let expressions = materialized
+            .iter()
+            .map(|slot_id| {
+                translated_by_slot.remove(slot_id).ok_or_else(|| {
+                    TranslateError::descriptor(format!(
+                        "sort tuple {sort_tuple} slot {slot_id} has no materialization expression"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The sort-tuple projection re-materializes the row; the child's carried columns were
+        // consumed by the expressions above and are dropped here by construction.
+        project_rel(child, expressions, vec![sort_tuple], Vec::new())
     } else {
         child
     };
@@ -610,6 +1759,8 @@ fn translate_sort(
     let sorts = sort_fields(&sort.sort_info, &input, ctx)?;
     let row_tuples = input.row_tuples.clone();
     let output_width = input.output_width;
+    // A sort keeps the row layout, so any carried columns (the no-sort-tuple path) survive it.
+    let carried_slots = input.carried_slots.clone();
     let sorted = TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
@@ -620,8 +1771,68 @@ fn translate_sort(
         },
         row_tuples,
         output_width,
+        carried_slots,
     };
     apply_conjuncts(sorted, node, ctx)
+}
+
+/// Pairs each `sort_tuple_slot_exprs` entry with the sort-tuple slot it materializes,
+/// returning the slot ids in the FE's expression-list order.
+///
+/// The FE builds the sort tuple in two passes (`PlanFragmentBuilder.buildPartialTopNFragment`):
+/// one slot per ordering key first, then one slot per remaining output column in ascending
+/// slot-id order; `sort_tuple_slot_exprs` is appended in the same two passes. Each ordering
+/// expression is a bare slot ref naming the sort-tuple slot its key fills, and the payload
+/// slots are exactly the materialized slots left over -- which `materialized` already lists in
+/// ascending slot-id order, because the FE serializes every sort-tuple slot with column_pos -1.
+fn sort_materialization_order(
+    node: &TPlanNode,
+    ordering_exprs: &[TExpr],
+    sort_tuple: i32,
+    materialized: &[i32],
+) -> Result<Vec<i32>> {
+    let mut order = Vec::with_capacity(materialized.len());
+    for expr in ordering_exprs {
+        let slot_id =
+            sort_tuple_slot_id(expr, sort_tuple).ok_or(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "a sort ordering expression that is not a slot ref into the sort tuple \
+                         leaves the materialized column order unrecoverable",
+            })?;
+        order.push(slot_id);
+    }
+    let payload_slots = materialized
+        .iter()
+        .copied()
+        .filter(|slot_id| !order.contains(slot_id))
+        .collect::<Vec<_>>();
+    order.extend(payload_slots);
+    // Equal lengths make `order` a permutation of `materialized`: a duplicate ordering key or a
+    // key outside the tuple both inflate it. Anything but a permutation means the FE laid the
+    // tuple out differently than the two-pass model above, and reordering on a wrong model
+    // would ship wrong columns.
+    if order.len() != materialized.len() {
+        return Err(TranslateError::descriptor(format!(
+            "SORT_NODE {} ordering keys pair with slots {order:?}, but sort tuple {sort_tuple} \
+             materializes slots {materialized:?}",
+            node.node_id
+        )));
+    }
+    Ok(order)
+}
+
+/// Returns the sort-tuple slot a sort ordering expression names, if it is a bare slot ref into
+/// that tuple.
+fn sort_tuple_slot_id(expr: &TExpr, sort_tuple: i32) -> Option<i32> {
+    let [node] = expr.nodes.as_slice() else {
+        return None;
+    };
+    if node.node_type != starrocks_thrift::exprs::TExprNodeType::SLOT_REF {
+        return None;
+    }
+    let slot_ref = node.slot_ref.as_ref()?;
+    (slot_ref.tuple_id == sort_tuple).then_some(slot_ref.slot_id)
 }
 
 /// Builds Substrait sort fields from a StarRocks sort-info payload against `input`'s row layout.
@@ -642,7 +1853,9 @@ fn sort_fields(
         .iter()
         .zip(sort_info.is_asc_order.iter().zip(&sort_info.nulls_first))
         .map(|(expr, (asc, nulls_first))| {
-            let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+            let mut expr_ctx = ctx
+                .expr_context(&input.row_tuples)
+                .with_carried(&input.carried_slots);
             let expr = expr.translate(&mut expr_ctx)?;
             let direction = match (asc, nulls_first) {
                 (true, true) => sort_field::SortDirection::AscNullsFirst,
@@ -690,6 +1903,10 @@ fn translate_hash_join(
         TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, JoinOutput::Both),
         TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, JoinOutput::Both),
         TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, JoinOutput::Left),
+        // The FE commutes a semi join to RIGHT_SEMI when it decides the probe side should be
+        // built (cardinality-driven once FILES() scans carry row counts). Substrait's RightSemi
+        // keeps the right (build) row layout, which the consumer lowers to DuckDB RIGHT_SEMI.
+        TJoinOp::RIGHT_SEMI_JOIN => (join_rel::JoinType::RightSemi, JoinOutput::Right),
         TJoinOp::LEFT_ANTI_JOIN => (join_rel::JoinType::Left, JoinOutput::LeftAnti),
         TJoinOp::RIGHT_ANTI_JOIN => (join_rel::JoinType::Right, JoinOutput::RightAnti),
         TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => {
@@ -739,6 +1956,8 @@ fn translate_hash_join(
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
+    refuse_carried_join_child(node, &left)?;
+    refuse_carried_join_child(node, &right)?;
 
     let combined_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
     let mut conditions = Vec::new();
@@ -779,6 +1998,7 @@ fn translate_hash_join(
 
     let (row_tuples, output_width) = match output {
         JoinOutput::Left => (left.row_tuples.clone(), left.output_width),
+        JoinOutput::Right => (right.row_tuples.clone(), right.output_width),
         JoinOutput::NullAwareLeftAnti => (left.row_tuples.clone(), left.output_width + 1),
         _ => (
             combined_tuples.clone(),
@@ -798,6 +2018,8 @@ fn translate_hash_join(
         },
         row_tuples,
         output_width,
+        // Both children were refused above if they carried anything.
+        carried_slots: Vec::new(),
     };
     let joined = match output {
         JoinOutput::LeftAnti => {
@@ -845,9 +2067,35 @@ fn translate_hash_join(
 enum JoinOutput {
     Both,
     Left,
+    /// Only the right (build) side's columns survive: a RIGHT_SEMI join.
+    Right,
     LeftAnti,
     RightAnti,
     NullAwareLeftAnti,
+}
+
+/// Refuses a join child that physically carries common-expr columns.
+///
+/// Join conjuncts resolve through `slot_global_index` over the concatenated child rows using
+/// DESCRIPTOR materialized widths; a carried (wider-than-descriptor) child would physically
+/// shift every right-side column while the descriptor math would not. That is a wrong column
+/// read, not a type error the engine would catch. Consumers of a common slot across a join are
+/// therefore refused, loudly, at translation.
+fn refuse_carried_join_child(node: &TPlanNode, child: &TranslatedRel) -> Result<()> {
+    if child.carried_slots.is_empty() {
+        return Ok(());
+    }
+    let slots: Vec<i32> = child
+        .carried_slots
+        .iter()
+        .map(|slot| slot.slot_id)
+        .collect();
+    Err(TranslateError::descriptor(format!(
+        "{:?} {} reads a child that carries common-expr columns for slots {slots:?}; carried \
+         columns would shift the join's combined descriptor row, so consumers of a common \
+         slot across a join are not supported",
+        node.node_type, node.node_id
+    )))
 }
 
 /// Translates an inner/cross `NESTLOOP_JOIN_NODE` into an equality join on synthetic constants.
@@ -887,6 +2135,8 @@ fn translate_nestloop_join(
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
+    refuse_carried_join_child(node, &left)?;
+    refuse_carried_join_child(node, &right)?;
     let left_width = left.output_width;
     let right_width = right.output_width;
     let row_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
@@ -933,6 +2183,7 @@ fn translate_nestloop_join(
                     rel,
                     row_tuples,
                     output_width,
+                    carried_slots,
                 } = cross;
                 TranslatedRel {
                     rel: Rel {
@@ -944,6 +2195,7 @@ fn translate_nestloop_join(
                     },
                     row_tuples,
                     output_width,
+                    carried_slots,
                 }
             }
             None => cross,
@@ -984,24 +2236,18 @@ fn and_conditions(
 /// `parquet_scan(<paths>)`. v1 assumes parquet files whose column order matches
 /// the scan tuple's slot order, which holds for `FILES()` `SELECT *`. Without
 /// paths (e.g. HDFS scans) it falls back to a named-table read.
-fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Result<Rel> {
-    let read_type = if file_paths.is_empty() {
+fn scan_rel(
+    desc: &DescriptorTable,
+    tuple_id: i32,
+    files: &[crate::scan_paths::ScanFile],
+) -> Result<Rel> {
+    let read_type = if files.is_empty() {
         ReadType::NamedTable(NamedTable {
             names: desc.table_names_for_tuple(tuple_id)?,
             ..Default::default()
         })
     } else {
-        ReadType::LocalFiles(LocalFiles {
-            items: file_paths
-                .iter()
-                .map(|path| FileOrFiles {
-                    path_type: Some(PathType::UriFile(path.clone())),
-                    file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        })
+        return Ok(local_files_rel(desc.named_struct(tuple_id)?, files));
     };
     Ok(Rel {
         rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
@@ -1010,6 +2256,54 @@ fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Res
             ..Default::default()
         }))),
     })
+}
+
+/// Builds a read of an engine stream view with an explicit schema.
+///
+/// The view is a named table as far as Substrait is concerned; the engine defines it as a read of
+/// the corresponding input stream, so the plan never names a file.
+fn stream_read_rel(schema: substrait::proto::NamedStruct, stream_view: &str) -> Rel {
+    Rel {
+        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+            base_schema: Some(schema),
+            read_type: Some(ReadType::NamedTable(NamedTable {
+                names: vec![stream_view.to_string()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    }
+}
+
+/// Builds a local parquet read with an explicit schema, one item per file or byte-range
+/// split. A split's `start`/`length` ride the Substrait item; `(0, 0)` — the proto default —
+/// is the whole-file encoding, which is why a real range is never emitted as `(0, 0)`.
+fn local_files_rel(
+    schema: substrait::proto::NamedStruct,
+    files: &[crate::scan_paths::ScanFile],
+) -> Rel {
+    Rel {
+        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+            base_schema: Some(schema),
+            read_type: Some(ReadType::LocalFiles(LocalFiles {
+                items: files
+                    .iter()
+                    .map(|file| {
+                        let (start, length) = file.range.unwrap_or((0, 0));
+                        FileOrFiles {
+                            path_type: Some(PathType::UriFile(file.path.clone())),
+                            file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                            start,
+                            length,
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    }
 }
 
 /// Translates a StarRocks project node while preserving descriptor output order.
@@ -1047,7 +2341,12 @@ fn translate_project_node(
     let mut common_slots = std::collections::HashMap::new();
     for (&slot_id, expr) in project_node.common_slot_map.as_ref().into_iter().flatten() {
         let expression = {
-            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            // A project stacked on a carrying project references the lower one's carried
+            // columns; append_project never shifts existing columns, so the child's carried
+            // indices stay valid throughout this loop.
+            let mut expr_ctx = ctx
+                .expr_context_with_slots(&input.row_tuples, &common_slots)
+                .with_carried(&input.carried_slots);
             expr.translate(&mut expr_ctx)?
         };
         let field = input.output_width;
@@ -1064,12 +2363,50 @@ fn translate_project_node(
                     node.node_id, slot_id
                 ))
             })?;
-            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            let mut expr_ctx = ctx
+                .expr_context_with_slots(&input.row_tuples, &common_slots)
+                .with_carried(&input.carried_slots);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
     }
 
-    Ok(project_rel(input, expressions, output_tuples))
+    // Physically materialize the common-expr slots an ancestor consumes even though no output
+    // tuple materializes them: StarRocks' BE outputs them and the FE plans against that (it
+    // even emits a slot_map entry for them). They land as extra trailing columns past the
+    // descriptor row, and the returned carried_slots bindings are how ancestor refs find them.
+    let materialized_count = expressions.len();
+    let consumed = ctx
+        .consumed_above
+        .get(&node.node_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut carried = Vec::with_capacity(consumed.len());
+    for (position, &slot_id) in consumed.iter().enumerate() {
+        let expression = if let Some(expr) = slot_map.get(&slot_id) {
+            // The FE's own slot_map entry for the consumed slot (q14: `35 <-> ref 35`); its
+            // ref resolves to the appended common column through the override path.
+            let mut expr_ctx = ctx
+                .expr_context_with_slots(&input.row_tuples, &common_slots)
+                .with_carried(&input.carried_slots);
+            expr.translate(&mut expr_ctx)?
+        } else if let Some(&column) = common_slots.get(&(output_tuple, slot_id)) {
+            field_selection(column as i32)
+        } else {
+            return Err(TranslateError::descriptor(format!(
+                "PROJECT_NODE {} common slot {slot_id} is consumed above but the project has \
+                 no slot_map entry or common binding for it",
+                node.node_id
+            )));
+        };
+        expressions.push(expression);
+        carried.push(CarriedSlot {
+            tuple_id: output_tuple,
+            slot_id,
+            column: materialized_count + position,
+        });
+    }
+
+    Ok(project_rel(input, expressions, output_tuples, carried))
 }
 
 /// Adds a root projection over explicit fragment output expressions.
@@ -1080,9 +2417,10 @@ pub(crate) fn project_exprs(
     registry: &mut ExtensionRegistry,
 ) -> Result<TranslatedRel> {
     // Root projections evaluate over already-translated inputs, so there are no
-    // scan nodes to resolve file paths for.
+    // scan nodes to resolve file paths for and no exchange nodes to bind streams to.
     let scan_paths = ScanFilePaths::default();
-    let mut ctx = PlanContext::new(desc, &scan_paths, registry);
+    let exchange_inputs = HashMap::new();
+    let mut ctx = PlanContext::new(desc, &scan_paths, &exchange_inputs, registry);
     project_exprs_with_context(input, exprs, &mut ctx)
 }
 
@@ -1094,12 +2432,15 @@ fn project_exprs_with_context(
 ) -> Result<TranslatedRel> {
     let mut expressions = Vec::with_capacity(exprs.len());
     for expr in exprs {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&input.row_tuples)
+            .with_carried(&input.carried_slots);
         expressions.push(expr.translate(&mut expr_ctx)?);
     }
-    // A root projection over fragment output expressions keeps the input layout.
+    // A root projection over fragment output expressions keeps the input layout. It emits
+    // only the output expressions, so any carried columns are narrowed away here.
     let row_tuples = input.row_tuples.clone();
-    Ok(project_rel(input, expressions, row_tuples))
+    Ok(project_rel(input, expressions, row_tuples, Vec::new()))
 }
 
 /// Builds a Substrait project that emits exactly `expressions`.
@@ -1107,11 +2448,14 @@ fn project_exprs_with_context(
 /// The emit `output_mapping` selects the projected expressions, which sit after
 /// the input columns, so the base offset is the input's carried `output_width`.
 /// `row_tuples` is the output row layout (the project's own tuples, which may
-/// reorder or differ from the input's).
+/// reorder or differ from the input's). `carried_slots` names the trailing
+/// expressions that carry common-expr columns past the descriptor row; every
+/// caller but [`translate_project_node`] passes none.
 fn project_rel(
     input: TranslatedRel,
     expressions: Vec<Expression>,
     row_tuples: Vec<i32>,
+    carried_slots: Vec<CarriedSlot>,
 ) -> TranslatedRel {
     let base = input.output_width as i32;
     let output_mapping = (base..base + expressions.len() as i32).collect();
@@ -1132,6 +2476,7 @@ fn project_rel(
         },
         row_tuples,
         output_width,
+        carried_slots,
     }
 }
 
@@ -1154,6 +2499,9 @@ fn append_project(input: TranslatedRel, expression: Expression) -> TranslatedRel
         },
         row_tuples: input.row_tuples,
         output_width,
+        // The appended column lands at the END of the row, past any carried columns, so the
+        // carried indices stay valid and pass through unchanged.
+        carried_slots: input.carried_slots,
     }
 }
 
@@ -1175,7 +2523,27 @@ fn emit_columns(input: Rel, output_mapping: Vec<i32>, row_tuples: Vec<i32>) -> T
         },
         row_tuples,
         output_width,
+        // An explicit column list re-materializes the row; carried columns never survive it.
+        carried_slots: Vec::new(),
     }
+}
+
+/// Drops a fragment root's carried common-expr columns, restoring the descriptor row.
+///
+/// Required, not defensive: without it a width-preserving consumer chain above the carrying
+/// project (a SELECT conjunct as the fragment root, say) would ship the carried columns while
+/// the sender's names and the receiver's declared stream schema describe only the descriptor
+/// row, a drift the receiver-side guard would only catch at runtime on the engine.
+pub(crate) fn confine_carried(input: TranslatedRel) -> TranslatedRel {
+    if input.carried_slots.is_empty() {
+        return input;
+    }
+    let descriptor_width = input.output_width - input.carried_slots.len();
+    emit_columns(
+        input.rel,
+        (0..descriptor_width as i32).collect(),
+        input.row_tuples,
+    )
 }
 
 /// Builds a direct field selection against the current relation output.
@@ -1199,6 +2567,51 @@ fn field_selection(field: i32) -> Expression {
                 )),
             },
         ))),
+    }
+}
+
+/// Returns the field index of a direct struct-field reference, if the expression is one.
+fn direct_field(expr: &Expression) -> Option<i32> {
+    use substrait::proto::expression::{RexType, field_reference, reference_segment};
+
+    let RexType::Selection(selection) = expr.rex_type.as_ref()? else {
+        return None;
+    };
+    let field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref()?
+    else {
+        return None;
+    };
+    let reference_segment::ReferenceType::StructField(field) = segment.reference_type.as_ref()?
+    else {
+        return None;
+    };
+    field.child.is_none().then_some(field.field)
+}
+
+/// Builds a typed Substrait null literal.
+fn null_literal(ty: substrait::proto::Type) -> Expression {
+    Expression {
+        rex_type: Some(substrait::proto::expression::RexType::Literal(
+            substrait::proto::expression::Literal {
+                literal_type: Some(substrait::proto::expression::literal::LiteralType::Null(ty)),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+/// Builds an i64 literal used to compare against a merged count.
+fn i64_literal(value: i64) -> Expression {
+    Expression {
+        rex_type: Some(substrait::proto::expression::RexType::Literal(
+            substrait::proto::expression::Literal {
+                literal_type: Some(substrait::proto::expression::literal::LiteralType::I64(
+                    value,
+                )),
+                ..Default::default()
+            },
+        )),
     }
 }
 
@@ -1229,6 +2642,8 @@ fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
         },
         row_tuples: input.row_tuples,
         output_width,
+        // A filter keeps the row layout, carried columns included.
+        carried_slots: input.carried_slots,
     }
 }
 
@@ -1280,7 +2695,9 @@ fn apply_conjuncts(
     let conjuncts = node.conjuncts.as_deref().unwrap_or_default();
     let mut conditions = Vec::with_capacity(conjuncts.len());
     for expr in conjuncts {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&input.row_tuples)
+            .with_carried(&input.carried_slots);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
     let Some(condition) = and_conditions(conditions, ctx) else {
@@ -1299,6 +2716,8 @@ fn apply_conjuncts(
         },
         row_tuples: input.row_tuples,
         output_width,
+        // A filter keeps the row layout, carried columns included.
+        carried_slots: input.carried_slots,
     })
 }
 

@@ -10,7 +10,13 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+pub use crate::parked_registry::RetireTrigger;
+use crate::result_store::FragmentInstanceId;
+
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
+///
+/// Only a *result* fragment produces one. An intermediate fragment's output never becomes Arrow —
+/// it stays on the GPU as native batches for the fragment that consumes it.
 #[derive(Clone, Debug)]
 pub struct FragmentResult {
     /// Result batches in fragment output order. Empty for a fragment with no output columns.
@@ -29,20 +35,195 @@ impl FragmentResult {
     }
 }
 
-/// Runs a translated fragment and returns its result batches.
+/// Where one sender fragment's output is parked until its receiver runs.
 ///
-/// This is intentionally a synchronous, fully-materializing seam for the single-fragment
-/// milestone: `exec_plan_fragment` runs it to completion before returning, and `fetch_data` then
-/// drains the buffered rows.
+/// Keyed by the *receiver* it feeds, because that is what the rendezvous looks it up by: a sender
+/// is addressed by the exchange it produces into, not by its own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SenderSlot {
+    /// Receiver fragment instance the output is destined for.
+    pub fragment_instance_id: FragmentInstanceId,
+    /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
+    pub node_id: i32,
+    /// Sender ordinal within that exchange's sender set.
+    pub sender_id: i32,
+}
+
+/// Identity of one fragment run, as the engine's parked-output bookkeeping and the CN's run log
+/// lines see it.
 ///
-/// TODO(starrocks-execute): a real GPU executor should not block dispatch on full materialization.
-/// Evolve this into a streaming contract — dispatch registers a running fragment and returns after
-/// startup, the executor pushes Arrow batches (e.g. via an Arrow C stream) into a bounded channel
-/// the `ResultStore` drains, and execution is cancellable from `cancel_plan_fragment`. Large/slow
-/// result queries then stream through `fetch_data` instead of risking dispatch-time timeout/OOM.
+/// The engine owns parked sender output per `query_id` (see `parked_registry`), and the CN's
+/// start/finish lines carry both ids next to this CN's exchange endpoint, so one StarRocks query's
+/// halves on different CNs line up. Both `None` when the dispatch carried no ids (fixtures).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FragmentLabel {
+    /// StarRocks query id, shared by every fragment instance of the query.
+    pub query_id: Option<FragmentInstanceId>,
+    /// The fragment instance the FE dispatched.
+    pub fragment_instance_id: Option<FragmentInstanceId>,
+}
+
+impl FragmentLabel {
+    /// The two ids as log-line text, `-` where the dispatch carried none.
+    pub fn log_ids(&self) -> (String, String) {
+        let text = |id: Option<FragmentInstanceId>| {
+            id.map_or_else(|| "-".to_string(), |id| id.to_string())
+        };
+        (text(self.query_id), text(self.fragment_instance_id))
+    }
+}
+
+/// One packed batch sitting in an exchange staging arena as cudf packed bytes.
+///
+/// The neutral wire shape of the nixl tier: on the sender it names a lease in the *local* arena
+/// (filled by `export_packed`), on the receiver a lease in the *receiver's* arena (filled by a
+/// nixl WRITE). Whoever holds the arena releases the lease after the bytes leave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedBatch {
+    /// Host-side cudf pack metadata (travels over brpc next to the device payload).
+    pub metadata: Vec<u8>,
+    /// Byte offset of the packed payload from the arena base. `0` with `len == 0` means no
+    /// lease exists for this batch (a metadata-only empty batch) — nothing to release.
+    pub offset: u64,
+    /// Length of the packed payload in bytes.
+    pub len: u64,
+    /// Exact row count of the packed table (from `export_packed`, carried on the transmit
+    /// frame). The receiver sums the counts per stream into `declare_input_cardinality` so the
+    /// optimizer can size the stream. `None` when the frame predates the wire field: the
+    /// receiver then declares nothing for the stream and keeps the legacy blind planning.
+    pub rows: Option<u64>,
+    /// `Some` once the payload was copied out of its arena lease into pool memory on arrival
+    /// ([`FragmentExecutor::stage_inbound`]): the batch lives in the executor's inbound store
+    /// under this ticket and `offset` is 0 and holds no lease (`len` keeps the payload size for
+    /// accounting, `metadata` stays for the rendezvous' frame checks). The receiver takes it by
+    /// ticket; a query that ends before
+    /// its receiver runs drops it by ticket. `None` is the legacy shape: the payload still sits
+    /// in the lease at `offset` until the receiver pushes it.
+    pub ticket: Option<u64>,
+}
+
+/// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
+#[derive(Debug)]
+pub struct FragmentRun<'a> {
+    /// Translated plan, including the schema of every exchange lowered to a stream read.
+    pub plan: &'a TranslatedPlan,
+    /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
+    pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Remote sender outputs already on this CN, as `(exchange node id, sender id, batches)`:
+    /// a ticketed batch is taken from the inbound store with `push_inbound`, a legacy one is
+    /// pushed from its lease via `push_packed` (the lease released the moment the push returns);
+    /// then `close_input`, all before the fragment runs.
+    pub remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
+    /// Non-empty for a sender fragment: the fragment parks ONCE and output stream i belongs to
+    /// destination `outputs[i]` (the FE's destination order). Each destination drains its own
+    /// stream; the parked fragment drops when the last destination releases it.
+    pub outputs: Vec<SenderSlot>,
+    /// Every destination receives the full output (a broadcast sink). With `outputs.len() > 1`
+    /// and `broadcast == false`, `hash_keys` routes rows instead.
+    pub broadcast: bool,
+    /// Hash-partition key columns (output column indices, in the exchange's shared
+    /// partition-expression order). Non-empty exactly for a hash-partitioned fan-out.
+    pub hash_keys: Vec<usize>,
+    /// The query and instance this run belongs to; the engine parks output under `query_id`.
+    pub label: FragmentLabel,
+}
+
+/// Runs a translated fragment, either parking its output for a downstream fragment or returning
+/// its rows.
+///
+/// The seam is synchronous and one fragment at a time: the engine serializes queries, and a
+/// sender's output is parked on the GPU — as native batches, not Arrow — until its receiver is
+/// dispatched. A sender's rows therefore never leave the device between fragments.
+///
+/// TODO(starrocks-execute): dispatch still blocks until a fragment completes. Concurrency needs
+/// per-query lifecycle isolation in the engine; until then `run` is called from a blocking worker
+/// so the BRPC runtime stays responsive.
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
-    /// Executes `translated` and returns its Arrow result batches.
-    fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String>;
+    /// Runs `run`. Returns rows only for a fragment with no `output` slot — a result fragment.
+    fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String>;
+
+    /// Exchange staging arena `(device base address, capacity in bytes)`, for transport memory
+    /// registration. Errors when the executor has no arena — the default for every executor
+    /// that is not the engine with `SIRIUS_EXCHANGE_STAGING_BYTES` set.
+    fn staging_info(&self) -> Result<(u64, u64), String> {
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Leases `len` bytes of the staging arena, returning the lease offset from the base.
+    fn staging_lease(&self, len: u64) -> Result<u64, String> {
+        let _ = len;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Returns the staging lease at `offset`.
+    fn staging_release(&self, offset: u64) -> Result<(), String> {
+        let _ = offset;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Packs the next batch parked under `slot` into a fresh staging lease; `Ok(None)` once the
+    /// parked output is drained. The lease stays outstanding until
+    /// [`staging_release`](Self::staging_release).
+    fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
+        let _ = slot;
+        Err("this fragment executor cannot export packed batches \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Whether this executor copies inbound frames out of their arena lease into pool memory on
+    /// arrival (an engine with a staging arena). `false` keeps frames in their leases until the
+    /// receiver runs, which is what every executor without a GPU does.
+    fn inbound_store_available(&self) -> bool {
+        false
+    }
+
+    /// Copies `batch`'s payload out of its staging lease into pool memory and returns the ticket
+    /// it is now held under. The lease at `batch.offset` is still the caller's to release,
+    /// immediately after this returns.
+    fn stage_inbound(&self, batch: &StagedBatch) -> Result<u64, String> {
+        let _ = batch;
+        Err("this fragment executor has no inbound store \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Drops the staged batch under `ticket`, freeing its pool memory: the release path for a
+    /// frame whose receiver will never run.
+    fn drop_inbound(&self, ticket: u64) -> Result<(), String> {
+        let _ = ticket;
+        Err("this fragment executor has no inbound store \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Drops the parked fragment under `slot`, releasing the GPU memory its batches hold. Called
+    /// after the drained output has been transmitted (or on a failed transmit, so a wedged
+    /// cross-node query does not pin its output for the process lifetime).
+    fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+        let _ = slot;
+        Err("this fragment executor parks nothing to drop".to_string())
+    }
+
+    /// Drops every parked output of `query_id` and refuses later runs for it. Non-blocking and
+    /// idempotent. Called when the CN learns the query is over: a fragment failed before the engine
+    /// ran it, or the FE cancelled. Unlike `drop_parked` this is a sweep, not an exactly-once
+    /// release, so an executor that parks nothing succeeds trivially.
+    fn retire_query(
+        &self,
+        query_id: FragmentInstanceId,
+        trigger: RetireTrigger,
+        cause: &str,
+    ) -> Result<(), String> {
+        let _ = (query_id, trigger, cause);
+        Ok(())
+    }
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
@@ -50,12 +231,24 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
 pub struct StubExecutor;
 
 impl FragmentExecutor for StubExecutor {
+    fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+        // A stub sender parks nothing; the rendezvous only needs it to succeed.
+        if !run.outputs.is_empty() {
+            return Ok(None);
+        }
+        self.execute(run.plan).map(Some)
+    }
+}
+
+impl StubExecutor {
+    /// One placeholder row per output column, so the FE→client path works without a GPU.
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
         // TODO(starrocks-execute): replace with a SiriusExecutor that hands
         // `translated.to_substrait_bytes()` to the embedded Sirius engine, executes it on the
         // GPU, and imports the result via the Arrow C Data Interface. That executor will hold an
-        // `Arc<sirius::SiriusContext>` threaded in from `main` (see `BrpcServer::new`). For now
-        // we emit one placeholder string row per output column so the FE→client path is exercised.
+        // `Arc<sirius::SiriusContext>` threaded in from `main` (see `BrpcServer::with_executor`).
+        // For now we emit one placeholder string row per output column so the FE→client path is
+        // exercised.
         let names = &translated.output_names;
         if names.is_empty() {
             return Ok(FragmentResult {
@@ -84,8 +277,10 @@ mod tests {
 
     fn plan_with_outputs(names: &[&str]) -> TranslatedPlan {
         TranslatedPlan {
+            output_partition_columns: None,
             plan: Default::default(),
             output_names: names.iter().map(|name| name.to_string()).collect(),
+            stream_inputs: Vec::new(),
         }
     }
 
@@ -106,5 +301,21 @@ mod tests {
     fn stub_executor_handles_empty_output() {
         let result = StubExecutor.execute(&plan_with_outputs(&[])).unwrap();
         assert!(result.batches.is_empty());
+    }
+
+    /// A dispatch without ids logs `-` for both; with ids, the two render distinctly.
+    #[test]
+    fn fragment_label_renders_ids_or_dashes() {
+        let label = FragmentLabel {
+            query_id: Some(FragmentInstanceId::from_halves(1, 2)),
+            fragment_instance_id: Some(FragmentInstanceId::from_halves(1, 3)),
+        };
+        let (query, instance) = label.log_ids();
+        assert_ne!(query, instance);
+        assert_eq!(query, FragmentInstanceId::from_halves(1, 2).to_string());
+        assert_eq!(
+            FragmentLabel::default().log_ids(),
+            ("-".to_string(), "-".to_string())
+        );
     }
 }

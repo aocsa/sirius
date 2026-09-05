@@ -54,9 +54,12 @@
 #include <cuda_runtime_api.h>
 
 // standard library
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 
 using namespace cucascade;
 using namespace cucascade::memory;
@@ -201,6 +204,30 @@ std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
   cudaMemcpy(col->mutable_view().data<int64_t>(),
              values.data(),
              sizeof(int64_t) * values.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto batch_id = ::sirius::get_next_batch_id();
+  return data_batch::make(batch_id, std::move(gpu_repr));
+}
+
+std::shared_ptr<data_batch> make_double_batch(memory_space& space,
+                                              const std::vector<double>& values)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+  auto size   = static_cast<cudf::size_type>(values.size());
+
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT64}, size, cudf::mask_state::UNALLOCATED, stream, mr);
+  cudaMemcpy(col->mutable_view().data<double>(),
+             values.data(),
+             sizeof(double) * values.size(),
              cudaMemcpyHostToDevice);
 
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -1590,6 +1617,146 @@ TEMPLATE_TEST_CASE("evaluate decimal TPC-H Q1 shape price * (1 - discount)",
     expected.push_back(raw_price[i] * (100 - raw_discount[i]));
   }
   REQUIRE(out0 == expected);
+}
+
+TEMPLATE_TEST_CASE("cast DOUBLE -> DECIMAL rounds half away from zero like DuckDB",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  // The StarRocks path lowers decimal arithmetic to FP64 and the FE casts the result back to
+  // DECIMAL: `1 - l_discount` arrives as cast(subtract(1.0, 0.07) as DECIMAL(16,2)). In FP64
+  // that is 0.9299999999999999; DuckDB's cast scales by 10^2 and rounds half away from zero
+  // (0.93), cuDF's fixed_point conversion truncates (0.92). The expected values below are
+  // DuckDB's own answers for these inputs (duckdb 1.x, `CAST(x::DOUBLE AS DECIMAL(16,2))`).
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<double> values    = {1.0 - 0.07,  // 0.9299999999999999
+                                   -(1.0 - 0.07),
+                                   0.125,  // exactly representable half: away from zero
+                                   -0.125,
+                                   2.675,  // 267.5 after scaling in double
+                                   1.005,  // 100.49999999999999 after scaling in double
+                                   0.001,
+                                   -0.001,
+                                   1234.0};
+  std::vector<int64_t> expected = {93, -93, 13, -13, 268, 100, 0, 0, 123400};
+
+  auto input     = make_double_batch(*space, values);
+  auto cast_expr = make_cast(make_ref(0), logical_type::make_decimal(16, 2), /*try_cast=*/false);
+
+  auto [in_batch, out_batch, iv, ov] =
+    run_execute(*space, input, one(std::move(cast_expr)), strategy);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(ov.column(0).type().scale() == -2);
+  REQUIRE(copy_column_to_host<int64_t>(ov.column(0)) == expected);
+}
+
+TEST_CASE("cast DOUBLE -> DECIMAL(16,0) rounds to the integer DuckDB gives",
+          "[expression_evaluator]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<double> values    = {0.5, -0.5, 1234.5, 2.4999};
+  std::vector<int64_t> expected = {1, -1, 1235, 2};
+
+  auto input     = make_double_batch(*space, values);
+  auto cast_expr = make_cast(make_ref(0), logical_type::make_decimal(16, 0), /*try_cast=*/false);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(cast_expr)), MAT);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(copy_column_to_host<int64_t>(ov.column(0)) == expected);
+}
+
+namespace {
+
+std::unique_ptr<ast_node> make_round(std::unique_ptr<ast_node> input, std::optional<int32_t> places)
+{
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(std::move(input));
+  if (places) { args.push_back(make_int_const(*places)); }
+  return std::make_unique<ast_node>(sirius::ast::function_call{
+    sirius::function_id::round, std::move(args), logical_type::make(type_id::DOUBLE)});
+}
+
+}  // namespace
+
+TEMPLATE_TEST_CASE("round(DOUBLE [, places]) rounds half away from zero like DuckDB",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  // The StarRocks translator finalizes every FE-declared DECIMAL aggregate it lowered to FP64
+  // with round(x, scale), so two independent FP64 sums of the same decimals become the same
+  // double: the first two values are TPC-H q15's SF1000 top total_revenue as two runs summed it,
+  // one ULP apart, and `total_revenue = (select max(total_revenue) ...)` dropped the row whenever
+  // the two evaluations of the CTE disagreed. Expected values are DuckDB's own answers for
+  // `round(x::DOUBLE, places)`.
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<double> values = {
+    3351778.0989000006, 3351778.0988999996, 2.675, 1.005, -0.125, 0.5, -0.5, 1234.0};
+  auto input = make_double_batch(*space, values);
+
+  SECTION("four places: the two ULP-apart sums collapse to one double")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), 4)), strategy);
+    REQUIRE(ov.num_columns() == 1);
+    REQUIRE(ov.column(0).type().id() == cudf::type_id::FLOAT64);
+    std::vector<double> expected = {
+      3351778.0989, 3351778.0989, 2.675, 1.005, -0.125, 0.5, -0.5, 1234.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+  SECTION("two places: 2.675 scales to 267.5 in double and rounds up, as in DuckDB")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), 2)), strategy);
+    std::vector<double> expected = {3351778.1, 3351778.1, 2.68, 1.0, -0.13, 0.5, -0.5, 1234.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+  SECTION("no places argument is DuckDB's unary round")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), std::nullopt)), strategy);
+    std::vector<double> expected = {3351778.0, 3351778.0, 3.0, 1.0, -0.0, 1.0, -1.0, 1234.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+  SECTION("negative places round to hundreds")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), -2)), strategy);
+    std::vector<double> expected = {3351800.0, 3351800.0, 0.0, 0.0, -0.0, 0.0, -0.0, 1200.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+}
+
+TEST_CASE("round(DOUBLE, places) keeps nulls and passes NaN and infinities through",
+          "[expression_evaluator]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const nan             = std::numeric_limits<double>::quiet_NaN();
+  auto const inf             = std::numeric_limits<double>::infinity();
+  std::vector<double> values = {nan, inf, -inf, 1e308, 0.0049};
+  auto input                 = make_double_batch(*space, values);
+
+  auto [in_batch, out_batch, iv, ov] =
+    run_execute(*space, input, one(make_round(make_ref(0), 2)), MAT);
+  auto out = copy_column_to_host<double>(ov.column(0));
+  REQUIRE(out.size() == 5);
+  REQUIRE(std::isnan(out[0]));
+  REQUIRE(out[1] == inf);
+  REQUIRE(out[2] == -inf);
+  // 1e308 * 100 overflows: DuckDB returns the input unchanged.
+  REQUIRE(out[3] == 1e308);
+  REQUIRE(out[4] == 0.0);
 }
 
 // ---------------------------------------------------------------------------

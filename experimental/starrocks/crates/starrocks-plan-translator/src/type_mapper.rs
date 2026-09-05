@@ -33,6 +33,56 @@ pub(crate) fn fp64_type(nullable: bool) -> Type {
     }
 }
 
+/// Builds an I64 (BIGINT) type, the width the engine returns for builtins the frontend declares
+/// narrower (year/month/day, length/char_length).
+pub(crate) fn i64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::I64(r#type::I64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
+/// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
+/// an input stream's schema.
+///
+/// A stream has no file to probe, so the engine cannot infer the schema; it is declared. Deriving
+/// the declaration from the very `Type` the plan's read carries is what keeps the two from
+/// drifting. The alternative, a second StarRocks-to-DuckDB mapping, would be a silent
+/// wrong-results bug the first time the two disagreed.
+pub fn duckdb_type_name(ty: &Type) -> Result<String> {
+    let kind = ty
+        .kind
+        .as_ref()
+        .ok_or_else(|| TranslateError::malformed("stream input column has no type"))?;
+    let name = match kind {
+        r#type::Kind::Bool(_) => "BOOLEAN".to_string(),
+        r#type::Kind::I8(_) => "TINYINT".to_string(),
+        r#type::Kind::I16(_) => "SMALLINT".to_string(),
+        r#type::Kind::I32(_) => "INTEGER".to_string(),
+        r#type::Kind::I64(_) => "BIGINT".to_string(),
+        r#type::Kind::Fp32(_) => "FLOAT".to_string(),
+        r#type::Kind::Fp64(_) => "DOUBLE".to_string(),
+        // DuckDB's CHAR is an alias of VARCHAR, so the declared length carries no information.
+        r#type::Kind::FixedChar(_) | r#type::Kind::Varchar(_) | r#type::Kind::String(_) => {
+            "VARCHAR".to_string()
+        }
+        r#type::Kind::Binary(_) | r#type::Kind::FixedBinary(_) => "BLOB".to_string(),
+        r#type::Kind::Date(_) => "DATE".to_string(),
+        r#type::Kind::PrecisionTimestamp(_) => "TIMESTAMP".to_string(),
+        r#type::Kind::Decimal(decimal) => {
+            format!("DECIMAL({},{})", decimal.precision, decimal.scale)
+        }
+        _ => {
+            return Err(TranslateError::malformed(
+                "stream input column type has no DuckDB name",
+            ));
+        }
+    };
+    Ok(name)
+}
+
 /// Maps a StarRocks type descriptor and slot nullability into a Substrait type.
 pub fn map_type_desc(type_desc: &TTypeDesc, nullable: bool) -> Result<Type> {
     let node = scalar_node(type_desc)?;
@@ -57,6 +107,34 @@ pub(crate) fn scalar_primitive(type_desc: &TTypeDesc) -> Result<TPrimitiveType> 
             field: "scalar_type",
         })?
         .type_)
+}
+
+/// The scale an FP64-lowered decimal is rounded back to where its value is finalized.
+///
+/// `Some(scale)` when the descriptor is a decimal that [`map_scalar_type`] lowers to FP64
+/// (precision above 18) and states its scale; `None` for every other type, including the
+/// decimals that stay DECIMAL -- the engine's FP64 -> DECIMAL cast rounds those itself.
+pub(crate) fn lowered_decimal_scale(type_desc: &TTypeDesc) -> Result<Option<i32>> {
+    let node = scalar_node(type_desc)?;
+    let Some(scalar) = node.scalar_type.as_ref() else {
+        return Ok(None);
+    };
+    let decimal = matches!(
+        scalar.type_,
+        TPrimitiveType::DECIMAL
+            | TPrimitiveType::DECIMALV2
+            | TPrimitiveType::DECIMAL32
+            | TPrimitiveType::DECIMAL64
+            | TPrimitiveType::DECIMAL128
+    );
+    if node.type_ != TTypeNodeType::SCALAR || !decimal {
+        return Ok(None);
+    }
+    let lowered = matches!(
+        map_scalar_type(scalar, true)?.kind,
+        Some(r#type::Kind::Fp64(_))
+    );
+    Ok(scalar.scale.filter(|_| lowered))
 }
 
 /// Returns the first scalar node in a StarRocks type descriptor.
@@ -228,6 +306,53 @@ mod tests {
 
     fn decimal(precision: i32) -> TScalarType {
         TScalarType::new(TPrimitiveType::DECIMAL128, None, Some(precision), Some(2))
+    }
+
+    /// Only the decimals that lower to FP64 report a scale to round back to; a decimal that
+    /// stays DECIMAL, a non-decimal, and a lowered decimal without a stated scale do not.
+    #[test]
+    fn lowered_decimal_scale_follows_the_precision_boundary() {
+        let desc = |scalar: TScalarType| {
+            starrocks_thrift::types::TTypeDesc::new(Some(vec![
+                starrocks_thrift::types::TTypeNode::new(
+                    TTypeNodeType::SCALAR,
+                    Some(scalar),
+                    None,
+                    None,
+                ),
+            ]))
+        };
+        assert_eq!(
+            lowered_decimal_scale(&desc(TScalarType::new(
+                TPrimitiveType::DECIMAL128,
+                None,
+                Some(38),
+                Some(4)
+            )))
+            .unwrap(),
+            Some(4)
+        );
+        assert_eq!(lowered_decimal_scale(&desc(decimal(18))).unwrap(), None);
+        assert_eq!(
+            lowered_decimal_scale(&desc(TScalarType::new(
+                TPrimitiveType::DECIMAL128,
+                None,
+                Some(38),
+                None
+            )))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            lowered_decimal_scale(&desc(TScalarType::new(
+                TPrimitiveType::DOUBLE,
+                None,
+                None,
+                None
+            )))
+            .unwrap(),
+            None
+        );
     }
 
     /// Precision 18 is the last width kept as DECIMAL; 19 and up lower to FP64.

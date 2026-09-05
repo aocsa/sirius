@@ -35,6 +35,7 @@
 #include <cudf/io/parquet.hpp>
 
 // standard library
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +43,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -67,6 +69,12 @@ class parquet_ingestible_table_info : public ingestible_table_info {
  public:
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
+  /// Per-file byte range `[start, start+length)`, parallel to @ref resolved_file_paths.
+  /// Empty means every file is read whole; a `(0,0)` entry means that file is read whole.
+  /// A ranged file reads only the row groups whose start offset falls inside the range
+  /// (see parquet_byte_range.hpp) — the mechanism behind distributed byte-range splits,
+  /// where N ranges of one file must read every row exactly once across scan instances.
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> resolved_file_ranges;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
@@ -81,9 +89,24 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  std::size_t scan_output_arity      = 0;
+  /// When true the coalescer never bundles row groups of different files into one
+  /// split: each emitted split holds slices of exactly one file (a large file still
+  /// splits under approximate_batch_size). The pin path sets this so every pinned
+  /// chunk has single-file provenance and a scan over a subset of the pinned files
+  /// can be served by selecting whole chunks. The query read path keeps fused
+  /// batches (false).
+  bool batch_within_file_boundaries = false;
+  std::size_t scan_output_arity     = 0;
 
   parquet_ingestible_table_info() = default;
+
+  /// True when any file carries a real byte range (a `(0,0)` entry is a whole file).
+  [[nodiscard]] bool has_byte_ranges() const
+  {
+    return std::any_of(resolved_file_ranges.begin(),
+                       resolved_file_ranges.end(),
+                       [](auto const& range) { return range.second != 0 || range.first != 0; });
+  }
 
   [[nodiscard]] std::span<std::string const> column_names() const override { return names; }
 
@@ -94,8 +117,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
 };
 
 /// Canonical identity form for a parquet file path so pinned-cache matching
-/// (@ref cache_entry_info::can_serve_with_columns, a raw set-equality on
-/// resolved_file_paths) is independent of spelling: relative vs absolute,
+/// (@ref cache_entry_info::matches_parquet_file_set: exact set equality, or a
+/// strict subset of the pinned files, over resolved_file_paths) and per-chunk
+/// provenance are independent of spelling: relative vs absolute,
 /// redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs
 /// (scheme://) pass through. Apply ONLY at the cache-identity boundary
 /// (cache_entry_info): resolved_file_paths on the bind info stay as bound, so
@@ -329,12 +353,15 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   }
 
  private:
-  /// Read one file's footer, prune its row groups against the filter, and record
-  /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
-  /// Runs on a scan-manager dispatcher thread (the task returned by
-  /// @ref next_split_provider).
-  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
-                                                  std::shared_ptr<io::sirius_ioctx> const& io_ctx);
+  /// Read one file's footer, prune its row groups against the byte range and the filter, and
+  /// record per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
+  /// `byte_range` is `(0,0)` for a whole-file read; otherwise only row groups starting inside
+  /// `[start, start+length)` are read. Runs on a scan-manager dispatcher thread (the task
+  /// returned by @ref next_split_provider).
+  std::unique_ptr<scan_info> build_file_scan_info(
+    std::string const& file_path,
+    std::pair<std::uint64_t, std::uint64_t> byte_range,
+    std::shared_ptr<io::sirius_ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 

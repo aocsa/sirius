@@ -120,7 +120,8 @@ task_scheduler::task_scheduler(
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
                                               dg_exec,
-                                              _telemetry_context));
+                                              _telemetry_context,
+                                              _execution_progress));
   }
 }
 
@@ -233,6 +234,19 @@ void task_scheduler::terminate_query(std::exception_ptr error)
   stop();
 }
 
+void task_scheduler::fail_stalled_query(uint64_t stalled_secs)
+{
+  std::scoped_lock lock(_query_mutex);
+  if (!_completion_handler) { return; }
+  SIRIUS_LOG_ERROR(
+    "task_scheduler: no scheduling progress for {}s (no task created or completed, no pipeline "
+    "finished); failing the query as stalled",
+    stalled_secs);
+  _completion_handler->report_error("sirius query watchdog: no scheduling progress for " +
+                                    std::to_string(stalled_secs) +
+                                    "s — failing the stalled query instead of wedging the engine");
+}
+
 void task_scheduler::drain_after_error()
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
@@ -262,6 +276,14 @@ void task_scheduler::drain_after_error()
   // tasks to finish, then restart the manager for the next query.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_and_wait();
+    auto const m = gpu_exec->get_metrics();
+    SIRIUS_LOG_INFO(
+      "task_scheduler: GPU:{} executor metrics (cumulative): tasks_executed={} "
+      "oom_reschedules={} futile_aborts={}",
+      device_id,
+      m.tasks_executed,
+      m.oom_reschedules,
+      m.futile_aborts);
   }
 
   // Now that no executor can generate further task_creation_requests, discard

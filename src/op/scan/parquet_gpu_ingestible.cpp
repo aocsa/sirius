@@ -26,6 +26,7 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <op/scan/parquet_byte_range.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
@@ -240,11 +241,13 @@ class parquet_batch_coalescer : public batch_coalescer {
  public:
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                          std::shared_ptr<scan_plan const> plan)
+                          std::shared_ptr<scan_plan const> plan,
+                          bool file_boundaries = false)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
-      _needs_assembly(needs_output_assembly(*_plan))
+      _needs_assembly(needs_output_assembly(*_plan)),
+      _file_boundaries(file_boundaries)
   {
   }
 
@@ -325,6 +328,9 @@ class parquet_batch_coalescer : public batch_coalescer {
       cur_rows += rg.num_rows;
     }
     seal_file();
+    // File-boundary mode: emit at each file's end so no split ever bundles two
+    // files' row groups — every split's provenance is exactly one file.
+    if (_file_boundaries && !_slices.empty()) { emitted.push_back(emit_current()); }
     return emitted;
   }
 
@@ -374,6 +380,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
   const bool _needs_assembly;
+  const bool _file_boundaries = false;
 
   std::vector<row_group_slice> _slices;
   std::size_t _acc_working_bytes = 0;
@@ -609,6 +616,14 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   }
 
   _file_paths = bind.resolved_file_paths;
+  if (!bind.resolved_file_ranges.empty() &&
+      bind.resolved_file_ranges.size() != bind.resolved_file_paths.size()) {
+    throw sirius::invalid_input_exception(
+      "parquet scan carries {} byte ranges for {} files; a partial pairing would make "
+      "row-group ownership ambiguous",
+      bind.resolved_file_ranges.size(),
+      bind.resolved_file_paths.size());
+  }
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
@@ -619,7 +634,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
   return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan);
+    _info->approximate_batch_size, _reader_options, _plan, _info->batch_within_file_boundaries);
 }
 
 //===----------------------------------------------------------------------===//
@@ -642,10 +657,13 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.
   auto const& file_path = _file_paths[idx];
+  auto const byte_range = idx < _info->resolved_file_ranges.size()
+                            ? _info->resolved_file_ranges[idx]
+                            : std::pair<std::uint64_t, std::uint64_t>{0, 0};
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
-  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, io_ctx);
+  return [this, file_path, byte_range, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(file_path, byte_range, io_ctx);
   };
 }
 
@@ -653,7 +671,9 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
+  std::string const& file_path,
+  std::pair<std::uint64_t, std::uint64_t> byte_range,
+  std::shared_ptr<io::sirius_ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -799,6 +819,18 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   auto row_group_indices = reader.all_row_groups(opts);
+  // Distributed byte-range split: keep only the row groups this range owns (start-offset
+  // containment, parquet_byte_range.hpp), BEFORE stats pruning. An empty selection is a valid
+  // empty split and flows through the all-pruned fallback below — never a whole-file read.
+  if (byte_range.second != 0 || byte_range.first != 0) {
+    row_group_indices =
+      detail::row_groups_in_byte_range(metadata, byte_range.first, byte_range.second);
+    SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Byte range [{}, +{}) of {} owns {} row group(s)",
+                     byte_range.first,
+                     byte_range.second,
+                     file_path,
+                     row_group_indices.size());
+  }
   if (ast_expression && !disable_filter_pushdown) {
     auto const rgs_before = row_group_indices.size();
     row_group_indices     = reader.filter_row_groups_with_stats(row_group_indices, opts, stream);
