@@ -41,6 +41,21 @@ const RPC_TIMEOUT_SECS: Knob<u64> = Knob {
     max: 3600,
 };
 
+/// How long a sender waits for a peer's receive credit before failing the drain.
+///
+/// A receiver grants a staging lease only together with pool memory reserved for the frame's
+/// copy-out (path 04, bounded receive credits); while it has none it answers
+/// SERVICE_UNAVAILABLE and the sender retries with a short backoff up to this budget. `0`
+/// disables waiting: the first refusal fails the query, which is the pre-credit outcome (an OOM
+/// while staging) with a clearer message. Sized against the engine watchdog: a receiver whose
+/// running fragments hold the pool for longer than this is treated as not converging.
+const INGRESS_WAIT_SECS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_INGRESS_WAIT_SECS",
+    default: 120,
+    min: 0,
+    max: 3600,
+};
+
 /// Bound on waiting for one posted nixl WRITE to reach DONE.
 ///
 /// This covers the RDMA/NVLink transfer alone, not any queueing behind a peer's engine thread,
@@ -356,6 +371,8 @@ pub struct Tunables {
     pub rpc_timeout: Duration,
     /// See [`XFER_TIMEOUT_SECS`].
     pub xfer_timeout: Duration,
+    /// See [`INGRESS_WAIT_SECS`]; zero means a refused credit fails the drain at once.
+    pub ingress_wait: Duration,
     /// See [`CANARY_BYTES`].
     pub canary_bytes: u64,
     /// See [`CANARY_FLOOR_GBPS`]; `0.0` means the check is disabled.
@@ -378,6 +395,7 @@ impl Tunables {
     const DEFAULTS: Self = Self {
         rpc_timeout: Duration::from_secs(RPC_TIMEOUT_SECS.default),
         xfer_timeout: Duration::from_secs(XFER_TIMEOUT_SECS.default),
+        ingress_wait: Duration::from_secs(INGRESS_WAIT_SECS.default),
         canary_bytes: CANARY_BYTES.default,
         canary_floor_gbps: CANARY_FLOOR_GBPS.default,
         warmup_timeout: Duration::from_secs(WARMUP_TIMEOUT_SECS.default),
@@ -397,6 +415,7 @@ impl Tunables {
         Ok(Self {
             rpc_timeout: Duration::from_secs(RPC_TIMEOUT_SECS.read()?),
             xfer_timeout: Duration::from_secs(XFER_TIMEOUT_SECS.read()?),
+            ingress_wait: Duration::from_secs(INGRESS_WAIT_SECS.read()?),
             canary_bytes: CANARY_BYTES.read()?,
             canary_floor_gbps: CANARY_FLOOR_GBPS.read()?,
             warmup_timeout: Duration::from_secs(WARMUP_TIMEOUT_SECS.read()?),
@@ -439,6 +458,7 @@ impl Tunables {
         tracing::info!(
             rpc_timeout_secs = published.rpc_timeout.as_secs(),
             xfer_timeout_secs = published.xfer_timeout.as_secs(),
+            ingress_wait_secs = published.ingress_wait.as_secs(),
             canary_bytes = published.canary_bytes,
             canary_floor_gbps = published.canary_floor_gbps,
             warmup_timeout_secs = published.warmup_timeout.as_secs(),

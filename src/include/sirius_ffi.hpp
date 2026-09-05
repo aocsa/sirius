@@ -213,6 +213,27 @@ class SIRIUS_FFI_EXPORT InboundStore {
   /// Bytes currently staged, summed over the batches' device buffers.
   std::uint64_t outstanding_bytes() const;
 
+  /// Receive credit: reserve pool memory for the copy of the frame that will land in the arena
+  /// lease at `offset` (`length` payload bytes), before the sender WRITEs it. `true` books the
+  /// credit; `stage()` for that offset then copies into the reservation instead of the bare pool,
+  /// and the bytes stay booked until the receiver takes the batch or it is dropped. `false` means
+  /// the ingress budget or the pool cannot take the frame right now: the caller returns the lease
+  /// and tells the sender to wait. Never blocks and allocates no device memory. With credits
+  /// disabled (`credit_budget() == 0`) every request is granted and nothing is booked, which is
+  /// the pre-credit behaviour: an unreserved copy that fails with OOM under pressure.
+  bool credit(std::uint64_t offset, std::uint64_t length) const;
+
+  /// Return a credit whose frame never staged (lease released early: canary, retired receiver,
+  /// failed transfer). Unknown offsets are ignored, so every lease release may call this.
+  void release_credit(std::uint64_t offset) const;
+
+  /// Bytes booked by credits: granted and not yet staged, plus staged and not yet taken.
+  std::uint64_t credited_bytes() const;
+
+  /// The ingress budget in bytes (`SIRIUS_INGRESS_BUDGET_BYTES`, default a quarter of the GPU
+  /// pool); 0 when credits are disabled.
+  std::uint64_t credit_budget() const;
+
  private:
   std::shared_ptr<State> state_;
   friend class Fragment;

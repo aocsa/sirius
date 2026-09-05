@@ -120,6 +120,15 @@ fn retry_backoff(attempt: u32) -> Duration {
     (MIN_BACKOFF * 2u32.pow(attempt.clamp(1, 4) - 1)).min(MAX_BACKOFF)
 }
 
+/// Delay before the `attempt`-th (1-based) retry of a lease request the receiver refused for
+/// want of a receive credit: 20 ms doubling to a 500 ms cap. Short, because a credit frees the
+/// moment a receiver takes a staged frame or a running fragment ends, and the sender's own lease
+/// (and the peer's arena) sit idle while it waits.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn credit_backoff(attempt: u32) -> Duration {
+    (Duration::from_millis(20) * 2u32.pow(attempt.clamp(1, 6) - 1)).min(Duration::from_millis(500))
+}
+
 /// Handle to the transport thread. Constructible only with the `nixl-transport` feature (via
 /// [`start`](Self::start)); without it the type still exists so the service seam — and its
 /// pure-Rust tests — compile everywhere.
@@ -859,12 +868,71 @@ mod agent_tier {
         pub(super) offset: u64,
     }
 
-    /// `request_staging_lease` over brpc.
+    /// One `request_staging_lease` reply, decoded.
+    enum LeaseReply {
+        Granted(RemoteLease),
+        /// SERVICE_UNAVAILABLE: the receiver has no receive credit for the frame right now.
+        Busy(String),
+    }
+
+    /// `request_staging_lease` over brpc, waiting for a receive credit.
+    ///
+    /// The receiver grants a lease only with pool memory reserved for the frame's copy-out
+    /// (path 04); when it has none it answers SERVICE_UNAVAILABLE and this loop retries with a
+    /// short backoff for up to `SIRIUS_CN_INGRESS_WAIT_SECS`, then fails the drain with the
+    /// receiver's last reason. Waiting here is what turns "OOM while staging a frame" into
+    /// backpressure: the sender's own lease stays outstanding meanwhile, so the wait is bounded
+    /// by the local arena as well.
     fn rpc_request_lease(client: &mut PrpcClient, length: u64) -> Result<RemoteLease, String> {
+        let wait_budget = Tunables::get().ingress_wait;
+        let started = Instant::now();
+        let mut attempt: u32 = 0;
+        let mut announced = false;
+        loop {
+            match rpc_request_lease_once(client, length)? {
+                LeaseReply::Granted(lease) => {
+                    if attempt > 0 {
+                        info!(
+                            length,
+                            attempts = attempt,
+                            waited_ms = started.elapsed().as_millis() as u64,
+                            "receive credit granted after waiting"
+                        );
+                    }
+                    return Ok(lease);
+                }
+                LeaseReply::Busy(why) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= wait_budget {
+                        return Err(format!(
+                            "request_staging_lease: the receiver refused a credit for a {length} \
+                             byte frame for {} s ({attempt} attempts; raise \
+                             SIRIUS_CN_INGRESS_WAIT_SECS or SIRIUS_INGRESS_BUDGET_BYTES on the \
+                             receiver): {why}",
+                            elapsed.as_secs()
+                        ));
+                    }
+                    attempt += 1;
+                    if !announced && elapsed >= Duration::from_secs(1) {
+                        info!(length, why = %why, "waiting for a receive credit from the peer");
+                        announced = true;
+                    }
+                    std::thread::sleep(credit_backoff(attempt).min(wait_budget - elapsed));
+                }
+            }
+        }
+    }
+
+    /// One lease round trip; transport and decode errors and every status other than OK or
+    /// SERVICE_UNAVAILABLE are hard errors.
+    fn rpc_request_lease_once(client: &mut PrpcClient, length: u64) -> Result<LeaseReply, String> {
         let body = PStagingLeaseRequest { length }.encode_to_vec();
         let response = client.call(methods::REQUEST_STAGING_LEASE, body, Vec::new())?;
         let result = PStagingLeaseResult::decode(response.body.as_slice())
             .map_err(|err| format!("undecodable request_staging_lease reply: {err}"))?;
+        if result.status.status_code == TStatusCode::SERVICE_UNAVAILABLE.0 {
+            return Ok(LeaseReply::Busy(result.status.error_msgs.join("; ")));
+        }
         check_status("request_staging_lease", &result.status)?;
         let remote_addr = result
             .remote_addr
@@ -873,10 +941,10 @@ mod agent_tier {
         let offset = result
             .offset
             .ok_or_else(|| "request_staging_lease reply carries no lease offset".to_string())?;
-        Ok(RemoteLease {
+        Ok(LeaseReply::Granted(RemoteLease {
             remote_addr,
             offset,
-        })
+        }))
     }
 
     /// `transmit_packed` over brpc; the pack metadata rides the attachment.
@@ -989,7 +1057,19 @@ mod agent_tier {
 mod tests {
     use std::time::Duration;
 
-    use super::{check_single_visible_device, retry_backoff};
+    use super::{check_single_visible_device, credit_backoff, retry_backoff};
+
+    /// The credit wait starts short and caps well under a second: a credit frees the moment a
+    /// receiver takes a frame, and the sender's own lease sits idle while it waits.
+    #[test]
+    fn credit_backoff_starts_at_20ms_and_caps_at_500ms() {
+        assert_eq!(credit_backoff(0), Duration::from_millis(20));
+        assert_eq!(credit_backoff(1), Duration::from_millis(20));
+        assert_eq!(credit_backoff(2), Duration::from_millis(40));
+        assert_eq!(credit_backoff(5), Duration::from_millis(320));
+        assert_eq!(credit_backoff(6), Duration::from_millis(500));
+        assert_eq!(credit_backoff(40), Duration::from_millis(500));
+    }
 
     #[test]
     fn unset_cuda_visible_devices_is_accepted() {

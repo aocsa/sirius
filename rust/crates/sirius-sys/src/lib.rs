@@ -142,6 +142,21 @@ mod ffi {
         /// Bytes currently staged.
         fn outstanding_bytes(self: &InboundStore) -> Result<u64>;
 
+        /// Book a receive credit for the frame that will land at arena
+        /// `offset` (`length` bytes): pool memory reserved for its copy.
+        /// `false` = the ingress budget or the pool is full right now.
+        fn credit(self: &InboundStore, offset: u64, length: u64) -> Result<bool>;
+
+        /// Return a credit whose frame never staged. Unknown offsets are
+        /// ignored.
+        fn release_credit(self: &InboundStore, offset: u64) -> Result<()>;
+
+        /// Bytes booked by credits (granted or staged and not yet taken).
+        fn credited_bytes(self: &InboundStore) -> Result<u64>;
+
+        /// The ingress budget; 0 when credits are disabled.
+        fn credit_budget(self: &InboundStore) -> Result<u64>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches that outlive its own query) or none (a result fragment, which

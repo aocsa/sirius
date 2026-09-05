@@ -578,6 +578,31 @@ impl InboundStore {
     pub fn outstanding_bytes(&self) -> Result<u64, Exception> {
         self.inner.outstanding_bytes()
     }
+
+    /// Book a receive credit for the frame a sender is about to WRITE into the arena lease at
+    /// `offset`: `length` bytes of pool memory reserved for its copy-out. `Ok(false)` means the
+    /// ingress budget or the pool cannot take it right now, and the caller should return the
+    /// lease and ask the sender to wait. Never blocks. With credits disabled (budget 0) every
+    /// request is granted and nothing is booked.
+    pub fn credit(&self, offset: u64, length: u64) -> Result<bool, Exception> {
+        self.inner.credit(offset, length)
+    }
+
+    /// Return a credit whose frame never staged (lease released early). Unknown offsets are
+    /// ignored, so every lease release may call this.
+    pub fn release_credit(&self, offset: u64) -> Result<(), Exception> {
+        self.inner.release_credit(offset)
+    }
+
+    /// Bytes booked by credits: granted and not yet staged, plus staged and not yet taken.
+    pub fn credited_bytes(&self) -> Result<u64, Exception> {
+        self.inner.credited_bytes()
+    }
+
+    /// The ingress budget in bytes; 0 when credits are disabled.
+    pub fn credit_budget(&self) -> Result<u64, Exception> {
+        self.inner.credit_budget()
+    }
 }
 
 impl std::fmt::Debug for InboundStore {
@@ -1375,6 +1400,96 @@ mod tests {
         // Keep the arena out of the other tests' context bring-ups.
         // SAFETY: the GPU lock is still held.
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// Receive credits (path 04): a credit books pool memory for a frame's copy-out before the
+    /// sender WRITEs it; the budget bounds what inbound frames may hold at once. A frame larger
+    /// than the budget is refused outright (it could never fit), one that does not fit right now
+    /// is refused softly, a released credit returns its bytes, a staged frame carries its credit
+    /// until it is taken or dropped, and disabling the budget grants everything without booking.
+    /// Requires a GPU.
+    #[test]
+    fn inbound_store_credits_are_bounded_by_the_ingress_budget() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe {
+            std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB");
+            std::env::set_var("SIRIUS_INGRESS_BUDGET_BYTES", "1MiB");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let outcome = std::panic::catch_unwind(|| {
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            let arena = ctx.staging_arena().expect("arena configured");
+            let store = ctx.inbound_store().expect("inbound store follows the arena");
+            assert_eq!(store.credit_budget().unwrap(), 1 << 20);
+            assert_eq!(store.credited_bytes().unwrap(), 0);
+
+            // A frame that can never fit is a hard error, not a wait.
+            let err = store.credit(0, 2 << 20).unwrap_err();
+            assert!(err.to_string().contains("never fit"), "{err}");
+            // Two frames within the budget book; the third does not fit right now.
+            assert!(store.credit(0, 512 << 10).unwrap());
+            assert!(store.credit(4096, 256 << 10).unwrap());
+            assert_eq!(store.credited_bytes().unwrap(), (512 << 10) + (256 << 10));
+            assert!(!store.credit(8192, 512 << 10).unwrap());
+            // Returning a credit frees its bytes; an unknown offset is a no-op.
+            store.release_credit(0).unwrap();
+            store.release_credit(0xdead).unwrap();
+            assert_eq!(store.credited_bytes().unwrap(), 256 << 10);
+            store.release_credit(4096).unwrap();
+            assert_eq!(store.credited_bytes().unwrap(), 0);
+
+            // A real frame: credit at its lease offset, stage into the reservation, the credit
+            // rides with the ticket until the batch is dropped (or taken by a receiver).
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.build(&sender_plan).unwrap();
+            sender.run().unwrap();
+            let batch = sender
+                .export_packed(0)
+                .unwrap()
+                .expect("the users table exports one batch");
+            assert!(batch.len > 0 && batch.len < (1 << 20));
+            assert!(store.credit(batch.offset, batch.len).unwrap());
+            let ticket = store.stage(&batch).unwrap();
+            arena.release(batch.offset).unwrap();
+            assert_eq!(store.credited_bytes().unwrap(), batch.len, "staged bytes stay booked");
+            // The offset map no longer holds it: a release for that offset changes nothing.
+            store.release_credit(batch.offset).unwrap();
+            assert_eq!(store.credited_bytes().unwrap(), batch.len);
+            store.drop(ticket).unwrap();
+            assert_eq!(store.credited_bytes().unwrap(), 0);
+            assert_eq!(store.outstanding().unwrap(), 0);
+            while sender.export_packed(0).unwrap().is_some() {}
+        });
+        // SAFETY: still under the GPU lock; other tests expect the default budget.
+        unsafe { std::env::remove_var("SIRIUS_INGRESS_BUDGET_BYTES") };
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+
+        // Budget 0 disables credits: everything is granted, nothing booked.
+        unsafe { std::env::set_var("SIRIUS_INGRESS_BUDGET_BYTES", "0") };
+        let outcome = std::panic::catch_unwind(|| {
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            let store = ctx.inbound_store().expect("inbound store follows the arena");
+            assert_eq!(store.credit_budget().unwrap(), 0);
+            assert!(store.credit(0, 8 << 30).unwrap());
+            assert_eq!(store.credited_bytes().unwrap(), 0);
+        });
+        unsafe { std::env::remove_var("SIRIUS_INGRESS_BUDGET_BYTES") };
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// Copy-out-on-arrival through the inbound store: frames exported into the arena are staged

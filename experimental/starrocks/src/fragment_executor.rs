@@ -203,6 +203,27 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
             .to_string())
     }
 
+    /// Books a receive credit for the frame a peer is about to WRITE into the lease at `offset`:
+    /// pool memory reserved for its copy-out (path 04, bounded receive credits). `Ok(false)` is
+    /// "not now": the caller returns the lease and the peer waits. An executor without an inbound
+    /// store has nothing to book and grants.
+    fn ingress_credit(&self, offset: u64, len: u64) -> Result<bool, String> {
+        let _ = (offset, len);
+        Ok(true)
+    }
+
+    /// Returns a credit whose frame never staged (the lease at `offset` was released early).
+    /// Unknown offsets are ignored.
+    fn ingress_release_credit(&self, offset: u64) -> Result<(), String> {
+        let _ = offset;
+        Ok(())
+    }
+
+    /// `(credited bytes, budget bytes)` for a refusal message; `None` without credits.
+    fn ingress_credit_status(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Drops the parked fragment under `slot`, releasing the GPU memory its batches hold. Called
     /// after the drained output has been transmitted (or on a failed transmit, so a wedged
     /// cross-node query does not pin its output for the process lifetime).

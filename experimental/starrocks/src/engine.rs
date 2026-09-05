@@ -763,7 +763,16 @@ impl FragmentExecutor for SiriusEngine {
     fn staging_release(&self, offset: u64) -> Result<(), String> {
         self.staging_arena()?
             .release(offset)
-            .map_err(|err| format!("staging release of offset {offset} failed: {err}"))
+            .map_err(|err| format!("staging release of offset {offset} failed: {err}"))?;
+        // A lease released without a stage (canary, retired receiver, failed transfer) hands its
+        // receive credit back too; a staged frame's credit already moved to its ticket, so this
+        // finds nothing and is a no-op.
+        if let Some(store) = self.inbound.as_ref()
+            && let Err(err) = store.release_credit(offset)
+        {
+            warn!(offset, error = %err, "failed to release the receive credit of a lease");
+        }
+        Ok(())
     }
 
     fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
@@ -802,6 +811,29 @@ impl FragmentExecutor for SiriusEngine {
         store
             .drop(ticket)
             .map_err(|err| format!("failed to drop staged inbound batch {ticket}: {err}"))
+    }
+
+    fn ingress_credit(&self, offset: u64, len: u64) -> Result<bool, String> {
+        match self.inbound.as_ref() {
+            Some(store) => store
+                .credit(offset, len)
+                .map_err(|err| format!("receive credit for {len} bytes at offset {offset}: {err}")),
+            None => Ok(true),
+        }
+    }
+
+    fn ingress_release_credit(&self, offset: u64) -> Result<(), String> {
+        match self.inbound.as_ref() {
+            Some(store) => store
+                .release_credit(offset)
+                .map_err(|err| format!("release of the receive credit at offset {offset}: {err}")),
+            None => Ok(()),
+        }
+    }
+
+    fn ingress_credit_status(&self) -> Option<(u64, u64)> {
+        let store = self.inbound.as_ref()?;
+        Some((store.credited_bytes().ok()?, store.credit_budget().ok()?))
     }
 
     fn retire_query(

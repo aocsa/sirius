@@ -23,6 +23,8 @@ knob listed under "Dispatch").
 |---|---|
 | `SIRIUS_CN_RPC_TIMEOUT_SECS` | How long a CN waits for a peer RPC (lease, metadata). Raise this before treating a large-SF timeout as a query bug, since a busy peer can sit behind this bound. |
 | `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS` | How long one nixl WRITE may take. Distinguishes a stuck fabric from a busy peer. |
+| `SIRIUS_CN_INGRESS_WAIT_SECS` | How long a sender waits for a peer's receive credit (SERVICE_UNAVAILABLE on `request_staging_lease`) before failing the drain; default 120 s, `0` = fail on the first refusal. See *Receive credits* above. |
+| `SIRIUS_INGRESS_BUDGET_BYTES` (engine) | Ingress budget the receiver books credits against; default a quarter of the GPU pool, `0` disables credits (pre-credit behaviour: unreserved copies that OOM under pressure). |
 | `SIRIUS_CN_NIXL_CANARY_BYTES` / `_FLOOR_GBPS` | First-contact bandwidth probe. A slow link is refused so a silent staged-copy fallback cannot look like a healthy transfer. `0` on the floor disables the check. |
 | `SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS` / `_EXPECT_PEERS` | Bring-up session warmup. The timeout is a budget, not a hard fail; expect-peers ends the loop early once that many peers are up. |
 | `SIRIUS_CN_NIXL_WARMUP` | Warmup kill switch, `on` by default. `off` returns to lazy sessions: the first cross-node query after bring-up pays first contact, and on a cold cluster that is the first-contact deadlock the warmup exists to prevent. |
@@ -46,6 +48,21 @@ cancelled query) is dropped from the store when the CN releases the receiver's
 inputs: when the rendezvous refuses the frame, when the receiver is retired,
 or in the engine's sweep after a failed run. A replayed frame (brpc
 reconnect-retry) is recognised by sequence number before its lease is touched.
+
+**Receive credits (path 04 of the performance plans).** A lease is granted only together with
+pool memory reserved for the frame's copy-out: the receiver books a *credit* against an ingress
+budget (`SIRIUS_INGRESS_BUDGET_BYTES`, engine-side, default a quarter of the GPU pool; `0`
+disables credits) and against the pool's own admission (`make_reservation_or_null`). While it
+cannot, it answers the peer's `request_staging_lease` with SERVICE_UNAVAILABLE and the sender
+retries with a 20-500 ms backoff for up to `SIRIUS_CN_INGRESS_WAIT_SECS`, then fails the drain
+naming the receiver's reason. Before credits the copy was an unreserved allocation made on the
+RPC thread, and a receiver whose running fragments held the pool failed the query with
+`failed to stage a ... byte inbound frame: out_of_memory` (q05/q18 at 2 CNs, 84 GiB pool).
+A staged frame keeps its credit until the receiver takes it or it is dropped; a lease released
+without a stage (canary, retired receiver, failed transfer) returns its credit. The budget is
+a bound on inbound bytes held at once, not a guarantee of progress: a receiver whose whole
+input exceeds the budget still needs spill (path 03) to converge, and hits the wait timeout
+instead of an OOM until then.
 
 ## Dispatch
 

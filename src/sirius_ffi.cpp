@@ -49,6 +49,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
 #include "planner/substrait_scan_ranges.hpp"           // sirius::planner::scan_byte_ranges_state
 #include "sirius_config.hpp"                           // sirius::sirius_config
+#include "yaml_reader.hpp"                             // sirius::parse_bytes (ingress budget)
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
@@ -154,13 +155,37 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substr
 // PIMPL: holds the engine + embedded DuckDB using DuckDB's own smart pointers
 /// The store proper. `gpu_space` is owned by the context's memory manager; `close()` nulls it
 /// when the context tears down so a straggling handle throws instead of dereferencing it.
+/// The ingress budget: `SIRIUS_INGRESS_BUDGET_BYTES` when set (`0` disables credits), else a
+/// quarter of the GPU pool. Credits bound the pool bytes inbound frames may hold at once, so a
+/// shuffle whose frames arrive faster than its receiver can start cannot starve the fragments
+/// already running; the sender waits for a credit instead (path 04 of the performance plans).
+static std::uint64_t ingress_budget_from_env(cucascade::memory::memory_space const& gpu_space)
+{
+  if (const char* env = std::getenv("SIRIUS_INGRESS_BUDGET_BYTES"); env != nullptr && *env != '\0') {
+    return sirius::yaml::parse_bytes(env);
+  }
+  return gpu_space.get_max_memory() / 4;
+}
+
 struct InboundStore::State {
+  /// A booked credit: the reservation the frame's copy is charged to, and its size.
+  struct Credit {
+    std::unique_ptr<cucascade::memory::reservation> reservation;
+    std::uint64_t bytes{0};
+  };
+
   State(std::shared_ptr<sirius::exec::exchange_staging_arena> arena_in,
         cucascade::memory::memory_space* gpu_space_in)
     : arena(std::move(arena_in)),
       gpu_space(gpu_space_in),
-      stream(rmm::cuda_stream::flags::non_blocking)
+      stream(rmm::cuda_stream::flags::non_blocking),
+      budget(ingress_budget_from_env(*gpu_space_in))
   {
+    if (budget > 0) {
+      SIRIUS_LOG_INFO("inbound store: receive credits enabled, ingress budget {} bytes", budget);
+    } else {
+      SIRIUS_LOG_INFO("inbound store: receive credits disabled (SIRIUS_INGRESS_BUDGET_BYTES=0)");
+    }
   }
 
   std::shared_ptr<sirius::exec::exchange_staging_arena> arena;
@@ -172,6 +197,12 @@ struct InboundStore::State {
   std::uint64_t next_ticket{1};
   std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::data_batch>> staged;
   std::unordered_map<std::uint64_t, std::uint64_t> staged_bytes;
+  // Receive credits (path 04): `budget` bounds `credited`; a credit is keyed by its lease offset
+  // until the frame stages, then travels with the ticket until the receiver takes the batch.
+  std::uint64_t budget{0};
+  std::uint64_t credited{0};
+  std::unordered_map<std::uint64_t, Credit> credits;             // lease offset -> credit
+  std::unordered_map<std::uint64_t, Credit> staged_credits;      // ticket -> credit
 
   void close()
   {
@@ -181,9 +212,25 @@ struct InboundStore::State {
                       staged.size(),
                       total_bytes_locked());
     }
+    if (!credits.empty()) {
+      SIRIUS_LOG_WARN("inbound store: {} unstaged receive credit(s) dropped at context teardown",
+                      credits.size());
+    }
     staged.clear();
     staged_bytes.clear();
+    staged_credits.clear();
+    credits.clear();
+    credited = 0;
     gpu_space = nullptr;
+  }
+
+  /// Drops the credit booked under `ticket` (if any) and returns its bytes to the budget.
+  void release_staged_credit_locked(std::uint64_t ticket)
+  {
+    if (auto it = staged_credits.find(ticket); it != staged_credits.end()) {
+      credited -= std::min(credited, it->second.bytes);
+      staged_credits.erase(it);
+    }
   }
 
   std::uint64_t total_bytes_locked() const
@@ -206,6 +253,9 @@ struct InboundStore::State {
     auto batch = std::move(it->second);
     staged.erase(it);
     staged_bytes.erase(ticket);
+    // The batch now belongs to its receiver (or is being dropped): its bytes leave the ingress
+    // budget, the way a pipeline task's reservation ends while its output lives on.
+    release_staged_credit_locked(ticket);
     return batch;
   }
 };
@@ -433,11 +483,17 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
       capacity);
   }
   // The memory space pointer is read under the lock, the copy runs outside it: the copy is the
-  // expensive part and the other threads' stage/drop must not wait behind it.
+  // expensive part and the other threads' stage/drop must not wait behind it. The frame's credit
+  // (if the sender was granted one) leaves the offset map here and rides with the ticket below.
   cucascade::memory::memory_space* gpu_space = nullptr;
+  State::Credit credit;
   {
     std::lock_guard<std::mutex> lock(st.mutex);
     gpu_space = st.gpu_space;
+    if (auto it = st.credits.find(offset); it != st.credits.end()) {
+      credit = std::move(it->second);
+      st.credits.erase(it);
+    }
   }
   if (gpu_space == nullptr) {
     throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
@@ -448,7 +504,20 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
   // Allocates no device memory: the view aliases the lease until the deep copy below.
   auto unpacked = cudf::unpack(metadata, payload);
   auto stream   = st.stream.view();
-  auto table = std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
+  // A credited frame is copied into its reservation, so the pool's admission already counted
+  // it; an uncredited one takes the bare pool allocator (legacy senders, credits disabled).
+  std::unique_ptr<cudf::table> table;
+  try {
+    table = credit.reservation != nullptr
+              ? std::make_unique<cudf::table>(unpacked, stream, credit.reservation->get_memory_resource())
+              : std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
+  } catch (...) {
+    if (credit.reservation != nullptr) {
+      std::lock_guard<std::mutex> lock(st.mutex);
+      st.credited -= std::min(st.credited, credit.bytes);
+    }
+    throw;
+  }
   // The lease is reusable the moment this returns, so the copy must be complete, not queued.
   stream.synchronize();
   // The packed payload is the table's device bytes to within pack padding; good enough for
@@ -461,12 +530,79 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
 
   std::lock_guard<std::mutex> lock(st.mutex);
   if (st.gpu_space == nullptr) {
+    if (credit.reservation != nullptr) { st.credited -= std::min(st.credited, credit.bytes); }
     throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
   }
   auto const ticket = st.next_ticket++;
   st.staged.emplace(ticket, std::move(data_batch));
   st.staged_bytes.emplace(ticket, bytes);
+  if (credit.reservation != nullptr) { st.staged_credits.emplace(ticket, std::move(credit)); }
   return ticket;
+}
+
+bool InboundStore::credit(std::uint64_t offset, std::uint64_t length) const
+{
+  auto& st = *state_;
+  cucascade::memory::memory_space* gpu_space = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (st.gpu_space == nullptr) {
+      throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
+    }
+    if (st.budget == 0) { return true; }  // credits disabled: grant, book nothing
+    if (length > st.budget) {
+      throw sirius::invalid_input_exception(
+        "InboundStore: a {} byte frame can never fit the {} byte ingress budget "
+        "(raise SIRIUS_INGRESS_BUDGET_BYTES or lower the sender's batch size)",
+        length,
+        st.budget);
+    }
+    if (st.credited + length > st.budget) { return false; }
+    if (auto stale = st.credits.find(offset); stale != st.credits.end()) {
+      // The arena reused an offset whose credit was never staged or released: a leak upstream,
+      // repaired here so the accounting cannot drift.
+      SIRIUS_LOG_WARN("inbound store: replacing an unreleased credit at lease offset {}", offset);
+      st.credited -= std::min(st.credited, stale->second.bytes);
+      st.credits.erase(stale);
+    }
+    gpu_space = st.gpu_space;
+  }
+  // The pool's own admission decides whether the copy can land at all. Taken outside the store
+  // lock: the reservation manager has its own, and a refusal here is the common case under
+  // pressure. The deep copy needs the payload plus per-column padding, hence the slack.
+  auto const reserve_bytes = length + length / 16 + (std::uint64_t{4} << 20);
+  auto reservation         = gpu_space->make_reservation_or_null(reserve_bytes);
+  if (reservation == nullptr || reservation->size() < static_cast<std::size_t>(reserve_bytes)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(st.mutex);
+  if (st.gpu_space == nullptr) { return false; }
+  if (st.credited + length > st.budget) { return false; }  // lost a race to another frame
+  st.credited += length;
+  st.credits.emplace(offset, State::Credit{std::move(reservation), length});
+  return true;
+}
+
+void InboundStore::release_credit(std::uint64_t offset) const
+{
+  auto& st = *state_;
+  std::lock_guard<std::mutex> lock(st.mutex);
+  if (auto it = st.credits.find(offset); it != st.credits.end()) {
+    st.credited -= std::min(st.credited, it->second.bytes);
+    st.credits.erase(it);
+  }
+}
+
+std::uint64_t InboundStore::credited_bytes() const
+{
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->credited;
+}
+
+std::uint64_t InboundStore::credit_budget() const
+{
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->budget;
 }
 
 void InboundStore::drop(std::uint64_t ticket) const { (void)state_->take(ticket); }

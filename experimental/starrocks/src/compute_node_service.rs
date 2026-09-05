@@ -639,7 +639,14 @@ impl PInternalService for SiriusComputeNodeService {
                 remote_addr: Some(remote_addr),
                 offset: Some(offset),
             },
-            Ok(Err(err)) => PStagingLeaseResult {
+            // SERVICE_UNAVAILABLE is the peer's cue to wait and retry (nixl_transport's lease
+            // loop); every other failure fails its query.
+            Ok(Err(LeaseRefusal::Busy(why))) => PStagingLeaseResult {
+                status: Self::busy_status(why),
+                remote_addr: None,
+                offset: None,
+            },
+            Ok(Err(LeaseRefusal::Failed(err))) => PStagingLeaseResult {
                 status: Self::internal_error(err),
                 remote_addr: None,
                 offset: None,
@@ -1757,10 +1764,44 @@ impl ServiceCore {
     }
 
     /// Leases `length` bytes of the staging arena and returns `(absolute address, offset)`.
-    fn handle_staging_lease(&self, length: u64) -> std::result::Result<(u64, u64), String> {
-        let (base, _capacity) = self.staging_info()?;
-        let offset = self.executor.staging_lease(length)?;
-        Ok((base + offset, offset))
+    ///
+    /// The lease is granted only together with a receive credit: pool memory reserved for the
+    /// frame's copy-out on arrival (path 04). Without the credit the copy was an unreserved
+    /// allocation made on the RPC thread that failed with OOM whenever the fragments already
+    /// running had the pool (q05/q18 at 2 CNs, 2026-09-05); with it, the peer is told to wait
+    /// and retries, so the shuffle progresses once the pool has room instead of failing the
+    /// query.
+    fn handle_staging_lease(&self, length: u64) -> std::result::Result<(u64, u64), LeaseRefusal> {
+        let (base, _capacity) = self.staging_info().map_err(LeaseRefusal::Failed)?;
+        let offset = self
+            .executor
+            .staging_lease(length)
+            .map_err(LeaseRefusal::Failed)?;
+        match self.executor.ingress_credit(offset, length) {
+            Ok(true) => Ok((base + offset, offset)),
+            Ok(false) => {
+                // The arena block goes back at once: the peer holds no address yet.
+                if let Err(err) = self.executor.staging_release(offset) {
+                    return Err(LeaseRefusal::Failed(format!(
+                        "failed to return a lease refused for want of a receive credit: {err}"
+                    )));
+                }
+                let status = self
+                    .executor
+                    .ingress_credit_status()
+                    .map(|(credited, budget)| format!(" (credited {credited} of {budget} bytes)"))
+                    .unwrap_or_default();
+                Err(LeaseRefusal::Busy(format!(
+                    "no receive credit for a {length} byte frame right now{status}"
+                )))
+            }
+            Err(err) => {
+                if let Err(release_err) = self.executor.staging_release(offset) {
+                    tracing::warn!(offset, error = %release_err, "failed to return a lease after a credit error");
+                }
+                Err(LeaseRefusal::Failed(err))
+            }
+        }
     }
 
     /// Staging arena `(base, capacity)`, cached after the first successful engine round-trip.
@@ -2355,6 +2396,24 @@ impl SiriusComputeNodeService {
             error_msgs: vec![message.into()],
         }
     }
+
+    /// StarRocks SERVICE_UNAVAILABLE status: a request the peer should retry shortly (a lease
+    /// refused for want of a receive credit), never a query failure.
+    fn busy_status(message: impl Into<String>) -> StatusPb {
+        StatusPb {
+            status_code: TStatusCode::SERVICE_UNAVAILABLE.0,
+            error_msgs: vec![message.into()],
+        }
+    }
+}
+
+/// Why a staging lease was not granted.
+#[derive(Debug)]
+enum LeaseRefusal {
+    /// Not now: no receive credit for the frame; the peer waits and retries.
+    Busy(String),
+    /// A real failure (no arena, arena exhausted, engine error): the peer fails its query.
+    Failed(String),
 }
 
 /// `pub(crate)` so the engine-linked test in `engine.rs` can borrow
@@ -3929,6 +3988,78 @@ pub(crate) mod tests {
             "{:?}",
             result.status.error_msgs
         );
+    }
+
+    /// An arena whose receive credits can be switched off: leases are handed out from a counter,
+    /// every release is recorded, and `ingress_credit` answers with `grant`.
+    #[derive(Debug, Default)]
+    struct CreditGateExecutor {
+        grant: std::sync::atomic::AtomicBool,
+        next_offset: std::sync::atomic::AtomicU64,
+        released: Mutex<Vec<u64>>,
+    }
+
+    impl FragmentExecutor for CreditGateExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            StubExecutor.run(run)
+        }
+        fn staging_info(&self) -> Result<(u64, u64), String> {
+            Ok((0x1000, 1 << 30))
+        }
+        fn staging_lease(&self, len: u64) -> Result<u64, String> {
+            Ok(self.next_offset.fetch_add(len, Ordering::SeqCst))
+        }
+        fn staging_release(&self, offset: u64) -> Result<(), String> {
+            self.released.lock().unwrap().push(offset);
+            Ok(())
+        }
+        fn ingress_credit(&self, _offset: u64, _len: u64) -> Result<bool, String> {
+            Ok(self.grant.load(Ordering::SeqCst))
+        }
+        fn ingress_credit_status(&self) -> Option<(u64, u64)> {
+            Some((5, 10))
+        }
+    }
+
+    /// A lease is granted only with a receive credit (path 04). Without one the peer gets
+    /// SERVICE_UNAVAILABLE -- its cue to wait and retry, never a query failure -- and the arena
+    /// block it would have held goes straight back; with one the lease is granted as before.
+    #[test]
+    fn staging_lease_without_a_receive_credit_is_busy_and_returns_the_block() {
+        let executor = Arc::new(CreditGateExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let response = route(
+            &service,
+            methods::REQUEST_STAGING_LEASE,
+            PStagingLeaseRequest { length: 4096 }.encode_to_vec(),
+            Vec::new(),
+        );
+        let result = PStagingLeaseResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::SERVICE_UNAVAILABLE.0);
+        assert!(result.remote_addr.is_none() && result.offset.is_none());
+        let message = result.status.error_msgs.join(" ");
+        assert!(
+            message.contains("receive credit") && message.contains("credited 5 of 10"),
+            "{message}"
+        );
+        assert_eq!(
+            *executor.released.lock().unwrap(),
+            vec![0],
+            "the refused lease's block is returned at once"
+        );
+
+        executor.grant.store(true, Ordering::SeqCst);
+        let response = route(
+            &service,
+            methods::REQUEST_STAGING_LEASE,
+            PStagingLeaseRequest { length: 4096 }.encode_to_vec(),
+            Vec::new(),
+        );
+        let result = PStagingLeaseResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::OK.0);
+        assert_eq!(result.offset, Some(4096), "the next block, the refused one was reused");
+        assert_eq!(result.remote_addr, Some(0x1000 + 4096));
+        assert_eq!(executor.released.lock().unwrap().len(), 1, "a granted lease stays out");
     }
 
     #[test]
