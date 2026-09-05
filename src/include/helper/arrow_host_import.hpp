@@ -130,9 +130,12 @@ struct arrow_import_footprint {
 /**
  * @brief Estimate the device footprint of importing `array` at the declared `types`.
  *
- * Runs the same structural checks as `import_arrow_host_table` (null or released structs, a
- * non-struct top level, a column-count mismatch, a struct window past a child) and throws the same
- * errors; it reads only the schema, the array lengths and the string offsets, never the data.
+ * Runs the same checks as `import_arrow_host_table`, in the same order, before it sizes anything:
+ * the structural ones (null or released structs, a non-struct top level, a column-count mismatch,
+ * a struct window past a child) and the per-column ones (the by-name refusals, the format string
+ * against the declared type), and throws the same errors. It reads only the schema, the array
+ * lengths and, for a `utf8` child, the string offsets, never the data; a column declared VARCHAR
+ * whose format is not `utf8` is refused rather than read as offsets it does not carry.
  */
 arrow_import_footprint estimate_arrow_import_footprint(const ArrowSchema* schema,
                                                        const ArrowArray* array,

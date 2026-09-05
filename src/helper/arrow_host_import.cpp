@@ -286,6 +286,30 @@ void validate_struct_batch(const ArrowSchema* schema,
   }
 }
 
+// The per-column checks both entry points run after validate_struct_batch and before any
+// buffer is read: the by-name refusals, then the type the format string implies against
+// `get_cudf_type(declared)` for the scalar formats. Returns the declared cudf type of every
+// column. A format the table does not know passes here and is checked on the imported column.
+std::vector<cudf::data_type> check_declared_columns(const ArrowSchema& schema,
+                                                    std::string_view what,
+                                                    const std::vector<std::string>& names,
+                                                    const std::vector<logical_type>& types)
+{
+  std::vector<cudf::data_type> expected;
+  expected.reserve(types.size());
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    const auto& child = *schema.children[i];
+    refuse_unsupported_shape(what, i, names[i], child, types[i]);
+    expected.push_back(get_cudf_type(types[i]));
+    // A plain type mismatch, refused from the format string before any buffer is copied.
+    const auto carried = cudf_type_of_format(format_of(child));
+    if (carried && *carried != expected[i] && !differs_in_width_only(*carried, expected[i])) {
+      throw_type_mismatch(what, i, names[i], types[i], expected[i], *carried);
+    }
+  }
+  return expected;
+}
+
 // Allocator granularity: every device buffer the import makes is rounded up to this.
 std::size_t aligned_bytes(std::size_t bytes)
 {
@@ -295,7 +319,9 @@ std::size_t aligned_bytes(std::size_t bytes)
 std::size_t saturating_add(std::size_t a, std::size_t b) { return memory::saturating_add(a, b); }
 
 // Device bytes of one imported column at `declared`, from the windowed host child.
-std::size_t resident_bytes_of(const ArrowArray& child, cudf::data_type declared)
+std::size_t resident_bytes_of(const ArrowSchema& child_schema,
+                              const ArrowArray& child,
+                              cudf::data_type declared)
 {
   const auto rows   = static_cast<std::size_t>(child.length);
   std::size_t bytes = 0;
@@ -308,8 +334,12 @@ std::size_t resident_bytes_of(const ArrowArray& child, cudf::data_type declared)
   }
   if (declared.id() == cudf::type_id::STRING) {
     // 32-bit offsets (rows + 1) plus the characters of the window, read off the host offsets.
+    // Only a `utf8` child carries them: the format pre-check has refused every other scalar
+    // format by now, and a format it does not know (binary, a nested type) is left to the
+    // import's backstop rather than read as offsets it does not have.
     bytes = saturating_add(bytes, aligned_bytes((rows + 1) * sizeof(std::int32_t)));
-    if (rows > 0 && child.n_buffers > 1 && child.buffers[1] != nullptr) {
+    if (format_of(child_schema) == "u" && rows > 0 && child.n_buffers > 1 &&
+        child.buffers != nullptr && child.buffers[1] != nullptr) {
       const auto* offsets = static_cast<const std::int32_t*>(child.buffers[1]);
       const auto begin    = offsets[child.offset];
       const auto end      = offsets[child.offset + child.length];
@@ -377,20 +407,7 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
                                                      rmm::device_async_resource_ref mr)
 {
   validate_struct_batch(schema, array, what, names, types);
-
-  std::vector<cudf::data_type> expected;
-  expected.reserve(types.size());
-  for (std::size_t i = 0; i < types.size(); ++i) {
-    const auto& child = *schema->children[i];
-    refuse_unsupported_shape(what, i, names[i], child, types[i]);
-    expected.push_back(get_cudf_type(types[i]));
-    // A plain type mismatch, refused from the format string before any buffer is copied. Formats
-    // the table does not know fall through to the check on the imported column.
-    const auto carried = cudf_type_of_format(format_of(child));
-    if (carried && *carried != expected[i] && !differs_in_width_only(*carried, expected[i])) {
-      throw_type_mismatch(what, i, names[i], types[i], expected[i], *carried);
-    }
-  }
+  const auto expected = check_declared_columns(*schema, what, names, types);
   validate_struct_window(*array, what, names);
 
   // Host -> device copy, one column at a time; cudf owns the result, the input is not released.
@@ -437,18 +454,20 @@ arrow_import_footprint estimate_arrow_import_footprint(const ArrowSchema* schema
                                                        const std::vector<logical_type>& types)
 {
   validate_struct_batch(schema, array, what, names, types);
+  // The same refusals, in the same order, as the import: the sizing below reads a utf8 child's
+  // offsets at 4 bytes a row, which a column that only claims to be VARCHAR (a bool bitmap, an
+  // int8 buffer) does not have. Such a column is refused here, before the estimate touches it.
+  const auto expected = check_declared_columns(*schema, what, names, types);
   validate_struct_window(*array, what, names);
 
   arrow_import_footprint footprint;
   for (std::size_t i = 0; i < types.size(); ++i) {
-    // HUGEINT is refused by the import before any copy; it has no cudf carrier to size here.
-    if (types[i].id() == type_id::HUGEINT || types[i].id() == type_id::UHUGEINT) { continue; }
-    const auto declared     = get_cudf_type(types[i]);
-    const ArrowArray window = windowed_child(*array, i);
-    footprint.resident_bytes =
-      saturating_add(footprint.resident_bytes, resident_bytes_of(window, declared));
-    footprint.transient_bytes = std::max(
-      footprint.transient_bytes, transient_bytes_of(*schema->children[i], window, declared));
+    const auto& child_schema = *schema->children[i];
+    const ArrowArray window  = windowed_child(*array, i);
+    footprint.resident_bytes = saturating_add(footprint.resident_bytes,
+                                              resident_bytes_of(child_schema, window, expected[i]));
+    footprint.transient_bytes =
+      std::max(footprint.transient_bytes, transient_bytes_of(child_schema, window, expected[i]));
   }
   return footprint;
 }

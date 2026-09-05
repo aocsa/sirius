@@ -170,9 +170,10 @@ class SIRIUS_FFI_EXPORT StagingArena {
 ///
 /// Contract: `push_arrow` and `close_input` are legal from any thread, concurrently with each
 /// other, from the moment `Fragment::build()` returned until `Fragment::join()` (or `run()`)
-/// returned — including while `run()`/`join()` blocks on another thread. After that, and after the
-/// `Fragment` is destroyed, both throw ("the fragment has finished") instead of touching freed
-/// state: the fragment detaches the handle under a lock that waits for in-flight pushes, so a push
+/// returned — including while `run()`/`join()` blocks on another thread. After that, after a
+/// `start()` that threw, and after the `Fragment` is destroyed, both throw ("the fragment has
+/// finished") instead of touching freed state: the fragment detaches the handle under a lock that
+/// waits for in-flight pushes, so a push
 /// racing the fragment's teardown completes or is refused, never faults. Every other `Fragment`
 /// and `Context` method keeps the single-threaded rule. There is no backpressure: a producer that
 /// outruns the query grows the GPU tier until the downgrade executor spills.
@@ -200,7 +201,8 @@ class SIRIUS_FFI_EXPORT FragmentInput {
   /// @throws on an unknown stream or sender, or once the fragment has finished.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id) const;
 
-  /// False once the fragment joined (or ran, or was destroyed): a push then throws.
+  /// False once the fragment joined (or ran, failed to start, or was destroyed): a push then
+  /// throws.
   [[nodiscard]] bool is_open() const;
 
  private:

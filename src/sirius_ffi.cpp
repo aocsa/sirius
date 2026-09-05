@@ -653,6 +653,9 @@ struct Fragment::Impl {
       started = true;
     } catch (...) {
       poison_outputs(std::current_exception());
+      // The query window closes below, so the fragment has finished as far as a producer is
+      // concerned: the handle refuses from here on, as it does after join().
+      if (input) { input->impl_->detach(); }
       end_lifecycle();
       throw;
     }

@@ -63,6 +63,7 @@
 #include <substrait/plan.pb.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -613,6 +614,34 @@ std::string import_error(const handmade_arrow_column& column, sirius::logical_ty
   return "";
 }
 
+// The footprint estimate runs before the import in `push_arrow`, so its refusals have to be the
+// import's: what it lets through it sizes from the host buffers.
+std::string estimate_error(const handmade_arrow_column& column, sirius::logical_type declared)
+{
+  const std::vector<std::string> names{"c"};
+  const std::vector<sirius::logical_type> types{declared};
+  try {
+    sirius::estimate_arrow_import_footprint(
+      reinterpret_cast<const ArrowSchema*>(column.schema_addr()),
+      reinterpret_cast<const ArrowArray*>(column.array_addr()),
+      "test batch",
+      names,
+      types);
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return "";
+}
+
+// A `rows`-row column of `format` whose one data buffer is `data`: the shape a producer sends
+// when its column is narrower than the declared type says.
+void give_rows(handmade_arrow_column& column, std::int64_t rows, const void* data)
+{
+  column.array.length       = rows;
+  column.child_array.length = rows;
+  column.child_buffers[1]   = data;
+}
+
 // Both TransactionContext::Commit() and ::Rollback() clear current_transaction before doing any
 // work that can throw, so "does BeginTransaction() work afterward" cannot tell the old
 // commit-on-failure bug apart from the fix. What both bugs share is that a broken/skipped
@@ -813,6 +842,26 @@ TEST_CASE("Fragment::push_arrow refuses a batch whose schema disagrees with the 
                         Catch::Matchers::Contains("non-null"));
     REQUIRE_THROWS_WITH(fragment->push_arrow(0, 0, host.array_addr(), 0),
                         Catch::Matchers::Contains("non-null"));
+  }
+
+  SECTION("a column narrower than its declared VARCHAR is refused before its buffers are read")
+  {
+    // A bool bitmap and an int8 buffer declared VARCHAR. Sized as a string column, 64 rows would
+    // be read as int32 offsets up to `offsets[64]`, 260 bytes into an 8- or 64-byte buffer; the
+    // footprint estimate that runs before the import refuses the format instead, so the push
+    // throws the type mismatch and never reads past the buffer.
+    const std::vector<plan_column> name{{"name", col_kind::STRING}};
+    auto fragment = build_result_fragment(*context, name);
+    for (const auto& [format, carried] :
+         {std::pair{"b", "bool"}, std::pair{"c", "int8"}, std::pair{"s", "int16"}}) {
+      handmade_arrow_column column(format);
+      std::array<std::uint8_t, 128> data{};
+      give_rows(column, 64, data.data());
+      REQUIRE_THROWS_WITH(fragment->push_arrow(0, 0, column.array_addr(), column.schema_addr()),
+                          Catch::Matchers::Contains("column 0 (name)") &&
+                            Catch::Matchers::Contains("declared VARCHAR") &&
+                            Catch::Matchers::Contains(carried));
+    }
   }
 
   SECTION("a decimal whose scale disagrees is refused naming both scales")
@@ -1462,6 +1511,50 @@ TEST_CASE("arrow_host_import refuses the shapes the engine cannot consume, by na
     column.schema.format = "l";
     const auto what      = import_error(column, logical_type::make(type_id::BIGINT));
     CHECK_THAT(what, Catch::Matchers::Contains("struct"));
+  }
+
+  SECTION("the footprint estimate refuses what the import refuses, before it sizes anything")
+  {
+    // Declared VARCHAR, the estimate reads the child's buffer as int32 string offsets up to
+    // `offsets[rows]`; a bool bitmap or an int8 buffer of those rows is 32x or 4x too small for
+    // that read. Every refusal below has to come from the format string, with nothing read.
+    std::array<std::uint8_t, 128> data{};
+    for (const auto& [format, carried] :
+         {std::pair{"b", "bool"}, std::pair{"c", "int8"}, std::pair{"S", "uint16"}}) {
+      handmade_arrow_column column(format);
+      give_rows(column, 64, data.data());
+      const auto what = estimate_error(column, logical_type::make(type_id::VARCHAR));
+      CHECK_THAT(what, Catch::Matchers::Contains("column 0 (c)"));
+      CHECK_THAT(what, Catch::Matchers::Contains("declared VARCHAR"));
+      CHECK_THAT(what, Catch::Matchers::Contains(carried));
+    }
+    // The by-name refusals and the declared-type refusal run there too.
+    handmade_arrow_column large("U");
+    give_rows(large, 64, data.data());
+    CHECK_THAT(estimate_error(large, logical_type::make(type_id::VARCHAR)),
+               Catch::Matchers::Contains("large_utf8"));
+    handmade_arrow_column wide("d:38,0");
+    give_rows(wide, 64, data.data());
+    CHECK_THAT(estimate_error(wide, logical_type::make(type_id::HUGEINT)),
+               Catch::Matchers::Contains("HUGEINT"));
+    // A utf8 child is what the estimate sizes from: 64 rows of one character each.
+    std::array<std::int32_t, 65> offsets{};
+    for (std::int32_t i = 0; i < 65; ++i) {
+      offsets[i] = i;
+    }
+    handmade_arrow_column utf8("u");
+    give_rows(utf8, 64, offsets.data());
+    const std::vector<std::string> names{"c"};
+    const std::vector<logical_type> types{logical_type::make(type_id::VARCHAR)};
+    const auto footprint = sirius::estimate_arrow_import_footprint(
+      reinterpret_cast<const ArrowSchema*>(utf8.schema_addr()),
+      reinterpret_cast<const ArrowArray*>(utf8.array_addr()),
+      "test batch",
+      names,
+      types);
+    // 65 int32 offsets (260 bytes, rounded up to 512) and 64 characters (rounded up to 256).
+    CHECK(footprint.resident_bytes == 512 + 256);
+    CHECK(footprint.transient_bytes == 0);
   }
 }
 
