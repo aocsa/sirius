@@ -1,8 +1,9 @@
 # Arrow-based in-process I/O for StarRocks: design, plan and NIXL comparison
 
 Branch `demo/arrow-inprocess-io`, base `281b13bc`. For Morningman (Apache Doris, author of the `push_arrow` proposal
-on sirius-db/sirius#1590) and the Sirius/StarRocks team. File:line anchors refer to `d39f72a0`, the last code commit.
-Nothing under `experimental/starrocks` changed since `281b13bc`, so its anchors are the base's.
+on sirius-db/sirius#1590) and the Sirius/StarRocks team. The last code commit is `dbdaa350`. The `file:line`
+anchors in sections 1, 2 and 4 (M1, M2) were taken at `d39f72a0` and are not refreshed for the later commits
+(`src/sirius_ffi.cpp` in particular grew); the later sections name files and functions instead.
 
 ## 0. Summary
 
@@ -12,19 +13,24 @@ new `Fragment::push_arrow` FFI, and reads the result back as Arrow. `push_arrow`
 `push_packed`, the device-memory hop the NIXL tier uses between two compute nodes (CNs) today.
 
 Deliverables: (M1, delivered) the `push_arrow` FFI plus a helper that imports Arrow through cudf and checks it against
-the declared stream schema, with Catch2 tests (13 cases, 267 assertions on GPU 1); (M2, delivered) Rust bindings, an
+the declared stream schema, with Catch2 tests (the `[sirius_ffi]` suite is 18 cases, 642 assertions on GPU 1 today);
+(M2, delivered) Rust bindings, an
 Arrow hop test that returns the same rows as the `relay_from` and `push_packed` hops, and a micro-benchmark of both
 PCIe legs at 128 MiB, 512 MiB and 2 GiB; (M3, delivered) the Arrow-over-brpc exchange transport in the StarRocks CN,
 drained off the RPC thread and pipelined over several connections; (M4, delivered behind `SIRIUS_CN_RESULT_PATH=arrow`)
 a one-copy Arrow output through `cudf::to_arrow_host`; (M5) the end-to-end comparison against NIXL at the byte totals
-of 5.1: run once (below); the rerun with the M3 closing fixes is pending.
+of 5.1: run once (below); the rerun with the M3 closing fixes is pending. Open outside this branch: the engine's
+task-creation error path that the first M5 run's out-of-memory took (`src/creator/task_creator.cpp`; it stops the
+scheduler from its own pool thread and the next fragment ran against the torn-down scheduler) is being fixed in a
+separate change; the CN-side trigger is closed here (M3, "Closing changes").
 
 Expected outcomes: a tested path for a CPU host (a Doris BE, a StarRocks BE or CN) to feed a GPU fragment without
 device pointers or pack metadata (in hand); the widened threading contract, `start()`/`join()` and the thread-safe
 input handle (section 3, in hand);
 numbers for what the Arrow path pays (D2H, host copies, H2D, all PCIe-bound) against what NIXL pays (one
-device-to-device write at 48-56 GB/s here). The per-leg numbers are measured: 10 GB/s in, 1.1-1.2 GB/s out today. The
-end-to-end arms are not run yet.
+device-to-device write at 48-56 GB/s here). The per-leg numbers are measured: 10 GB/s in, 1.1-1.2 GB/s out through the
+default result path, 4.1-4.3 GB/s through `to_arrow_host`. The end-to-end arms ran once (M5, 4.3); the rerun with the
+closing fixes is pending.
 
 ## 1. The current design
 
@@ -207,7 +213,11 @@ so an already-released batch is refused instead of read (`:274-277`); top-level 
 count, both child counts named (`:288-295`); per column, the by-name refusals, then the type the format string implies
 against `get_cudf_type(declared)` for the scalar formats (`:300-310`); the struct window (`:312-313`);
 `cudf::from_arrow` (`:318`); the check on the imported table, the backstop for formats the pre-check does not know
-(`:319-328`).
+(`:319-328`). `estimate_arrow_import_footprint`, which `push_arrow` runs before the import to size its reservation, runs
+the same checks in the same order before it reads anything, and reads a child's string offsets only when the child is
+`utf8`: a column declared VARCHAR that arrives as anything else is refused there instead of being read as int32 offsets
+it does not carry (a bool bitmap or int8 child declared VARCHAR read 4 bytes a row past its buffer before this;
+`18683658`).
 
 ### 2.5 The output side
 
@@ -327,12 +337,14 @@ a started fragment destroyed before `join()` is joined by its destructor and the
 `start()`, `join()` before `start()` and `input_handle()` before `build()` throw. Rust
 (`start_join_takes_arrow_pushes_from_another_thread_while_join_blocks`): the handle is moved into a `std::thread`
 that pushes while the main thread blocks in `join()`; the rows equal the pre-materialized run; a push after `join()`
-is an `Err` naming the finished fragment. The `[sirius_ffi]` suite is 18 cases, 619 assertions; the Rust suite 20
-tests.
+is an `Err` naming the finished fragment. The `[sirius_ffi]` suite is 18 cases, 642 assertions; the Rust suite
+20 tests.
 
 Measured. The pool-stream copy costs nothing against the default-stream copy: the hidden `[sirius_ffi_bench]` case
-gives `push_arrow` on the 512 MiB batch 0.055 s / 9.81 GB/s before and 0.053 s / 10.20 GB/s after (128 MiB 7.80 to
-10.08, 2 GiB 9.92 to 10.23 GB/s, one run each, same box, GPU 1). The transient device peak of the declared-width
+gives `push_arrow` on the 512 MiB batch 0.055 s / 9.81 GB/s before and 0.053 s / 10.20 GB/s after (2 GiB 9.92 to
+10.23 GB/s; one run each, same box, GPU 1). The 128 MiB pair of those runs, 7.80 before and 10.08 after, is run-level
+noise, not the stream change: the before run's pageable `cudaMemcpy` reference on the same pass was 7.72 GB/s, and a
+rerun gives 9.85 against a 9.92 reference. The transient device peak of the declared-width
 import, measured through an rmm statistics adaptor on six decimal128 columns of 2^18 rows declared DECIMAL(15,2), is
 one wide column (4 MiB) over the 12 MiB table: 16 MiB, where importing the batch wide and casting afterwards held
 24 MiB of wide columns plus the first cast.
@@ -347,7 +359,10 @@ lines are the method declaration order in the header and the schema guard, which
 
 ## 4. Plan for the demo branch: M1 to M5
 
-M1 and M2 are delivered (`e354d5d1`, `0d873ac3`, `e51943af`, `d39f72a0`). M3 to M5 are planned.
+M1 to M4 are delivered. Code commits: M1 and M2 `e354d5d1`, `0d873ac3`, `e51943af`, `d39f72a0`; M3 `252a554f`,
+`47010baa`, `b0dea400`, `d1a801da`, `664653c5`, then its closing changes `7d71c6f1`, `03d1b9fa`, `5503e422`,
+`2f09fdea`; M4 `2d0c85bf`; the review fixes `18683658` (FFI) and `dbdaa350` (CN). M5 ran once (4.3) and is
+to be rerun with the closing fixes.
 
 ### M1: `push_arrow` FFI, import helper, Catch2 tests (delivered)
 
@@ -426,7 +441,8 @@ a batch. The same 2-CN TPC-H arm can therefore run once over NIXL and once over 
 - The drain left the RPC. The sender fragment and its Arrow drain ran inside `exec_plan_fragment`; the 15.4 GB drain
   of q04 took 59 s, the FE's ~60 s per-RPC deadline (`RpcTimerTask` in the FE log) cancelled the query mid-drain and
   retried it, the re-planned scan parked 62 GB on one CN, and the OOM that followed took the engine's task-creation
-  error path, which is the crash the diagnosis traced (an engine defect, out of this branch's scope). Now
+  error path, which is where the failure analysis of that run traced the crash (an engine defect, being fixed outside
+  this branch). Now
   `arrow_exchange::prepare` dials the peer inside the RPC (an unreachable destination still fails it and drops the
   parked output), the RPC replies, and an `arrow-drain` thread runs the drain; the receivers this sender readied are
   dispatched after its drains complete, the order the inline drain kept, so a local receiver never competes with the
@@ -454,10 +470,19 @@ a batch. The same 2-CN TPC-H arm can therefore run once over NIXL and once over 
   `declare_input_cardinality` must precede `build()`, and a remote sender's row count is only known at its eos, so an
   early start plans blind (cardinality 1 on the stream), which is the q07 join-order regression the exact branch
   exists to prevent. Streaming into a running receiver needs an engine that serves exports while a query runs, or a
-  sender that announces its row count before its first frame; neither is in this step.
+  sender that announces its row count before its first frame; neither is on this branch.
 - Log lines. `transmitted batches via arrow` keeps `stream_id sender_id dest batches bytes elapsed_ms` and adds
   `query_id fragment_instance_id export_ms encode_ms send_ms workers`; `received remote batches via arrow` adds
   `push_ms`; the tunables line adds `arrow_send_workers`, `brpc_io_threads`, `result_path`.
+- Review fixes (`18683658`, `dbdaa350`). A peer that died mid-drain wedged the drain thread: the exporter
+  kept its own handle on the chunk queue's receiving end, so once every send worker had exited on the wire error its
+  `send` on the full queue could never fail, and `drop_parked`, `fail_fragment` and the receivers' dispatch never ran.
+  The workers alone own that end now, so the last one's exit turns the blocked `send` into an error, and the exporter
+  re-checks the failure flag per chunk (`arrow_exchange.rs`, `send_fragment`; test
+  `a_peer_that_dies_mid_drain_does_not_wedge_the_drain_thread`, which times out on the previous code). A drain thread
+  that cannot be spawned drains inside the RPC instead of losing the outcome (`dispatch_ready`). On the engine side,
+  `estimate_arrow_import_footprint` runs the import's refusals before it sizes anything (2.4), and a `start()` that
+  throws detaches the input handle as `join()` does.
 
 Original plan, kept for the record:
 
@@ -527,9 +552,10 @@ item 1 has the accounting that now exists), and q07 crashed a CN (not yet reprod
 lineitem fragment's translation, then the segfault). Conclusion for the design question: for CN-to-CN exchange on one host NIXL stays;
 the Arrow path is the host-input contract for a CPU-side producer (its intended role), and needs pipelining
 (overlap export, encode, send, decode, push) and the crash fix before it can be measured against NIXL on equal
-terms; the reservation accounting is in (2.3). Evidence: `starrocks-tools/evidence/rtxpro6000-fix4/X-nixl`, `X-arrow`, `arrow-vs-nixl.md`.
+terms; the reservation accounting is in (2.3). Evidence: the `X-nixl` and `X-arrow` arm directories under the arms
+path of section 6.
 
-What the diagnosis of that run and the closing changes established afterwards (M3, "Closing changes"):
+What the failure analysis of that run and the closing changes established (M3, "Closing changes"):
 
 - The q04 failure and the q07 crash were one chain. The 59 s drain inside `exec_plan_fragment` tripped the FE's ~60 s
   per-RPC deadline; the FE cancelled q04 mid-drain and retried it; the retry re-planned lineitem so one CN parked 62.1 GB
@@ -541,9 +567,12 @@ What the diagnosis of that run and the closing changes established afterwards (M
   scope; the CN-side trigger is closed: the RPC replies before the drain, and the drain is 4-7x faster on loopback.
 - The arm has not been rerun with these changes yet. The numbers to expect
   from the loopback bench: a 19.7 GB q03 stream at 1.3 GB/s takes ~15 s instead of 68 s (4 workers, one I/O thread),
-  ~10 s with `SIRIUS_CN_BRPC_IO_THREADS=4`; the receiver's `push_ms` (H2D at ~10 GB/s) and the sender's `export_ms`
-  (D2H at ~4 GB/s, serialized on the engine thread) are now logged per stream so the next run can attribute what is
-  left. Knobs for the rerun: `SIRIUS_CN_EXCHANGE_TRANSPORT=arrow SIRIUS_CN_ARROW_SEND_WORKERS=4
+  ~10 s with `SIRIUS_CN_BRPC_IO_THREADS=4`. That bench excludes both PCIe legs: its export is host-resident
+  (`export_ms` = 0) and its peer stages the frames without running `push_arrow`, so a stream's wall time in the arm is
+  the wire time plus the receiver's `push_ms` (H2D at ~10 GB/s, about 2 s for 19.7 GB, serial on the engine thread and
+  not overlapped with the wire, since the pushes happen at dispatch), and the sender's `export_ms` (D2H at ~4 GB/s)
+  competes with the other drains for the one engine thread. Both are logged per stream so the next run can attribute
+  what is left. Knobs for the rerun: `SIRIUS_CN_EXCHANGE_TRANSPORT=arrow SIRIUS_CN_ARROW_SEND_WORKERS=4
   SIRIUS_CN_BRPC_IO_THREADS=4`, and `SIRIUS_CN_RESULT_PATH=arrow` for the M4 leg.
 
 ## 5. Performance comparison against NIXL
@@ -630,8 +659,8 @@ DuckDB oracle (`compare.txt`).
 |---|---|---|
 | A0 | NIXL baseline, 2 CNs, q03 q04 q07 q22 (`V3d-32g`) | measured, table 5.1 |
 | A1 | M2 micro-benchmark in one process: `push_arrow` then `run()` + `result_to_arrow` | measured at 128 MiB to 2 GiB, table 5.2; the byte totals of 5.1 (6.19, 30.82, 40.10, 48.83 GB) not run |
-| A2 | M3 loopback in one CN for the single-destination exchanges of q22 and q04, behind a CN switch that routes a local destination through the Arrow path instead of `relay_from` | after M3, optional |
-| A3 | Arrow IPC over brpc between the 2 CNs (the D3 shape; frames under the 256 MiB decoder cap, `prpc.rs:13`) | not scheduled; listed so the wire cost is not forgotten |
+| A2 | M3 loopback in one CN for the single-destination exchanges of q22 and q04, behind a CN switch that routes a local destination through the Arrow path instead of `relay_from` | not built: same-CN exchanges stay native relays (2.6); the loopback measurement is the two-service CN bench of M3, "Closing changes" |
+| A3 | Arrow IPC over brpc between the 2 CNs (the D3 shape; frames under the 256 MiB decoder cap, `prpc.rs:13`) | what M3 shipped (`arrow_ipc` frames of `transmit_packed`, chunks of at most 64 MiB); measured once in the M5 run (4.3), rerun pending |
 
 ### 5.5 Per-byte comparison, measured legs
 
@@ -663,7 +692,7 @@ inside a CN (A2).
 
 | Item | Location |
 |---|---|
-| Branch | `demo/arrow-inprocess-io`, base `281b13bc`; code commits `e354d5d1`, `0d873ac3`, `e51943af`, `d39f72a0` |
+| Branch | `demo/arrow-inprocess-io`, base `281b13bc`; code commits from `e354d5d1` to `dbdaa350`, listed per milestone at the top of section 4 |
 | FFI surface | `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp`; helper `src/include/helper/arrow_host_import.hpp`, `src/helper/arrow_host_import.cpp` |
 | Rust bindings | `rust/crates/sirius-sys/src/lib.rs` (cxx bridge), `rust/crates/sirius/src/lib.rs` (safe wrapper, GPU tests) |
 | StarRocks CN | `experimental/starrocks/src/{engine.rs,fragment_executor.rs,nixl_transport.rs,compute_node_service.rs}` |
