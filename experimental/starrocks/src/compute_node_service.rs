@@ -287,6 +287,10 @@ impl SiriusComputeNodeService {
     /// The FE's per-RPC deadline (~60 s) is what forbids draining inside the RPC: the first
     /// SF1000 Arrow run held one `exec_plan_fragment` open for 59 s, the FE cancelled and retried
     /// the query, and the retry ran a CN out of GPU memory.
+    ///
+    /// When the drain thread cannot be spawned the drains run on this thread instead, the
+    /// shape before the drain left the RPC: slower for the FE, but the parked output is
+    /// dropped and the readied receivers are dispatched, which losing the outcome would forfeit.
     fn dispatch_ready(&self, outcome: FragmentOutcome) -> std::result::Result<(), String> {
         if outcome.drains.is_empty() {
             for ready in outcome.ready {
@@ -294,11 +298,31 @@ impl SiriusComputeNodeService {
             }
             return Ok(());
         }
+        // The outcome is handed over only once the thread exists: a failed spawn would drop a
+        // closure that owned it, drains included.
+        let (hand_over, take_over) = mpsc::channel::<FragmentOutcome>();
         let service = self.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("arrow-drain".to_string())
-            .spawn(move || service.finish_arrow_drains(outcome))
-            .map_err(|err| format!("failed to spawn the Arrow drain thread: {err}"))?;
+            .spawn(move || {
+                if let Ok(outcome) = take_over.recv() {
+                    service.finish_arrow_drains(outcome);
+                }
+            });
+        let outcome = match spawned {
+            Ok(_) => match hand_over.send(outcome) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::SendError(outcome)) => outcome,
+            },
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "could not spawn the Arrow drain thread; draining inside the RPC instead"
+                );
+                outcome
+            }
+        };
+        self.clone().finish_arrow_drains(outcome);
         Ok(())
     }
 
@@ -3603,7 +3627,24 @@ pub(crate) mod tests {
         });
         let fetched = fetch_rows_eventually(&peer, receiver_id.hi, receiver_id.lo);
         assert!(!fetched.attachment.is_empty());
-        assert_eq!(peer_executor.remote_inputs.lock().unwrap().len(), 1);
+        {
+            // What the peer's receiver saw after the reply is the parked output, whole and in
+            // order, not merely something.
+            let inputs = peer_executor.remote_inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 1, "{inputs:?}");
+            let (node_id, sender_id, batches) = &inputs[0];
+            assert_eq!((*node_id, *sender_id), (7, 0));
+            let parked = parked_arrow_batches(&["id".to_string(), "name".to_string()]);
+            assert_eq!(batches.len(), parked.len(), "{batches:?}");
+            for (staged, parked) in batches.iter().zip(&parked) {
+                assert_eq!(staged.rows, Some(parked.num_rows() as u64));
+                assert_eq!(
+                    staged.arrow.as_deref(),
+                    Some(std::slice::from_ref(parked)),
+                    "the batch shipped after the reply equals the parked one"
+                );
+            }
+        }
         wait_until("the drain line", || {
             logged(
                 &query_id,
@@ -3850,6 +3891,123 @@ pub(crate) mod tests {
             peer_executor.remote_inputs.lock().unwrap().is_empty(),
             "the cancelled receiver never ran"
         );
+    }
+
+    /// A destination that accepts the drain's connections and never answers a frame, so the
+    /// send workers' round trips wait in the reply read until [`MutePeer::kill`] closes every
+    /// accepted socket. `kill` stops listening first, so the failed drain's
+    /// `cancel_plan_fragment` dial is refused rather than answered by silence.
+    struct MutePeer {
+        port: u16,
+        accepted: Arc<Mutex<Vec<std::net::TcpStream>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        acceptor: std::thread::JoinHandle<()>,
+    }
+
+    impl MutePeer {
+        /// `None` when the sandbox denies binding (the brpc tests skip alike).
+        fn listen() -> Option<Self> {
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(listener) => listener,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+                Err(err) => panic!("{err}"),
+            };
+            // Polled, so `kill` can stop the acceptor and drop the listener.
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepted = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let acceptor = {
+                let accepted = Arc::clone(&accepted);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((socket, _)) => accepted.lock().unwrap().push(socket),
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                            Err(err) => panic!("{err}"),
+                        }
+                    }
+                    // `listener` drops here: nothing listens on the port from now on.
+                })
+            };
+            Some(Self {
+                port,
+                accepted,
+                stop,
+                acceptor,
+            })
+        }
+
+        /// Stops listening, then closes every accepted connection: each pending round trip on
+        /// them fails, and no later dial to the port succeeds.
+        fn kill(self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.acceptor.join().unwrap();
+            for socket in self.accepted.lock().unwrap().drain(..) {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// A peer that dies mid-drain must not wedge the drain thread. One worker and a queue of one:
+    /// the worker holds chunk 0 in a round trip the peer never answers, chunk 1 fills the queue,
+    /// and the exporter blocks in `send` on chunk 2 (its third export is the tell). The peer then
+    /// dies, the worker's round trip fails and the worker exits, which disconnects the queue: the
+    /// exporter's `send` returns an error instead of waiting for a consumer that no longer
+    /// exists, the parked output is dropped exactly once, nothing more is exported, and the
+    /// query is failed on the sender's CN. With the exporter holding its own handle on the
+    /// queue's receiving end (the shape before this test) the drain thread parked forever here
+    /// and none of that happened.
+    #[test]
+    fn a_peer_that_dies_mid_drain_does_not_wedge_the_drain_thread() {
+        let Some(peer) = MutePeer::listen() else {
+            return;
+        };
+        let query_id = TUniqueId::new(75, 1);
+        let receiver_id = TUniqueId::new(75, 2);
+        let executor = Arc::new(ArrowParkingExecutor {
+            template: Some(numbered_batches(6)),
+            ..ArrowParkingExecutor::default()
+        });
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_exchange_transport(ExchangeTransport::Arrow);
+        service.set_arrow_send_workers(1);
+        let sender =
+            arrow_sender_to_peer(&query_id, &TUniqueId::new(75, 3), &receiver_id, peer.port);
+        // The peer accepts the dial and the fragment parks its output: the RPC is OK.
+        assert_exec_ok(&service, &sender);
+
+        wait_until("the exporter to reach its third export", || {
+            executor.exports.load(Ordering::SeqCst) >= 3
+        });
+        peer.kill();
+
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from(&receiver_id),
+            node_id: 7,
+            sender_id: 0,
+        };
+        wait_until("the failed drain to drop the parked output", || {
+            executor.dropped.lock().unwrap().as_slice() == [slot]
+        });
+        let query = FragmentInstanceId::from(&query_id);
+        wait_until("the sender's query to fail on its CN", || {
+            service.core.results.failure_of(query).is_some()
+        });
+        let failure = service.core.results.failure_of(query).unwrap();
+        assert!(
+            failure.contains("transmit_packed") && !failure.contains("exploded"),
+            "the worker's wire error is the cause: {failure}"
+        );
+        assert_eq!(
+            executor.exports.load(Ordering::SeqCst),
+            3,
+            "nothing was exported once the worker had failed"
+        );
+        assert!(executor.parked.lock().unwrap().is_empty());
     }
 
     /// Serves `service` as a peer CN on a loopback port; returns the port and a guard that stops

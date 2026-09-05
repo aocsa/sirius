@@ -270,8 +270,10 @@ fn frame(spec: &RemoteSendSpec, eos: bool, seq: i64, rows: Option<u64>) -> PTran
 
 /// One encode-and-send worker: takes `(seq, chunk)`s off the shared queue until the exporter
 /// closes it, IPC-encodes each and ships it over this worker's own connection. Stops at the
-/// first failure and raises `failed`, so the exporter stops feeding the queue; the connection
-/// comes back either way (one of them sends the eos).
+/// first failure and raises `failed`, so the exporter stops feeding the queue; its handle on
+/// the queue goes with it, so once the last worker has stopped the exporter's `send` fails
+/// instead of waiting for a consumer. The connection comes back either way (one of them sends
+/// the eos).
 fn send_worker(
     mut client: PrpcClient,
     spec: &RemoteSendSpec,
@@ -321,6 +323,13 @@ fn send_worker(
 /// the receiver out of `seq` order; it holds the early ones (`local_exchange.rs`,
 /// `push_remote_frame`). The eos goes last, once every worker has returned with its data frames
 /// acknowledged, so an eos never overtakes a data frame.
+///
+/// A peer that dies mid-drain fails every worker's round trip at once. The exporter is then
+/// usually blocked in `send` on the full queue (the export outruns the wire), so it must not
+/// hold a handle on the queue's receiving end: only the workers do, and the last one's exit
+/// disconnects the channel and turns that `send` into an error. Before this the drain thread
+/// parked forever there, the parked output stayed pinned and the readied receivers were never
+/// dispatched.
 pub(crate) fn send_fragment(
     executor: &dyn FragmentExecutor,
     drain: ArrowDrain,
@@ -353,6 +362,8 @@ pub(crate) fn send_fragment(
             }
         }
     }
+    // The workers own the receiving end from here: see the note on `send` above.
+    drop(chunk_rx);
 
     let mut seq: i64 = 0;
     let mut export = Duration::ZERO;
@@ -372,6 +383,10 @@ pub(crate) fn send_fragment(
                 export += exporting.elapsed();
                 let named = with_names(&batch, &spec.names)?;
                 for chunk in chunk_by_rows(&named, MAX_CHUNK_BYTES) {
+                    if failed.load(Ordering::SeqCst) {
+                        return Err("an Arrow send worker failed".to_string());
+                    }
+                    // Err once the last worker has exited (each stops at its first failure).
                     if chunk_tx.send((seq, chunk)).is_err() {
                         return Err(
                             "every Arrow send worker exited before the drain finished".to_string()

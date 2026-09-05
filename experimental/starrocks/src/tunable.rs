@@ -140,9 +140,10 @@ const ARROW_SEND_WORKERS: Knob<u64> = Knob {
 /// `1` is the current-thread runtime the CN has always used: every connection's frames are
 /// read and decoded on that one thread, and handlers run on the blocking pool. The Arrow
 /// exchange transport's receiver reads 64 MiB frames from several sender connections at once,
-/// and one thread caps that at about 1.1 GB/s on loopback here; 4 threads lifted a 4-worker
-/// drain to 1.45 GB/s and an 8-worker one to 2.1 GB/s. The default stays 1 because it changes
-/// the threading of every RPC the CN serves, FE traffic included.
+/// and one thread caps that on loopback here (single runs, 8 frames of 64 MiB): 1.3 GB/s for a
+/// 4-worker drain and 1.4 for an 8-worker one, which 4 threads lift to 2.0 and 2.7 GB/s (one
+/// worker on one thread: 0.64). The default stays 1 because it changes the threading of every
+/// RPC the CN serves, FE traffic included.
 const BRPC_IO_THREADS: Knob<u64> = Knob {
     name: "SIRIUS_CN_BRPC_IO_THREADS",
     default: 1,
