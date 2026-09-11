@@ -48,6 +48,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/cudf/gpu_to_gpu_clone_stats.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -387,6 +388,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   try {
     log_pool_stats(pool_tag);
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
+    if (!is_internal_query_active(context)) { cucascade::reset_gpu_to_gpu_clone_stats(); }
   } catch (...) {  // best-effort observability
   }
   // Register this query's repository manager up front
@@ -403,6 +405,15 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // (query/drain/repository/scan/task resets) may throw out of this function
   // and thereby poison the runtime — a logging or telemetry failure must not.
   try {
+    auto const clone = cucascade::snapshot_gpu_to_gpu_clone_stats();
+    double const clone_ms = static_cast<double>(clone.clone_ns) / 1.0e6;
+    SIRIUS_LOG_INFO(
+      "[clone_stats] bytes_0to1={} bytes_1to0={} bytes_other={} clone_ms={:.4f} copies={}",
+      clone.bytes_0to1,
+      clone.bytes_1to0,
+      clone.bytes_other,
+      clone_ms,
+      clone.copies);
     SIRIUS_LOG_INFO("QueryEnd");
   } catch (...) {
   }

@@ -73,6 +73,14 @@ description = "Run the Quent telemetry UI server."
 cmd = "echo 'Quent UI will be served at: http://localhost:8080' && cargo run --manifest-path rust/Cargo.toml -p sirius-telemetry-server --features ui -- --output-dir {{ output_dir }}"
 args = [{ arg = "output_dir", default = "telemetry_data" }]
 
+[tasks.shuffle-bench]
+description = "Run the two-GPU interconnect + Sirius shuffle microbenchmark."
+cmd = "scripts/benchmark/run_shuffle_microbench.sh"
+
+[tasks.query-mgpu]
+description = "Pin synthetic parquet and time 1-GPU vs 2-GPU scan, GROUP BY, and joins."
+cmd = "scripts/benchmark/run_query_mgpu.sh"
+
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems.
 [feature.cuda13]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]

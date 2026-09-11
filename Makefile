@@ -26,7 +26,8 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
 	s3-test s3-test-large s3-tpch \
 	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench \
-	slot-gate-test
+	slot-gate-test \
+	sirius_shuffle_benchmark
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -110,6 +111,9 @@ clean:
 
 list-presets: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
+
+sirius_shuffle_benchmark: build/release/build.ninja
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target sirius_shuffle_benchmark
 
 # -----------------------------------------------------------------------------
 # S3 integration test gates

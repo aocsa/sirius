@@ -1050,3 +1050,43 @@ set_target_properties(
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/cpp/benchmark/sirius_shuffle_benchmark — two-GPU shuffle microbench
+# -----------------------------------------------------------------------------
+add_executable(sirius_shuffle_benchmark
+               test/cpp/benchmark/sirius_shuffle_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(sirius_shuffle_benchmark
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_shuffle_benchmark BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  sirius_shuffle_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+
+target_link_libraries(
+  sirius_shuffle_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(sirius_shuffle_benchmark "")
+
+target_link_options(sirius_shuffle_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  sirius_shuffle_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
