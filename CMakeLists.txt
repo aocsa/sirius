@@ -729,6 +729,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/exec/test_semi_future.cpp
+    test/cpp/exec/test_sirius_ffi_arrow.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_sirius_ffi_host.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
