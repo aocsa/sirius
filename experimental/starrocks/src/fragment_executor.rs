@@ -10,6 +10,40 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+use crate::result_store::FragmentInstanceId;
+
+/// Where one sender fragment's output is parked until its receiver runs.
+///
+/// Keyed by the *receiver* it feeds: a sender is addressed by the exchange it produces into,
+/// not by its own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SenderSlot {
+    /// Receiver fragment instance the output is destined for.
+    pub(crate) fragment_instance_id: FragmentInstanceId,
+    /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
+    pub(crate) node_id: i32,
+    /// Sender ordinal within that exchange's sender set.
+    pub(crate) sender_id: i32,
+}
+
+/// One packed batch sitting in an exchange staging arena as cudf packed bytes.
+///
+/// The wire shape of the NIXL hop: on the sender it names a lease in the *local* arena
+/// (filled by `export_packed`); on the receiver a lease in the *receiver's* arena (filled
+/// by a NIXL WRITE). `len == 0` means no lease exists for this batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedBatch {
+    /// Host-side cudf pack metadata (travels on `POST /exchange`; the device payload does not).
+    pub metadata: Vec<u8>,
+    /// Byte offset of the packed payload from the arena base. `0` with `len == 0` means no
+    /// lease exists for this batch.
+    pub offset: u64,
+    /// Length of the packed payload in bytes.
+    pub len: u64,
+    /// Exact row count of the packed table, when the frame carried `X-Rows`.
+    pub rows: Option<u64>,
+}
+
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
 #[derive(Clone, Debug)]
 pub struct FragmentResult {
@@ -43,6 +77,46 @@ impl FragmentResult {
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     /// Executes `translated` and returns its Arrow result batches.
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String>;
+
+    /// Exchange staging arena `(device base address, capacity in bytes)`. Errors when this
+    /// executor has no arena.
+    fn staging_info(&self) -> Result<(u64, u64), String> {
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Leases `len` bytes of the staging arena, returning the lease offset from the base.
+    fn staging_lease(&self, len: u64) -> Result<u64, String> {
+        let _ = len;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Returns the staging lease at `offset`.
+    fn staging_release(&self, offset: u64) -> Result<(), String> {
+        let _ = offset;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Packs the next batch parked under `slot` into a fresh staging lease; `Ok(None)` once
+    /// the parked output is drained. The lease stays outstanding until
+    /// [`staging_release`](Self::staging_release).
+    fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
+        let _ = slot;
+        Err("this fragment executor cannot export packed batches \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Drops the parked fragment under `slot`. The default errors because a stub parks nothing.
+    fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+        let _ = slot;
+        Err("this fragment executor parks nothing to drop".to_string())
+    }
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
