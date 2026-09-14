@@ -6,7 +6,16 @@
 //! rides this RPC. Native `ChunkPB`, pass-through, and pipeline-level shuffle are rejected so
 //! a stock BE cannot be misread as Sirius.
 
-use crate::proto::starrocks::PTransmitChunkParams;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use prost::Message;
+
+use crate::proto::starrocks::{
+    PTransmitChunkParams, PTransmitChunkResult,
+    p_internal_service_brpc::{SERVICE_NAME, methods},
+};
+use crate::prpc;
 use crate::result_store::FragmentInstanceId;
 
 /// ASCII `SRNX` (0x53524E58 as a big-endian u32). On the wire the four bytes are `S R N X`;
@@ -271,6 +280,42 @@ pub(crate) fn packed_params(
         use_pass_through: Some(false),
         is_pipeline_level_shuffle: Some(false),
         driver_sequences: Vec::new(),
+    }
+}
+
+const TRANSMIT_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Blocking `transmit_chunk` for the NIXL control plane. Returns the response attachment
+/// (Md blob, Lease addr+offset, or empty). Must not be called from inside a `transport_call`.
+pub(crate) fn transmit_envelope_blocking(
+    peer: SocketAddr,
+    params: PTransmitChunkParams,
+    envelope: &NixlEnvelope,
+) -> Result<Vec<u8>, String> {
+    let (body, attachment) = prpc::call_blocking(
+        peer,
+        SERVICE_NAME,
+        methods::TRANSMIT_CHUNK,
+        params.encode_to_vec(),
+        envelope.encode(),
+        TRANSMIT_CHUNK_TIMEOUT,
+    )
+    .map_err(|err| err.to_string())?;
+    require_ok_status(&body)?;
+    Ok(attachment)
+}
+
+fn require_ok_status(body: &[u8]) -> Result<(), String> {
+    let result = PTransmitChunkResult::decode(body)
+        .map_err(|err| format!("transmit_chunk response: {err}"))?;
+    match result.status {
+        Some(status) if status.status_code == 0 => Ok(()),
+        Some(status) => Err(if status.error_msgs.is_empty() {
+            format!("transmit_chunk failed with status {}", status.status_code)
+        } else {
+            status.error_msgs.join("; ")
+        }),
+        None => Err("transmit_chunk returned no status".to_string()),
     }
 }
 

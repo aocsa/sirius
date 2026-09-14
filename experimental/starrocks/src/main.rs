@@ -123,6 +123,7 @@ impl Args {
         #[cfg(not(feature = "nixl-transport"))]
         let md: Option<Arc<dyn NixlMdHandler>> = None;
         let leases: Option<Arc<dyn StagingLeaseHandler>> = Some(Arc::new(executor.clone()));
+        let service = service.with_nixl_control(md.clone(), leases.clone());
         let http_bind = format!(
             "{}:{}",
             self.compute_node.bind_host, self.compute_node.http_port

@@ -58,12 +58,12 @@ pub struct RemoteLease {
 }
 
 /// Loads a peer's NIXL metadata and returns this CN's cached local blob.
-pub trait NixlMdHandler: Send + Sync {
+pub trait NixlMdHandler: Send + Sync + std::fmt::Debug {
     fn on_peer_md(&self, peer_metadata: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 /// Grants a lease of this CN's staging arena for a peer WRITE.
-pub trait StagingLeaseHandler: Send + Sync {
+pub trait StagingLeaseHandler: Send + Sync + std::fmt::Debug {
     fn lease(&self, length: u64) -> Result<RemoteLease, String>;
     /// Returns the lease at `offset`. Used by the log-only bandwidth canary so the
     /// remote probe does not sit in the exchange rendezvous.
@@ -700,6 +700,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct FakeMd {
         mine: Vec<u8>,
         loaded: Mutex<Vec<Vec<u8>>>,
@@ -712,6 +713,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct FakeLeases {
         base: u64,
         next: Mutex<u64>,

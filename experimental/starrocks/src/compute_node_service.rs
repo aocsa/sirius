@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::exchange_http::{
-    ExchangeHttpServer, NixlMdHandler, StagingLeaseHandler, peer_http_port,
+    ExchangeHttpServer, NixlMdHandler, RemoteLease, StagingLeaseHandler, peer_http_port,
 };
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
@@ -16,7 +16,8 @@ use crate::nixl_transport::{NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
-    PGetFileSchemaResult, PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
+    PGetFileSchemaResult, PSlotDescriptor, PTransmitChunkParams, PTransmitChunkResult, StatusPb,
+    p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
@@ -93,6 +94,11 @@ pub struct SiriusComputeNodeService {
     /// NIXL transport for a remote hop. Absent when this CN was built or started without it;
     /// a remote destination then fails loudly instead of silently skipping the hop.
     transport: Option<Arc<NixlTransport>>,
+    /// Optional Md handler for `transmit_chunk` kind Md. Production falls back to `transport`.
+    md: Option<Arc<dyn NixlMdHandler>>,
+    /// Optional lease handler for `transmit_chunk` kinds Lease and CanaryRelease. Production
+    /// falls back to the fragment executor's staging arena.
+    leases: Option<Arc<dyn StagingLeaseHandler>>,
 }
 
 impl SiriusComputeNodeService {
@@ -130,6 +136,67 @@ impl SiriusComputeNodeService {
             exchanges,
             identity,
             transport,
+            md: None,
+            leases: None,
+        }
+    }
+
+    /// Injects Md / Lease handlers used by `transmit_chunk` (tests with a stub arena; production
+    /// can share the same objects the HTTP control plane already holds).
+    pub fn with_nixl_control(
+        mut self,
+        md: Option<Arc<dyn NixlMdHandler>>,
+        leases: Option<Arc<dyn StagingLeaseHandler>>,
+    ) -> Self {
+        self.md = md;
+        self.leases = leases;
+        self
+    }
+
+    fn md_handler(&self) -> Result<Arc<dyn NixlMdHandler>, String> {
+        if let Some(md) = &self.md {
+            return Ok(Arc::clone(md));
+        }
+        #[cfg(feature = "nixl-transport")]
+        if let Some(transport) = &self.transport {
+            return Ok(Arc::clone(transport) as Arc<dyn NixlMdHandler>);
+        }
+        Err("this CN has no nixl metadata handler".to_string())
+    }
+
+    fn lease_handler(&self) -> Arc<dyn StagingLeaseHandler> {
+        match &self.leases {
+            Some(leases) => Arc::clone(leases),
+            None => Arc::new(Arc::clone(&self.executor)),
+        }
+    }
+
+    /// Decodes an SRNX `transmit_chunk` attachment. Md/Lease/CanaryRelease never call
+    /// [`LocalExchange::push_remote_frame`]; Packed is rejected until the hop moves off HTTP.
+    fn handle_nixl_chunk(
+        &self,
+        request: &PTransmitChunkParams,
+        attachment: &[u8],
+    ) -> std::result::Result<Vec<u8>, String> {
+        crate::nixl_chunk::reject_native_chunk(request)?;
+        match crate::nixl_chunk::NixlEnvelope::decode(attachment)? {
+            crate::nixl_chunk::NixlEnvelope::Md(peer_md) => self.md_handler()?.on_peer_md(&peer_md),
+            crate::nixl_chunk::NixlEnvelope::Lease { length } => {
+                let lease = self.lease_handler().lease(length)?;
+                Ok(crate::nixl_chunk::encode_lease_reply(
+                    lease.remote_addr,
+                    lease.offset,
+                ))
+            }
+            crate::nixl_chunk::NixlEnvelope::CanaryRelease { offset } => {
+                self.lease_handler().release(offset)?;
+                Ok(Vec::new())
+            }
+            crate::nixl_chunk::NixlEnvelope::Packed { .. } => Err(
+                "packed transmit_chunk is not wired yet; Packed frames still travel over HTTP \
+                 POST /exchange"
+                    .to_string(),
+            ),
         }
     }
 
@@ -304,6 +371,23 @@ impl PInternalService for SiriusComputeNodeService {
             },
         };
         Ok(result.into())
+    }
+
+    /// Serves NIXL control on unpatched `transmit_chunk`. Md and Lease reply in the attachment;
+    /// Packed is not ingested here yet (HTTP `POST /exchange` still carries frames).
+    #[instrument(skip_all)]
+    async fn transmit_chunk(
+        &self,
+        request: PTransmitChunkParams,
+        attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PTransmitChunkResult>, crate::prpc::Error> {
+        match self.handle_nixl_chunk(&request, &attachment) {
+            Ok(reply_attachment) => Ok(crate::prpc::Reply::with_attachment(
+                Self::transmit_chunk_result(Self::ok_status()),
+                reply_attachment,
+            )),
+            Err(err) => Ok(Self::transmit_chunk_result(Self::internal_error(err)).into()),
+        }
     }
 }
 
@@ -949,6 +1033,14 @@ impl SiriusComputeNodeService {
         }
     }
 
+    fn transmit_chunk_result(status: StatusPb) -> PTransmitChunkResult {
+        PTransmitChunkResult {
+            status: Some(status),
+            receive_timestamp: None,
+            receiver_post_process_time: None,
+        }
+    }
+
     /// StarRocks INTERNAL_ERROR status carrying a user-visible error message.
     fn internal_error(message: impl Into<String>) -> StatusPb {
         StatusPb {
@@ -997,6 +1089,231 @@ mod tests {
         },
         prpc,
     };
+
+    #[derive(Debug)]
+    struct FakeMd {
+        mine: Vec<u8>,
+        loaded: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl NixlMdHandler for FakeMd {
+        fn on_peer_md(&self, peer_metadata: &[u8]) -> Result<Vec<u8>, String> {
+            self.loaded.lock().unwrap().push(peer_metadata.to_vec());
+            Ok(self.mine.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeLeases {
+        base: u64,
+        next: std::sync::Mutex<u64>,
+        released: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl StagingLeaseHandler for FakeLeases {
+        fn lease(&self, length: u64) -> Result<RemoteLease, String> {
+            let mut next = self.next.lock().unwrap();
+            let offset = *next;
+            *next += length;
+            Ok(RemoteLease {
+                remote_addr: self.base + offset,
+                offset,
+            })
+        }
+
+        fn release(&self, offset: u64) -> Result<(), String> {
+            self.released.lock().unwrap().push(offset);
+            Ok(())
+        }
+    }
+
+    fn nixl_control_service() -> (SiriusComputeNodeService, Arc<FakeMd>, Arc<FakeLeases>) {
+        let md = Arc::new(FakeMd {
+            mine: b"local-md".to_vec(),
+            loaded: std::sync::Mutex::new(Vec::new()),
+        });
+        let leases = Arc::new(FakeLeases {
+            base: 0xB000_0000,
+            next: std::sync::Mutex::new(0),
+            released: std::sync::Mutex::new(Vec::new()),
+        });
+        let service = SiriusComputeNodeService::with_executor_and_exchange(
+            Arc::new(StubExecutor),
+            Arc::new(LocalExchange::default()),
+            ExchangeIdentity::default(),
+            None,
+        )
+        .with_nixl_control(Some(md.clone()), Some(leases.clone()));
+        (service, md, leases)
+    }
+
+    fn call_transmit(
+        service: &SiriusComputeNodeService,
+        params: PTransmitChunkParams,
+        attachment: Vec<u8>,
+    ) -> (PTransmitChunkResult, Vec<u8>) {
+        let response = route(
+            service,
+            methods::TRANSMIT_CHUNK,
+            params.encode_to_vec(),
+            attachment,
+        );
+        (
+            PTransmitChunkResult::decode(response.body.as_slice()).unwrap(),
+            response.attachment,
+        )
+    }
+
+    #[test]
+    fn transmit_chunk_md_returns_local_blob_without_ingesting() {
+        let (service, md, _) = nixl_control_service();
+        let (result, attachment) = call_transmit(
+            &service,
+            crate::nixl_chunk::control_params(),
+            crate::nixl_chunk::NixlEnvelope::Md(b"peer-md".to_vec()).encode(),
+        );
+        assert_eq!(result.status.unwrap().status_code, TStatusCode::OK.0);
+        assert_eq!(attachment, b"local-md");
+        assert_eq!(md.loaded.lock().unwrap().as_slice(), &[b"peer-md".to_vec()]);
+    }
+
+    #[test]
+    fn transmit_chunk_lease_replies_with_addr_and_offset() {
+        let (service, _, _) = nixl_control_service();
+        let (result, attachment) = call_transmit(
+            &service,
+            crate::nixl_chunk::control_params(),
+            crate::nixl_chunk::NixlEnvelope::Lease { length: 64 }.encode(),
+        );
+        assert_eq!(result.status.unwrap().status_code, TStatusCode::OK.0);
+        assert_eq!(
+            crate::nixl_chunk::decode_lease_reply(&attachment).unwrap(),
+            (0xB000_0000, 0)
+        );
+        let (result, attachment) = call_transmit(
+            &service,
+            crate::nixl_chunk::control_params(),
+            crate::nixl_chunk::NixlEnvelope::Lease { length: 16 }.encode(),
+        );
+        assert_eq!(result.status.unwrap().status_code, TStatusCode::OK.0);
+        assert_eq!(
+            crate::nixl_chunk::decode_lease_reply(&attachment).unwrap(),
+            (0xB000_0000 + 64, 64)
+        );
+    }
+
+    #[test]
+    fn transmit_chunk_canary_release_does_not_ingest() {
+        let (service, _, leases) = nixl_control_service();
+        let (result, attachment) = call_transmit(
+            &service,
+            crate::nixl_chunk::control_params(),
+            crate::nixl_chunk::NixlEnvelope::CanaryRelease { offset: 0x2000 }.encode(),
+        );
+        assert_eq!(result.status.unwrap().status_code, TStatusCode::OK.0);
+        assert!(attachment.is_empty());
+        assert_eq!(leases.released.lock().unwrap().as_slice(), &[0x2000]);
+    }
+
+    #[test]
+    fn transmit_chunk_packed_is_not_wired_yet() {
+        let (service, _, _) = nixl_control_service();
+        let (result, _) = call_transmit(
+            &service,
+            crate::nixl_chunk::packed_params(FragmentInstanceId::from_halves(1, 2), 7, 0, 0, false),
+            crate::nixl_chunk::NixlEnvelope::Packed {
+                offset: 0,
+                length: 0,
+                rows: 0,
+                names: vec!["id".into()],
+                metadata: Vec::new(),
+            }
+            .encode(),
+        );
+        assert_eq!(
+            result.status.as_ref().unwrap().status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+        assert!(
+            result.status.as_ref().unwrap().error_msgs[0].contains("not wired yet"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn transmit_chunk_rejects_native_chunkpb() {
+        let (service, _, _) = nixl_control_service();
+        let mut params = crate::nixl_chunk::control_params();
+        params
+            .chunks
+            .push(crate::proto::starrocks::ChunkPb::default());
+        let (result, _) = call_transmit(&service, params, Vec::new());
+        assert_eq!(
+            result.status.as_ref().unwrap().status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+        assert!(
+            result.status.as_ref().unwrap().error_msgs[0].contains("ChunkPB"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn transmit_chunk_md_and_lease_reply_over_brpc() {
+        use crate::brpc::BrpcServer;
+        use tokio_util::sync::CancellationToken;
+
+        let (service, md, _) = nixl_control_service();
+        let listener = match BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
+            Err(err) if is_permission_denied(&err) => return,
+            Err(err) => panic!("{err:?}"),
+        };
+        let peer = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                BrpcServer::with_service(service)
+                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+            )
+        });
+
+        let md_reply = crate::nixl_chunk::transmit_envelope_blocking(
+            peer,
+            crate::nixl_chunk::control_params(),
+            &crate::nixl_chunk::NixlEnvelope::Md(b"peer-md".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(md_reply, b"local-md");
+        assert_eq!(md.loaded.lock().unwrap().as_slice(), &[b"peer-md".to_vec()]);
+
+        let lease_reply = crate::nixl_chunk::transmit_envelope_blocking(
+            peer,
+            crate::nixl_chunk::control_params(),
+            &crate::nixl_chunk::NixlEnvelope::Lease { length: 1_048_576 },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::nixl_chunk::decode_lease_reply(&lease_reply).unwrap(),
+            (0xB000_0000, 0)
+        );
+
+        shutdown.cancel();
+        join.join().unwrap().unwrap();
+    }
+
+    fn is_permission_denied(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+        })
+    }
 
     #[test]
     fn exec_plan_fragment_translates_supported_scan() {
