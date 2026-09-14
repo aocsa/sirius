@@ -53,15 +53,21 @@ mod file_schema;
 mod fragment_executor;
 mod local_exchange;
 mod nixl_transport;
+mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
 
 pub use brpc::BrpcServer;
+pub use compute_node_service::{ExchangeIdentity, SiriusComputeNodeService};
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
-pub use fragment_executor::{FragmentExecutor, FragmentResult, SenderSlot, StagedBatch, StubExecutor};
+pub use exchange_http::{ExchangeHttpServer, NixlMdHandler, RemoteLease, StagingLeaseHandler};
+pub use fragment_executor::{
+    FragmentExecutor, FragmentResult, FragmentRun, SenderSlot, StagedBatch, StubExecutor,
+};
+pub use local_exchange::{LocalExchange, ReadyFragment};
 pub use nixl_transport::NixlTransport;
 
 /// Serializes GPU-using tests inside this process. Cross-process GPU exclusion is the

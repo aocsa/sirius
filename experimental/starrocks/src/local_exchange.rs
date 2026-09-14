@@ -87,7 +87,7 @@ pub(crate) struct ReadyExchangeInput {
 
 /// A receiver fragment whose exchange inputs are all ready for sequential execution.
 #[derive(Debug)]
-pub(crate) struct ReadyFragment {
+pub struct ReadyFragment {
     pub(crate) params: TExecPlanFragmentParams,
     pub(crate) inputs: Vec<ReadyExchangeInput>,
 }
@@ -114,7 +114,7 @@ struct ExchangeState {
 
 /// Matches receiver-first StarRocks dispatch with later sender results.
 #[derive(Debug, Default)]
-pub(crate) struct LocalExchange {
+pub struct LocalExchange {
     inner: Mutex<ExchangeState>,
 }
 

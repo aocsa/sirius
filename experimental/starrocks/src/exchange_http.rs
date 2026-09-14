@@ -28,8 +28,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::fragment_executor::StagedBatch;
-use crate::local_exchange::{ExchangeKey, LocalExchange};
+use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment};
 use crate::result_store::FragmentInstanceId;
+
+/// Callback invoked when a remote hop completes a receiver's sender set.
+pub type ReadyReceiver = Arc<dyn Fn(ReadyFragment) + Send + Sync>;
 
 /// One packed hop frame on `POST /exchange`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,19 +52,22 @@ pub(crate) struct PackedExchangeFrame {
 
 /// Receiver-side arena lease returned by `POST /staging-lease`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteLease {
+pub struct RemoteLease {
     pub(crate) remote_addr: u64,
     pub(crate) offset: u64,
 }
 
 /// Loads a peer's NIXL metadata and returns this CN's cached local blob.
-pub(crate) trait NixlMdHandler: Send + Sync {
+pub trait NixlMdHandler: Send + Sync {
     fn on_peer_md(&self, peer_metadata: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 /// Grants a lease of this CN's staging arena for a peer WRITE.
-pub(crate) trait StagingLeaseHandler: Send + Sync {
+pub trait StagingLeaseHandler: Send + Sync {
     fn lease(&self, length: u64) -> Result<RemoteLease, String>;
+    /// Returns the lease at `offset`. Used by the log-only bandwidth canary so the
+    /// remote probe does not sit in the exchange rendezvous.
+    fn release(&self, offset: u64) -> Result<(), String>;
 }
 
 impl StagingLeaseHandler for Arc<dyn crate::fragment_executor::FragmentExecutor> {
@@ -73,11 +79,15 @@ impl StagingLeaseHandler for Arc<dyn crate::fragment_executor::FragmentExecutor>
             offset,
         })
     }
+
+    fn release(&self, offset: u64) -> Result<(), String> {
+        self.staging_release(offset)
+    }
 }
 
 /// Listener that accepts the three hop routes and records `/exchange` frames on a
 /// [`LocalExchange`].
-pub(crate) struct ExchangeHttpServer {
+pub struct ExchangeHttpServer {
     local_addr: SocketAddr,
     shutdown: CancellationToken,
     join: JoinHandle<()>,
@@ -85,11 +95,12 @@ pub(crate) struct ExchangeHttpServer {
 
 impl ExchangeHttpServer {
     /// Binds `bind` and serves until [`Self::shutdown`].
-    pub(crate) async fn start(
+    pub async fn start(
         bind: SocketAddr,
         exchange: Arc<LocalExchange>,
         md: Option<Arc<dyn NixlMdHandler>>,
         leases: Option<Arc<dyn StagingLeaseHandler>>,
+        on_ready: Option<ReadyReceiver>,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind(bind)
             .await
@@ -101,7 +112,7 @@ impl ExchangeHttpServer {
         let server_shutdown = shutdown.clone();
         info!(%local_addr, "starting packed exchange HTTP server");
         let join = tokio::spawn(async move {
-            serve_loop(listener, exchange, md, leases, server_shutdown).await;
+            serve_loop(listener, exchange, md, leases, on_ready, server_shutdown).await;
         });
         Ok(Self {
             local_addr,
@@ -111,12 +122,12 @@ impl ExchangeHttpServer {
     }
 
     /// The bound address, including the ephemeral port when `bind` used port 0.
-    pub(crate) fn local_addr(&self) -> SocketAddr {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Stops accept and waits for the serve task.
-    pub(crate) async fn shutdown(self) {
+    pub async fn shutdown(self) {
         self.shutdown.cancel();
         let _ = self.join.await;
     }
@@ -125,12 +136,12 @@ impl ExchangeHttpServer {
 /// Peer HTTP port from a destination brpc port, using this CN's advertised http/brpc offset.
 /// Default CN ports are http 8040 / brpc 8060 (offset −20). The 2-CN study script may set
 /// `http_port = brpc_port + 1` instead; the wrapping arithmetic covers both.
-pub(crate) fn peer_http_port(dest_brpc: u16, local_http: u16, local_brpc: u16) -> u16 {
+pub fn peer_http_port(dest_brpc: u16, local_http: u16, local_brpc: u16) -> u16 {
     dest_brpc.wrapping_add(local_http.wrapping_sub(local_brpc))
 }
 
 /// POSTs this CN's agent metadata and returns the peer's.
-pub(crate) fn post_nixl_md(peer: SocketAddr, local_md: &[u8]) -> Result<Vec<u8>, String> {
+pub fn post_nixl_md(peer: SocketAddr, local_md: &[u8]) -> Result<Vec<u8>, String> {
     let (status, _headers, body) = http_post(peer, "/nixl-md", &[], local_md)?;
     if status != 200 {
         return Err(format!(
@@ -142,7 +153,7 @@ pub(crate) fn post_nixl_md(peer: SocketAddr, local_md: &[u8]) -> Result<Vec<u8>,
 }
 
 /// Leases `length` bytes of the peer's staging arena.
-pub(crate) fn post_staging_lease(peer: SocketAddr, length: u64) -> Result<RemoteLease, String> {
+pub fn post_staging_lease(peer: SocketAddr, length: u64) -> Result<RemoteLease, String> {
     let extra = vec![("X-Length".to_string(), length.to_string())];
     let (status, headers, body) = http_post(peer, "/staging-lease", &extra, &[])?;
     if status != 200 {
@@ -164,7 +175,7 @@ pub(crate) fn post_staging_lease(peer: SocketAddr, length: u64) -> Result<Remote
 }
 
 /// POSTs one packed hop frame to `peer`.
-pub(crate) fn post_exchange(peer: SocketAddr, frame: &PackedExchangeFrame) -> Result<(), String> {
+pub fn post_exchange(peer: SocketAddr, frame: &PackedExchangeFrame) -> Result<(), String> {
     let names = frame.names.join(",");
     let mut extra = vec![
         (
@@ -189,6 +200,22 @@ pub(crate) fn post_exchange(peer: SocketAddr, frame: &PackedExchangeFrame) -> Re
     if status != 200 {
         return Err(format!(
             "POST /exchange {peer} returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        ));
+    }
+    Ok(())
+}
+
+/// Releases a receiver-side canary lease without touching the exchange rendezvous.
+pub(crate) fn post_canary_release(peer: SocketAddr, offset: u64) -> Result<(), String> {
+    let extra = vec![
+        ("X-Canary".to_string(), "1".to_string()),
+        ("X-Offset".to_string(), offset.to_string()),
+    ];
+    let (status, _headers, body) = http_post(peer, "/exchange", &extra, &[])?;
+    if status != 200 {
+        return Err(format!(
+            "POST /exchange canary-release {peer} returned {status}: {}",
             String::from_utf8_lossy(&body)
         ));
     }
@@ -286,6 +313,7 @@ async fn serve_loop(
     exchange: Arc<LocalExchange>,
     md: Option<Arc<dyn NixlMdHandler>>,
     leases: Option<Arc<dyn StagingLeaseHandler>>,
+    on_ready: Option<ReadyReceiver>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -297,8 +325,11 @@ async fn serve_loop(
                         let exchange = exchange.clone();
                         let md = md.clone();
                         let leases = leases.clone();
+                        let on_ready = on_ready.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_connection(stream, exchange, md, leases).await {
+                            if let Err(err) = handle_connection(
+                                stream, exchange, md, leases, on_ready,
+                            ).await {
                                 warn!(error = %err, "exchange http request failed");
                             }
                         });
@@ -317,6 +348,7 @@ async fn handle_connection(
     exchange: Arc<LocalExchange>,
     md: Option<Arc<dyn NixlMdHandler>>,
     leases: Option<Arc<dyn StagingLeaseHandler>>,
+    on_ready: Option<ReadyReceiver>,
 ) -> Result<(), String> {
     let mut reader = AsyncBufReader::new(stream);
     let mut request_line = String::new();
@@ -354,7 +386,17 @@ async fn handle_connection(
         .map_err(|err| format!("read body: {err}"))?;
 
     match path {
-        Some("/exchange") => handle_exchange(reader.get_mut(), &headers, &body, exchange).await,
+        Some("/exchange") => {
+            handle_exchange(
+                reader.get_mut(),
+                &headers,
+                &body,
+                exchange,
+                leases.as_ref(),
+                on_ready.as_ref(),
+            )
+            .await
+        }
         Some("/nixl-md") => handle_nixl_md(reader.get_mut(), md.as_ref(), &body).await,
         Some("/staging-lease") => {
             handle_staging_lease(reader.get_mut(), &headers, leases.as_ref()).await
@@ -383,7 +425,38 @@ async fn handle_exchange(
     headers: &HashMap<String, String>,
     body: &[u8],
     exchange: Arc<LocalExchange>,
+    leases: Option<&Arc<dyn StagingLeaseHandler>>,
+    on_ready: Option<&ReadyReceiver>,
 ) -> Result<(), String> {
+    let canary = matches!(
+        headers.get("x-canary").map(String::as_str),
+        Some("1") | Some("true")
+    );
+    if canary {
+        let offset = match headers.get("x-offset") {
+            Some(value) => match value.parse::<u64>() {
+                Ok(offset) => offset,
+                Err(err) => {
+                    write_http_response(stream, 400, &[], format!("X-Offset: {err}").as_bytes())
+                        .await?;
+                    return Ok(());
+                }
+            },
+            None => {
+                write_http_response(stream, 400, &[], b"canary frame missing X-Offset").await?;
+                return Ok(());
+            }
+        };
+        let Some(leases) = leases else {
+            write_http_response(stream, 501, &[], b"staging-lease is not configured").await?;
+            return Ok(());
+        };
+        match leases.release(offset) {
+            Ok(()) => write_http_response(stream, 200, &[], b"ok").await?,
+            Err(err) => write_http_response(stream, 500, &[], err.as_bytes()).await?,
+        }
+        return Ok(());
+    }
     let frame = match parse_exchange_frame(headers, body) {
         Ok(frame) => frame,
         Err(err) => {
@@ -415,7 +488,12 @@ async fn handle_exchange(
         frame.names,
         batch,
     ) {
-        Ok(_) => write_http_response(stream, 200, &[], b"ok").await?,
+        Ok(ready) => {
+            write_http_response(stream, 200, &[], b"ok").await?;
+            if let (Some(ready), Some(on_ready)) = (ready, on_ready) {
+                on_ready(ready);
+            }
+        }
         Err(err) => write_http_response(stream, 500, &[], err.as_bytes()).await?,
     }
     Ok(())
@@ -649,6 +727,10 @@ mod tests {
                 offset,
             })
         }
+
+        fn release(&self, _offset: u64) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -660,10 +742,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_hop_delivers_packed_batch_and_eos_into_the_rendezvous() {
         let exchange = Arc::new(LocalExchange::default());
-        let server =
-            ExchangeHttpServer::start("127.0.0.1:0".parse().unwrap(), exchange.clone(), None, None)
-                .await
-                .unwrap();
+        let server = ExchangeHttpServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            exchange.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let peer = server.local_addr();
         let instance = FragmentInstanceId::from_halves(11, 22);
         let metadata = b"pack-meta".to_vec();
@@ -741,6 +828,7 @@ mod tests {
             exchange,
             Some(md.clone()),
             Some(leases),
+            None,
         )
         .await
         .unwrap();
