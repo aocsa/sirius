@@ -2,11 +2,13 @@
 # FE + two Sirius CNs on MIG ordinals 0 and 1 run:
 #   SELECT region, SUM(amount) FROM FILES("...") GROUP BY region
 # Shuffle is packed GPU bytes over NIXL WRITE into the peer staging arena.
-# Rows must match DuckDB (rel 1e-6). Tiny FILES() shards may all land on one CN;
-# the other CN still runs the merge. Require a non-empty packed hop
-# (`bytes=N` with N>0) and a matching receive on the peer. The log-only
-# first-contact bandwidth canary runs on the first outbound NIXL WRITE, so it
-# must appear on every CN that shipped — not on a CN that only received.
+# Control (Md, Lease, Packed) rides unpatched transmit_chunk on the advertised
+# brpc port — not POST /exchange. Rows must match DuckDB (rel 1e-6). Tiny
+# FILES() shards may all land on one CN; the other CN still runs the merge.
+# Require a non-empty packed hop (`bytes=N` with N>0), a matching receive on
+# the peer, and transmit_chunk in the logs. The log-only first-contact
+# bandwidth canary runs on the first outbound NIXL WRITE, so it must appear
+# on every CN that shipped — not on a CN that only received.
 #
 # Requires a release CN linked to libsirius (`cargo build --release -p sirius-starrocks-cn`).
 set -euo pipefail
@@ -328,7 +330,7 @@ echo "== running FILES() GROUP BY =="
 mysql_table -e "SET query_timeout = 600; ${QUERY}" | tee "$E2E/query.tsv"
 sleep 1
 
-echo "== comparing to DuckDB and checking packed NIXL hops =="
+echo "== comparing to DuckDB and checking packed NIXL hops over transmit_chunk =="
 "$PYTHON" - "$E2E" <<'PY'
 import math
 import re
@@ -387,6 +389,15 @@ received = {
 canaries = {name: bool(canary_re.search(text)) for name, text in logs.items()}
 if not any(shipped.values()):
     raise SystemExit(f"no non-empty remote packed hop logged (shipped={shipped})")
+http_leak = {
+    name: ("POST /exchange" in text or "starting packed exchange HTTP server" in text)
+    for name, text in logs.items()
+}
+if any(http_leak.values()):
+    raise SystemExit(f"HTTP exchange path still present (http_leak={http_leak})")
+tc = {name: "transmit_chunk" in text for name, text in logs.items()}
+if not any(tc.values()):
+    raise SystemExit(f"no transmit_chunk in CN logs (transmit_chunk={tc})")
 cross = (shipped["cn0"] and received["cn1"]) or (shipped["cn1"] and received["cn0"]) or (
     shipped["cn0"] and shipped["cn1"]
 )
@@ -404,10 +415,10 @@ if missing_canary:
 if not any(canaries.values()):
     raise SystemExit(f"no nixl bandwidth canary logged (canaries={canaries})")
 print(
-    "cross-CN packed NIXL hop:",
-    {"shipped": shipped, "received": received, "canaries": canaries},
+    "cross-CN packed NIXL hop over transmit_chunk:",
+    {"shipped": shipped, "received": received, "canaries": canaries, "transmit_chunk": tc},
 )
 PY
 
 dump_logs_on_fail=0
-echo "OK: 2-CN FILES() GROUP BY matched DuckDB with a real packed NIXL shuffle"
+echo "OK: 2-CN FILES() GROUP BY matched DuckDB with a packed NIXL shuffle over transmit_chunk"
