@@ -52,6 +52,7 @@ mod exchange_http;
 mod file_schema;
 mod fragment_executor;
 mod local_exchange;
+mod nixl_chunk;
 mod nixl_transport;
 mod parked_registry;
 mod proto;
