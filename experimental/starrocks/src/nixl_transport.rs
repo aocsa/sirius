@@ -7,10 +7,9 @@
 //! and are gated on the `nixl-transport` feature.
 //!
 //! This commit brings the agent up, registers the engine's `cudaMalloc` staging arena as
-//! VRAM, caches local agent metadata for a later `/nixl-md` route, and loads a peer's
-//! metadata on the agent thread. Packed send (`SendFragment`) drains a parked sender:
-//! lease, WRITE, HTTP frame, release. Session warmup, FE peer discovery, and brpc packed
-//! RPCs are not ported.
+//! VRAM, caches local agent metadata for kind Md, and loads a peer's metadata on the
+//! agent thread. Packed send (`SendFragment`) drains a parked sender: lease, WRITE,
+//! `transmit_chunk` Packed frame, release.
 //!
 //! ONE CN PER GPU: the staging arena is registered with nixl as CUDA device 0 of this
 //! process, because that is where the engine allocates it. Device 0 is the engine's GPU
@@ -40,7 +39,7 @@ const ENV_HINT: &str = "export TOOLS_DIR=/home/ubuntu/sirius-wt/tools and source
 #[derive(Clone, Debug)]
 #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 pub(crate) struct RemoteSendSpec {
-    /// Peer packed-exchange HTTP address.
+    /// Peer brpc address (unpatched `transmit_chunk` control).
     pub(crate) peer: SocketAddr,
     /// Peer nixl agent name (`{advertise_host}:{brpc_port}`).
     pub(crate) peer_agent_name: String,
@@ -82,7 +81,7 @@ pub struct NixlTransport {
     requests: Mutex<Option<Sender<TransportRequest>>>,
     /// Transport thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
-    /// Cached `get_local_md` blob. The later `/nixl-md` outbound leg serves this from the
+    /// Cached `get_local_md` blob. The outbound Md leg serves this from the
     /// caller's thread; only `load_remote_md` goes through the agent thread.
     #[allow(dead_code)]
     local_md: Mutex<Option<Arc<Vec<u8>>>>,
@@ -137,7 +136,7 @@ impl NixlTransport {
     }
 
     /// Packed send path: export parked batches, WRITE them into a peer lease, announce the
-    /// frame over HTTP.
+    /// frame over `transmit_chunk`.
     #[cfg(feature = "nixl-transport")]
     pub(crate) fn send_fragment(
         &self,
@@ -184,7 +183,7 @@ impl Drop for NixlTransport {
 }
 
 #[cfg(feature = "nixl-transport")]
-impl crate::exchange_http::NixlMdHandler for NixlTransport {
+impl crate::nixl_chunk::NixlMdHandler for NixlTransport {
     fn on_peer_md(&self, peer_metadata: &[u8]) -> Result<Vec<u8>, String> {
         self.load_peer_md(peer_metadata)?;
         Ok((*self.local_md()?).to_vec())
@@ -466,11 +465,9 @@ mod agent_tier {
             spec: &RemoteSendSpec,
             executor: &dyn FragmentExecutor,
         ) -> Result<(), String> {
-            use crate::exchange_http::{
-                PackedExchangeFrame, post_exchange, post_nixl_md, post_staging_lease,
-            };
+            use crate::nixl_chunk::{PackedExchangeFrame, exchange_md, request_staging_lease};
 
-            let peer_md = post_nixl_md(spec.peer, &self.local_md)?;
+            let peer_md = exchange_md(spec.peer, &self.local_md)?;
             let remote_agent = self.load_peer_md(&peer_md)?;
             if remote_agent != spec.peer_agent_name {
                 tracing::warn!(
@@ -493,7 +490,7 @@ mod agent_tier {
                         let metadata = std::mem::take(&mut batch.metadata);
                         let sent = (|| {
                             let (offset, length) = if batch.len > 0 {
-                                let lease = post_staging_lease(spec.peer, batch.len)?;
+                                let lease = request_staging_lease(spec.peer, batch.len)?;
                                 write_and_wait(
                                     &self.agent,
                                     &remote_agent,
@@ -505,21 +502,19 @@ mod agent_tier {
                             } else {
                                 (0, 0)
                             };
-                            post_exchange(
-                                spec.peer,
-                                &PackedExchangeFrame {
-                                    fragment_instance_id: spec.slot.fragment_instance_id,
-                                    dest_stream: spec.dest_stream,
-                                    sender_id: spec.sender_id,
-                                    seq,
-                                    eos: false,
-                                    names: spec.names.clone(),
-                                    offset,
-                                    length,
-                                    rows: batch.rows,
-                                    metadata,
-                                },
-                            )?;
+                            PackedExchangeFrame {
+                                fragment_instance_id: spec.slot.fragment_instance_id,
+                                dest_stream: spec.dest_stream,
+                                sender_id: spec.sender_id,
+                                seq,
+                                eos: false,
+                                names: spec.names.clone(),
+                                offset,
+                                length,
+                                rows: batch.rows,
+                                metadata,
+                            }
+                            .transmit_blocking(spec.peer)?;
                             Ok::<_, String>((offset, length))
                         })();
                         if batch.len > 0
@@ -538,21 +533,19 @@ mod agent_tier {
                         seq += 1;
                     }
                     None => {
-                        post_exchange(
-                            spec.peer,
-                            &PackedExchangeFrame {
-                                fragment_instance_id: spec.slot.fragment_instance_id,
-                                dest_stream: spec.dest_stream,
-                                sender_id: spec.sender_id,
-                                seq,
-                                eos: true,
-                                names: spec.names.clone(),
-                                offset: 0,
-                                length: 0,
-                                rows: None,
-                                metadata: Vec::new(),
-                            },
-                        )?;
+                        PackedExchangeFrame {
+                            fragment_instance_id: spec.slot.fragment_instance_id,
+                            dest_stream: spec.dest_stream,
+                            sender_id: spec.sender_id,
+                            seq,
+                            eos: true,
+                            names: spec.names.clone(),
+                            offset: 0,
+                            length: 0,
+                            rows: None,
+                            metadata: Vec::new(),
+                        }
+                        .transmit_blocking(spec.peer)?;
                         executor.drop_parked(spec.slot)?;
                         info!(
                             peer = %spec.peer,
@@ -575,14 +568,14 @@ mod agent_tier {
             executor: &dyn FragmentExecutor,
             remote_agent: &str,
         ) -> Result<(), String> {
-            use crate::exchange_http::{post_canary_release, post_staging_lease};
+            use crate::nixl_chunk::{canary_release, request_staging_lease};
 
             let nbytes = canary_bytes();
             let local_offset = executor
                 .staging_lease(nbytes)
                 .map_err(|err| format!("failed to lease canary staging bytes locally: {err}"))?;
             let result = (|| {
-                let lease = post_staging_lease(spec.peer, nbytes)?;
+                let lease = request_staging_lease(spec.peer, nbytes)?;
                 let local_addr = self.staging_base + local_offset;
                 bandwidth_canary(
                     &self.agent,
@@ -591,7 +584,7 @@ mod agent_tier {
                     lease.remote_addr,
                     nbytes,
                 )?;
-                post_canary_release(spec.peer, lease.offset)?;
+                canary_release(spec.peer, lease.offset)?;
                 Ok(())
             })();
             if let Err(err) = executor.staging_release(local_offset) {

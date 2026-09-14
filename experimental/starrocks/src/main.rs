@@ -8,10 +8,10 @@ use sirius_starrocks_cn::SiriusEngine;
 #[cfg(not(feature = "sirius-engine"))]
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
-    BackendServer, BrpcServer, ComputeNodeConfig, ExchangeHttpServer, ExchangeIdentity, FeConfig,
-    FragmentExecutor, HeartbeatServer, LocalExchange, NixlMdHandler, SharedHeartbeatState,
-    SiriusComputeNodeService, StagingLeaseHandler, register_node, report_to_frontend_once,
-    start_backend_server, start_heartbeat_server,
+    BackendServer, BrpcServer, ComputeNodeConfig, ExchangeIdentity, FeConfig, FragmentExecutor,
+    HeartbeatServer, LocalExchange, NixlMdHandler, SharedHeartbeatState, SiriusComputeNodeService,
+    StagingLeaseHandler, register_node, report_to_frontend_once, start_backend_server,
+    start_heartbeat_server,
 };
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -123,17 +123,7 @@ impl Args {
         #[cfg(not(feature = "nixl-transport"))]
         let md: Option<Arc<dyn NixlMdHandler>> = None;
         let leases: Option<Arc<dyn StagingLeaseHandler>> = Some(Arc::new(executor.clone()));
-        let service = service.with_nixl_control(md.clone(), leases.clone());
-        let http_bind = format!(
-            "{}:{}",
-            self.compute_node.bind_host, self.compute_node.http_port
-        )
-        .parse()
-        .map_err(|err| anyhow!("invalid packed-exchange HTTP bind address: {err}"))?;
-        let exchange_server = service
-            .start_exchange_http(http_bind, exchange, md, leases)
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let service = service.with_nixl_control(md, leases);
 
         let state = SharedHeartbeatState::new();
 
@@ -165,14 +155,13 @@ impl Args {
             heartbeat_server,
             backend_server,
             brpc_runtime,
-            exchange_server,
             registration_task,
             report_task,
         }
         .wait_until_shutdown()
         .await;
 
-        // HTTP and BRPC have stopped, so no in-flight hop can touch the agent or engine.
+        // BRPC has stopped, so no in-flight hop can touch the agent or engine.
         #[cfg(feature = "nixl-transport")]
         {
             info!("tearing down nixl transport");
@@ -350,8 +339,6 @@ struct RunningComputeNode {
     backend_server: BackendServer,
     /// BRPC runtime task and shutdown token.
     brpc_runtime: BrpcRuntime,
-    /// Packed-exchange HTTP listener (NIXL control plane + hop frames).
-    exchange_server: ExchangeHttpServer,
     /// Background task that refreshes FE registration when heartbeats are stale.
     registration_task: tokio::task::JoinHandle<()>,
     /// Background task that reports empty CN inventory to FE.
@@ -365,7 +352,6 @@ impl RunningComputeNode {
         let heartbeat_shutdown = self.heartbeat_server.shutdown_handle();
         let backend_shutdown = self.backend_server.shutdown_handle();
         let brpc_shutdown = self.brpc_runtime.shutdown.clone();
-        let exchange_server = self.exchange_server;
 
         // Drive every server's join as a labelled task so the first exit can be observed in the
         // select and the rest drained with one loop, instead of repeating the join logic per arm.
@@ -417,7 +403,6 @@ impl RunningComputeNode {
         heartbeat_shutdown.shutdown();
         backend_shutdown.shutdown();
         brpc_shutdown.cancel();
-        exchange_server.shutdown().await;
 
         let mut result = outcome;
         while let Some(joined) = servers.join_next().await {

@@ -33,7 +33,7 @@ pub struct SenderSlot {
 /// by a NIXL WRITE). `len == 0` means no lease exists for this batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedBatch {
-    /// Host-side cudf pack metadata (travels on `POST /exchange`; the device payload does not).
+    /// Host-side cudf pack metadata (travels on `transmit_chunk` kind Packed; the device payload does not).
     pub metadata: Vec<u8>,
     /// Byte offset of the packed payload from the arena base. `0` with `len == 0` means no
     /// lease exists for this batch.

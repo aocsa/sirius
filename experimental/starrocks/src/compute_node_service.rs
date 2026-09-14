@@ -3,15 +3,13 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::exchange_http::{
-    ExchangeHttpServer, NixlMdHandler, RemoteLease, StagingLeaseHandler, peer_http_port,
-};
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot, StagedBatch};
 use crate::local_exchange::{
     ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, SenderSource,
 };
+use crate::nixl_chunk::{NixlMdHandler, StagingLeaseHandler};
 use crate::nixl_transport::{NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
@@ -142,7 +140,7 @@ impl SiriusComputeNodeService {
     }
 
     /// Injects Md / Lease handlers used by `transmit_chunk` (tests with a stub arena; production
-    /// can share the same objects the HTTP control plane already holds).
+    /// shares the transport and executor already held by this service).
     pub fn with_nixl_control(
         mut self,
         md: Option<Arc<dyn NixlMdHandler>>,
@@ -172,36 +170,62 @@ impl SiriusComputeNodeService {
     }
 
     /// Decodes an SRNX `transmit_chunk` attachment. Md/Lease/CanaryRelease never call
-    /// [`LocalExchange::push_remote_frame`]; Packed is rejected until the hop moves off HTTP.
+    /// [`LocalExchange::push_remote_frame`]; Packed/EOS does.
     fn handle_nixl_chunk(
         &self,
         request: &PTransmitChunkParams,
         attachment: &[u8],
-    ) -> std::result::Result<Vec<u8>, String> {
+    ) -> std::result::Result<(Vec<u8>, Option<ReadyFragment>), String> {
         crate::nixl_chunk::reject_native_chunk(request)?;
         match crate::nixl_chunk::NixlEnvelope::decode(attachment)? {
-            crate::nixl_chunk::NixlEnvelope::Md(peer_md) => self.md_handler()?.on_peer_md(&peer_md),
+            crate::nixl_chunk::NixlEnvelope::Md(peer_md) => {
+                Ok((self.md_handler()?.on_peer_md(&peer_md)?, None))
+            }
             crate::nixl_chunk::NixlEnvelope::Lease { length } => {
                 let lease = self.lease_handler().lease(length)?;
-                Ok(crate::nixl_chunk::encode_lease_reply(
-                    lease.remote_addr,
-                    lease.offset,
+                Ok((
+                    crate::nixl_chunk::encode_lease_reply(lease.remote_addr, lease.offset),
+                    None,
                 ))
             }
             crate::nixl_chunk::NixlEnvelope::CanaryRelease { offset } => {
                 self.lease_handler().release(offset)?;
-                Ok(Vec::new())
+                Ok((Vec::new(), None))
             }
-            crate::nixl_chunk::NixlEnvelope::Packed { .. } => Err(
-                "packed transmit_chunk is not wired yet; Packed frames still travel over HTTP \
-                 POST /exchange"
-                    .to_string(),
-            ),
+            crate::nixl_chunk::NixlEnvelope::Packed {
+                offset,
+                length,
+                rows,
+                names,
+                metadata,
+            } => {
+                let ready = self.ingest_packed(packed_frame_from_request(
+                    request, offset, length, rows, names, metadata,
+                )?)?;
+                Ok((Vec::new(), ready))
+            }
         }
     }
 
-    /// Runs a receiver whose sender set just completed, on a helper thread so the HTTP
-    /// handler can return 200 without waiting for GPU work.
+    fn ingest_packed(
+        &self,
+        frame: crate::nixl_chunk::PackedExchangeFrame,
+    ) -> std::result::Result<Option<ReadyFragment>, String> {
+        self.exchanges.push_remote_frame(
+            ExchangeKey {
+                fragment_instance_id: frame.fragment_instance_id,
+                node_id: frame.dest_stream,
+            },
+            frame.sender_id,
+            frame.seq,
+            frame.eos,
+            frame.names.clone(),
+            frame.staged_batch(),
+        )
+    }
+
+    /// Runs a receiver whose sender set just completed, on a helper thread so the
+    /// `transmit_chunk` handler can return status without waiting for GPU work.
     pub(crate) fn dispatch_ready_async(&self, ready: ReadyFragment) {
         let service = self.clone();
         let _ = std::thread::Builder::new()
@@ -211,25 +235,6 @@ impl SiriusComputeNodeService {
                     warn!(error = %err, "ready receiver from packed hop failed");
                 }
             });
-    }
-
-    /// Serves the packed-exchange HTTP routes on `bind`, dispatching completed receivers.
-    pub async fn start_exchange_http(
-        &self,
-        bind: SocketAddr,
-        exchange: Arc<LocalExchange>,
-        md: Option<Arc<dyn NixlMdHandler>>,
-        leases: Option<Arc<dyn StagingLeaseHandler>>,
-    ) -> Result<ExchangeHttpServer, String> {
-        let service = self.clone();
-        ExchangeHttpServer::start(
-            bind,
-            exchange,
-            md,
-            leases,
-            Some(Arc::new(move |ready| service.dispatch_ready_async(ready))),
-        )
-        .await
     }
 }
 
@@ -373,8 +378,7 @@ impl PInternalService for SiriusComputeNodeService {
         Ok(result.into())
     }
 
-    /// Serves NIXL control on unpatched `transmit_chunk`. Md and Lease reply in the attachment;
-    /// Packed is not ingested here yet (HTTP `POST /exchange` still carries frames).
+    /// Serves NIXL control and packed-frame announce on unpatched `transmit_chunk`.
     #[instrument(skip_all)]
     async fn transmit_chunk(
         &self,
@@ -382,10 +386,15 @@ impl PInternalService for SiriusComputeNodeService {
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PTransmitChunkResult>, crate::prpc::Error> {
         match self.handle_nixl_chunk(&request, &attachment) {
-            Ok(reply_attachment) => Ok(crate::prpc::Reply::with_attachment(
-                Self::transmit_chunk_result(Self::ok_status()),
-                reply_attachment,
-            )),
+            Ok((reply_attachment, ready)) => {
+                if let Some(ready) = ready {
+                    self.dispatch_ready_async(ready);
+                }
+                Ok(crate::prpc::Reply::with_attachment(
+                    Self::transmit_chunk_result(Self::ok_status()),
+                    reply_attachment,
+                ))
+            }
             Err(err) => Ok(Self::transmit_chunk_result(Self::internal_error(err)).into()),
         }
     }
@@ -678,8 +687,7 @@ impl SiriusComputeNodeService {
                  nixl transport"
             )
         })?;
-        let http_port = peer_http_port(brpc_port, self.identity.http_port, self.identity.brpc_port);
-        let peer = lookup_peer(host, http_port)?;
+        let peer = lookup_peer(host, brpc_port)?;
         transport.send_fragment(
             RemoteSendSpec {
                 peer,
@@ -1058,6 +1066,44 @@ fn lookup_peer(host: &str, port: u16) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("exchange peer {host}:{port} resolved to no addresses"))
 }
 
+fn packed_frame_from_request(
+    request: &PTransmitChunkParams,
+    offset: u64,
+    length: u64,
+    rows: u64,
+    names: Vec<String>,
+    metadata: Vec<u8>,
+) -> Result<crate::nixl_chunk::PackedExchangeFrame, String> {
+    let finst = request
+        .finst_id
+        .as_ref()
+        .ok_or_else(|| "packed transmit_chunk is missing finst_id".to_string())?;
+    Ok(crate::nixl_chunk::PackedExchangeFrame {
+        fragment_instance_id: FragmentInstanceId::from(finst),
+        dest_stream: request
+            .node_id
+            .ok_or_else(|| "packed transmit_chunk is missing node_id".to_string())?,
+        sender_id: request
+            .sender_id
+            .ok_or_else(|| "packed transmit_chunk is missing sender_id".to_string())?,
+        seq: request
+            .sequence
+            .ok_or_else(|| "packed transmit_chunk is missing sequence".to_string())?,
+        eos: request
+            .eos
+            .ok_or_else(|| "packed transmit_chunk is missing eos".to_string())?,
+        names,
+        offset,
+        length,
+        rows: if length == 0 && metadata.is_empty() {
+            None
+        } else {
+            Some(rows)
+        },
+        metadata,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1111,11 +1157,11 @@ mod tests {
     }
 
     impl StagingLeaseHandler for FakeLeases {
-        fn lease(&self, length: u64) -> Result<RemoteLease, String> {
+        fn lease(&self, length: u64) -> Result<crate::nixl_chunk::RemoteLease, String> {
             let mut next = self.next.lock().unwrap();
             let offset = *next;
             *next += length;
-            Ok(RemoteLease {
+            Ok(crate::nixl_chunk::RemoteLease {
                 remote_addr: self.base + offset,
                 offset,
             })
@@ -1127,7 +1173,12 @@ mod tests {
         }
     }
 
-    fn nixl_control_service() -> (SiriusComputeNodeService, Arc<FakeMd>, Arc<FakeLeases>) {
+    fn nixl_control_service() -> (
+        SiriusComputeNodeService,
+        Arc<FakeMd>,
+        Arc<FakeLeases>,
+        Arc<LocalExchange>,
+    ) {
         let md = Arc::new(FakeMd {
             mine: b"local-md".to_vec(),
             loaded: std::sync::Mutex::new(Vec::new()),
@@ -1137,14 +1188,15 @@ mod tests {
             next: std::sync::Mutex::new(0),
             released: std::sync::Mutex::new(Vec::new()),
         });
+        let exchange = Arc::new(LocalExchange::default());
         let service = SiriusComputeNodeService::with_executor_and_exchange(
             Arc::new(StubExecutor),
-            Arc::new(LocalExchange::default()),
+            exchange.clone(),
             ExchangeIdentity::default(),
             None,
         )
         .with_nixl_control(Some(md.clone()), Some(leases.clone()));
-        (service, md, leases)
+        (service, md, leases, exchange)
     }
 
     fn call_transmit(
@@ -1166,7 +1218,7 @@ mod tests {
 
     #[test]
     fn transmit_chunk_md_returns_local_blob_without_ingesting() {
-        let (service, md, _) = nixl_control_service();
+        let (service, md, _, _) = nixl_control_service();
         let (result, attachment) = call_transmit(
             &service,
             crate::nixl_chunk::control_params(),
@@ -1179,7 +1231,7 @@ mod tests {
 
     #[test]
     fn transmit_chunk_lease_replies_with_addr_and_offset() {
-        let (service, _, _) = nixl_control_service();
+        let (service, _, _, _) = nixl_control_service();
         let (result, attachment) = call_transmit(
             &service,
             crate::nixl_chunk::control_params(),
@@ -1204,7 +1256,7 @@ mod tests {
 
     #[test]
     fn transmit_chunk_canary_release_does_not_ingest() {
-        let (service, _, leases) = nixl_control_service();
+        let (service, _, leases, _) = nixl_control_service();
         let (result, attachment) = call_transmit(
             &service,
             crate::nixl_chunk::control_params(),
@@ -1216,33 +1268,67 @@ mod tests {
     }
 
     #[test]
-    fn transmit_chunk_packed_is_not_wired_yet() {
-        let (service, _, _) = nixl_control_service();
-        let (result, _) = call_transmit(
-            &service,
-            crate::nixl_chunk::packed_params(FragmentInstanceId::from_halves(1, 2), 7, 0, 0, false),
-            crate::nixl_chunk::NixlEnvelope::Packed {
-                offset: 0,
-                length: 0,
-                rows: 0,
-                names: vec!["id".into()],
-                metadata: Vec::new(),
-            }
-            .encode(),
-        );
-        assert_eq!(
-            result.status.as_ref().unwrap().status_code,
-            TStatusCode::INTERNAL_ERROR.0
-        );
-        assert!(
-            result.status.as_ref().unwrap().error_msgs[0].contains("not wired yet"),
-            "{result:?}"
-        );
+    fn transmit_chunk_packed_delivers_staged_batch_and_eos_into_the_rendezvous() {
+        let (service, _, _, exchange) = nixl_control_service();
+        let instance = FragmentInstanceId::from_halves(11, 22);
+        let metadata = b"pack-meta".to_vec();
+        let data = crate::nixl_chunk::PackedExchangeFrame {
+            fragment_instance_id: instance,
+            dest_stream: 7,
+            sender_id: 0,
+            seq: 0,
+            eos: false,
+            names: vec!["id".to_string()],
+            offset: 4096,
+            length: 32,
+            rows: Some(5),
+            metadata: metadata.clone(),
+        };
+        let (result, attachment) = call_transmit(&service, data.params(), data.envelope().encode());
+        assert_eq!(result.status.unwrap().status_code, TStatusCode::OK.0);
+        assert!(attachment.is_empty());
+
+        let eos = crate::nixl_chunk::PackedExchangeFrame {
+            fragment_instance_id: instance,
+            dest_stream: 7,
+            sender_id: 0,
+            seq: 1,
+            eos: true,
+            names: vec!["id".to_string()],
+            offset: 0,
+            length: 0,
+            rows: None,
+            metadata: Vec::new(),
+        };
+        let (result, _) = call_transmit(&service, eos.params(), eos.envelope().encode());
+        assert_eq!(result.status.unwrap().status_code, TStatusCode::OK.0);
+
+        let ready = exchange
+            .register_receiver(instance, vec![(7, 1)], fragment_params(None, None))
+            .unwrap()
+            .expect("eos already arrived over transmit_chunk");
+        let SenderSource::Remote {
+            names,
+            sender_id,
+            batches,
+            closed,
+        } = &ready.inputs[0].sources[0]
+        else {
+            panic!("expected a remote source");
+        };
+        assert_eq!(names, &["id".to_string()]);
+        assert_eq!(*sender_id, 0);
+        assert!(*closed);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].metadata, metadata);
+        assert_eq!(batches[0].offset, 4096);
+        assert_eq!(batches[0].len, 32);
+        assert_eq!(batches[0].rows, Some(5));
     }
 
     #[test]
     fn transmit_chunk_rejects_native_chunkpb() {
-        let (service, _, _) = nixl_control_service();
+        let (service, _, _, _) = nixl_control_service();
         let mut params = crate::nixl_chunk::control_params();
         params
             .chunks
@@ -1263,7 +1349,7 @@ mod tests {
         use crate::brpc::BrpcServer;
         use tokio_util::sync::CancellationToken;
 
-        let (service, md, _) = nixl_control_service();
+        let (service, md, _, _) = nixl_control_service();
         let listener = match BrpcServer::bind("127.0.0.1", 0) {
             Ok(listener) => listener,
             Err(err) if is_permission_denied(&err) => return,

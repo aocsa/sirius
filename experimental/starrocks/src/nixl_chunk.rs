@@ -7,10 +7,12 @@
 //! a stock BE cannot be misread as Sirius.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
 
+use crate::fragment_executor::{FragmentExecutor, StagedBatch};
 use crate::proto::starrocks::{
     PTransmitChunkParams, PTransmitChunkResult,
     p_internal_service_brpc::{SERVICE_NAME, methods},
@@ -317,6 +319,129 @@ fn require_ok_status(body: &[u8]) -> Result<(), String> {
         }),
         None => Err("transmit_chunk returned no status".to_string()),
     }
+}
+
+/// Receiver-side arena lease returned by kind Lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteLease {
+    pub(crate) remote_addr: u64,
+    pub(crate) offset: u64,
+}
+
+/// Loads a peer's NIXL metadata and returns this CN's cached local blob.
+pub trait NixlMdHandler: Send + Sync + std::fmt::Debug {
+    fn on_peer_md(&self, peer_metadata: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// Grants a lease of this CN's staging arena for a peer WRITE.
+pub trait StagingLeaseHandler: Send + Sync + std::fmt::Debug {
+    fn lease(&self, length: u64) -> Result<RemoteLease, String>;
+    /// Returns the lease at `offset`. Used by the log-only bandwidth canary so the
+    /// remote probe does not sit in the exchange rendezvous.
+    fn release(&self, offset: u64) -> Result<(), String>;
+}
+
+impl StagingLeaseHandler for Arc<dyn FragmentExecutor> {
+    fn lease(&self, length: u64) -> Result<RemoteLease, String> {
+        let (base, _) = self.staging_info()?;
+        let offset = self.staging_lease(length)?;
+        Ok(RemoteLease {
+            remote_addr: base + offset,
+            offset,
+        })
+    }
+
+    fn release(&self, offset: u64) -> Result<(), String> {
+        self.staging_release(offset)
+    }
+}
+
+/// One packed hop frame announced over `transmit_chunk` after a NIXL WRITE.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PackedExchangeFrame {
+    pub(crate) fragment_instance_id: FragmentInstanceId,
+    pub(crate) dest_stream: i32,
+    pub(crate) sender_id: i32,
+    pub(crate) seq: i64,
+    pub(crate) eos: bool,
+    pub(crate) names: Vec<String>,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) rows: Option<u64>,
+    /// Cudf pack metadata. Empty when `eos` or `length == 0`.
+    pub(crate) metadata: Vec<u8>,
+}
+
+impl PackedExchangeFrame {
+    pub(crate) fn envelope(&self) -> NixlEnvelope {
+        NixlEnvelope::Packed {
+            offset: self.offset,
+            length: self.length,
+            rows: self.rows.unwrap_or(0),
+            names: self.names.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    pub(crate) fn params(&self) -> PTransmitChunkParams {
+        packed_params(
+            self.fragment_instance_id,
+            self.dest_stream,
+            self.sender_id,
+            self.seq,
+            self.eos,
+        )
+    }
+
+    /// Announces this frame on the peer's brpc `transmit_chunk`. Empty response attachment.
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+    pub(crate) fn transmit_blocking(&self, peer: SocketAddr) -> Result<(), String> {
+        let _ = transmit_envelope_blocking(peer, self.params(), &self.envelope())?;
+        Ok(())
+    }
+
+    /// Host metadata plus the receiver-side lease this WRITE filled. `None` on a pure EOS frame.
+    pub(crate) fn staged_batch(&self) -> Option<StagedBatch> {
+        if self.length == 0 && self.metadata.is_empty() && self.eos {
+            None
+        } else {
+            Some(StagedBatch {
+                metadata: self.metadata.clone(),
+                offset: self.offset,
+                len: self.length,
+                rows: self.rows,
+            })
+        }
+    }
+}
+
+/// Exchanges this CN's agent metadata for the peer's (kind Md).
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) fn exchange_md(peer: SocketAddr, local_md: &[u8]) -> Result<Vec<u8>, String> {
+    transmit_envelope_blocking(peer, control_params(), &NixlEnvelope::Md(local_md.to_vec()))
+}
+
+/// Leases `length` bytes of the peer's staging arena (kind Lease).
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) fn request_staging_lease(peer: SocketAddr, length: u64) -> Result<RemoteLease, String> {
+    let attachment =
+        transmit_envelope_blocking(peer, control_params(), &NixlEnvelope::Lease { length })?;
+    let (remote_addr, offset) = decode_lease_reply(&attachment)?;
+    Ok(RemoteLease {
+        remote_addr,
+        offset,
+    })
+}
+
+/// Releases a receiver-side canary lease without touching the exchange rendezvous.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) fn canary_release(peer: SocketAddr, offset: u64) -> Result<(), String> {
+    let _ = transmit_envelope_blocking(
+        peer,
+        control_params(),
+        &NixlEnvelope::CanaryRelease { offset },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
