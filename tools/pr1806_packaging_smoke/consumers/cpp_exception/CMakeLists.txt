@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
+project(cpp_exception LANGUAGES CXX)
+find_package(sirius REQUIRED)
+add_executable(use_exception use_exception.cpp)
+target_link_libraries(use_exception PRIVATE sirius::sirius)

@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
+project(cpp_ffi LANGUAGES CXX)
+find_package(sirius REQUIRED)
+add_executable(use_ffi use_ffi.cpp)
+target_link_libraries(use_ffi PRIVATE sirius::sirius)
