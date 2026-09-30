@@ -194,9 +194,9 @@ pub fn stream_view_name(stream_id: u64) -> String {
 /// **none** is a result fragment and produces Arrow via [`Fragment::result_to_arrow`].
 ///
 /// Calls are ordered: declare, [`build`](Fragment::build), fill every sender,
-/// [`run`](Fragment::run), then drain. `build` opens a query lifecycle on the shared engine that
-/// `run` closes, so one fragment at a time may sit between the two — dropping a built-but-unrun
-/// fragment closes the lifecycle for you.
+/// [`run`](Fragment::run), then drain. Any number of fragments may be built before any runs, in
+/// any order that respects `relay_from` (a source runs before its receiver's relay); dropping a
+/// built-but-unrun fragment is safe.
 ///
 /// Borrows the [`SiriusContext`] that created it, so a fragment cannot outlive its engine.
 pub struct Fragment<'ctx> {
@@ -269,7 +269,7 @@ impl Fragment<'_> {
         self.inner.pin_mut().declare_output_hash_key(column_index)
     }
 
-    /// Plan `substrait_plan` against the declared streams and open the fragment's query lifecycle.
+    /// Plan `substrait_plan` against the declared streams.
     pub fn build(&mut self, substrait_plan: &[u8]) -> Result<(), Exception> {
         let_cxx_string!(plan = substrait_plan);
         self.inner.pin_mut().build(&plan)
@@ -362,7 +362,7 @@ impl Fragment<'_> {
         self.inner.pin_mut().close_input(stream_id, sender_id)
     }
 
-    /// Execute the fragment and close its query lifecycle. Blocks until its pipelines finish.
+    /// Execute the fragment. Blocks until its pipelines finish. Every input must be closed first.
     pub fn run(&mut self) -> Result<(), Exception> {
         self.inner.pin_mut().run()
     }

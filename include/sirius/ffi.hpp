@@ -15,8 +15,11 @@
  */
 
 /*
- * Public C++ surface for embedding Sirius (FFI use cases, e.g. the Rust
- * `sirius-sys` crate). Intentionally lightweight — a small RAII wrapper that
+ * Public C++ surface for embedding Sirius (`sirius::ffi::Context` plus
+ * `Fragment`). The embedder is the process that links it: Rust `sirius-sys`
+ * or C++ tests.
+ *
+ * Intentionally lightweight — a small RAII wrapper that
  * forward-declares the heavy internal type — so consumers bind it without
  * pulling in sirius_context.hpp (and its cudf/rmm/duckdb includes).
  *
@@ -51,7 +54,7 @@ class StagingArena;
 /// `duckdb::SiriusContext`) and an embedded in-process DuckDB whose connection
 /// has that engine registered as the `sirius_state` so the GPU executor can find
 /// it. DuckDB is used only to lower a Substrait plan to a DuckDB
-/// `LogicalOperator` (the translation step) and to host the catalog — execution
+/// `LogicalOperator` (the translation step) and to own the catalog. Execution
 /// runs directly on the Sirius engine, not through DuckDB's query pipeline.
 ///
 /// Held from Rust via `cxx::UniquePtr`; created by `make_context()` /
@@ -113,13 +116,13 @@ class SIRIUS_FFI_EXPORT Context {
 
 /// Thread-safe handle to a [`Context`]'s exchange staging arena.
 ///
-/// Why this exists: the `Context` is single-threaded by contract, so its `staging_*` methods can
-/// only be served by the thread that owns it — in an embedding that thread also runs fragments,
-/// so a long (or wedged) `Fragment::run` starves every lease request arriving from transport
-/// threads and stalls the peers' cross-node exchanges with it. The arena itself needs no such
-/// funnel: `lease`/`release` serialize on the arena's internal mutex and make **no CUDA calls**
-/// (the region is one `cudaMalloc` owned for the arena's lifetime), so any thread may call any
-/// method here, concurrently with the context thread's own staging traffic.
+/// Why this exists: the embedder drives a `Context` from one owning thread, and build()/run()
+/// serialize on its connection, so its `staging_*` methods are served by that thread — which in
+/// an embedding also runs fragments, so a long (or wedged) `Fragment::run` starves every lease
+/// request arriving from transport threads and stalls the peers' cross-node exchanges with it. The
+/// arena itself needs no such funnel: `lease`/`release` serialize on the arena's internal mutex and
+/// make **no CUDA calls** (the region is one `cudaMalloc` owned for the arena's lifetime), so any
+/// thread may call any method here, concurrently with the context thread's own staging traffic.
 ///
 /// This handle shares ownership of the ONE allocator the context uses, so the two sides can
 /// never double-book a region, and the handle stays valid even if the `Context` is torn down
@@ -167,9 +170,11 @@ class SIRIUS_FFI_EXPORT StagingArena {
 /// relay_from / export_packed on an intermediate fragment, or result_to_arrow on a
 /// result fragment.
 ///
-/// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
-/// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
-/// build() but before run() closes the lifecycle itself.
+/// Any number of fragments may be built before any runs, and run in any order that respects
+/// relay_from (a source runs before its receiver's relay). build(), run() and
+/// Context::execute_substrait execute one at a time per Context: a concurrent call waits for
+/// the one in progress. run() and destruction may happen on a thread other than the one that
+/// called build().
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -210,7 +215,7 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build(), or from build() itself when fewer than two outputs are declared.
   void declare_output_hash_key(std::uint32_t column_index);
 
-  /// Lower and plan `substrait_plan` against the declared streams; open the query lifecycle.
+  /// Lower and plan `substrait_plan` against the declared streams.
   /// Creates a view `sirius_stream_<id>` for each declared input stream.
   /// @throws on translation/planning failure or if already built.
   void build(const std::string& substrait_plan);
@@ -264,8 +269,9 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
-  /// Execute the fragment and close the query lifecycle. Blocks until pipelines finish.
-  /// @throws before build() or on execution failure.
+  /// Execute the fragment. Blocks until pipelines finish. Every input must be closed first
+  /// (relay_from and close_input close their sender).
+  /// @throws before build(), while an input is still open, or on execution failure.
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at
@@ -278,11 +284,13 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build(), on a result fragment, or on an unknown output stream.
   [[nodiscard]] bool drained(std::uint64_t stream_id);
 
-  /// Batches currently parked on output stream `stream_id`. For diagnostics.
+  /// Batches currently parked on output stream `stream_id`. For diagnostics. 0 before build().
+  /// @throws after build() on an unknown id, including any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
 
-  /// Total rows parked on output stream `stream_id`, without draining it.
-  /// @throws on an unknown output stream, or on a parked batch that is not GPU-resident.
+  /// Total rows parked on output stream `stream_id`, without draining it. 0 before build().
+  /// @throws after build() on an unknown id, including any id on a result fragment, or on a
+  /// parked batch that is not GPU-resident.
   [[nodiscard]] std::uint64_t output_row_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.

@@ -305,7 +305,6 @@ Construction invariants:
 ```
 push(stream_id, batch)              // → source.push
 close_input(stream_id, sender_id)   // → source.close_input(sender)
-fail_input(stream_id, error)        // → source.fail_input(error)   — poison an input stream
 pull(stream_id) -> optional         // → sink.pull(partition)
 wait(stream_id)                     // → sink.wait(partition)
 drained(stream_id) -> bool          // → sink.drained(partition)
@@ -365,8 +364,8 @@ additive — nothing in this design forecloses it.
 ## Fragments: `exec::streaming_fragment` and the FFI
 
 The layer above these primitives — building a plan around them, bridging DuckDB bind time to
-physical-plan time via `stream_bind_catalog`, and the cross-language `sirius::ffi::Fragment`
-lifecycle — has its own document: [Streaming Fragments](streaming-fragments.md).
+physical-plan time via `stream_bind_catalog`, and the embedder API (`sirius::ffi::Context` plus
+`Fragment`) — has its own document: [Streaming Fragments](streaming-fragments.md).
 
 ## Tests
 

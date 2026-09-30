@@ -394,8 +394,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
                                            std::string_view window_label,
                                            std::string_view pool_tag)
 {
-  // Runs inside the held slot, after acquire and the health check and before
-  // the final create_plan.
+  // Runs inside the held slot, after acquire and the health check.
   // Logging around the mutations is best-effort: a logging failure must never
   // leave the runtime half-begun (the mutations themselves are the only
   // throwing steps that matter; a throw here is handled by the scope ctor's
@@ -1671,6 +1670,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
 void SiriusContext::release_query_lifecycle_slot() noexcept
 {
+  // Unlocking a std::mutex from a thread that does not hold it is undefined behaviour.
+  D_ASSERT(holder_thread_hash_.load(std::memory_order_relaxed) ==
+           (std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1));
   holder_thread_hash_.store(0, std::memory_order_relaxed);
   query_lifecycle_held_.store(false, std::memory_order_release);
   query_lifecycle_mutex_.unlock();

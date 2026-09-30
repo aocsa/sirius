@@ -113,8 +113,9 @@ mod ffi {
         /// produces Arrow).
         ///
         /// Usage order: `declare_*` → `build` → fill inputs → `run` → drain via
-        /// `relay_from` / `export_packed` or `result_to_arrow`. Exactly one fragment
-        /// may sit between its own `build` and `run`; the engine serializes queries.
+        /// `relay_from` / `export_packed` or `result_to_arrow`. Any number of
+        /// fragments may be built before any runs; `build`, `run` and
+        /// `execute_substrait` execute one at a time per context.
         type Fragment;
 
         /// Create a [`Fragment`] on `context`, which must outlive it.
@@ -164,8 +165,7 @@ mod ffi {
         /// broadcast.
         fn declare_output_hash_key(self: Pin<&mut Fragment>, column_index: u32) -> Result<()>;
 
-        /// Plan `substrait_plan` against the declared streams and open the
-        /// fragment's query lifecycle.
+        /// Plan `substrait_plan` against the declared streams.
         fn build(self: Pin<&mut Fragment>, substrait_plan: &CxxString) -> Result<()>;
 
         /// Move every batch parked on `source`'s output stream into this fragment's
@@ -225,8 +225,8 @@ mod ffi {
         /// once every expected sender has closed.
         fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
 
-        /// Execute the fragment and close its query lifecycle. Blocks until its
-        /// pipelines finish.
+        /// Execute the fragment. Blocks until its pipelines finish. Every input
+        /// must be closed first.
         fn run(self: Pin<&mut Fragment>) -> Result<()>;
 
         /// Write a result fragment's rows into the caller-owned `ArrowArrayStream`
