@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
@@ -95,6 +96,28 @@ duckdb::shared_ptr<duckdb::PreparedStatementData> synthesize_prepared(
     prepared->names.push_back("col_" + std::to_string(i));
   }
   return prepared;
+}
+
+// DuckDB types SUM(BIGINT) as HUGEINT while the physical plan narrows it to BIGINT. cuDF has no
+// INT128, so a HUGEINT column is decoded from INT64 either way (get_cudf_type); only values
+// beyond the BIGINT range are lost, and that holds for every HUGEINT result already.
+bool prepared_types_match(const duckdb::vector<sirius::logical_type>& prepared,
+                          const duckdb::vector<sirius::logical_type>& physical)
+{
+  if (prepared.size() != physical.size()) { return false; }
+  for (duckdb::idx_t i = 0; i < prepared.size(); ++i) {
+    if (prepared[i] == physical[i]) { continue; }
+    if (prepared[i].id() == sirius::type_id::HUGEINT &&
+        physical[i].id() == sirius::type_id::BIGINT) {
+      SIRIUS_LOG_WARN(
+        "streaming_fragment: result column {} is HUGEINT but the physical plan produces BIGINT; "
+        "values outside the BIGINT range cannot be represented",
+        i);
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 }  // namespace
@@ -210,7 +233,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> streaming_fragment::make_result
   if (!prepared) { prepared = synthesize_prepared(subtree->types); }
   // The collector decodes GPU output with prepared->types; a mismatch would misread it.
   _sink_types = sirius::from_duckdb_vec(prepared->types);
-  if (_sink_types != subtree->types) {
+  if (!prepared_types_match(_sink_types, subtree->types)) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: prepared result types do not match the physical plan's " +
       std::to_string(subtree->types.size()) + " output column(s)");
