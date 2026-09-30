@@ -91,10 +91,9 @@ struct fragment_fixture {
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    // sirius_stream_source's bind resolves its schema here; the transparent path does not
-    // register a catalog, so the fragment supplies one for this connection.
-    catalog = duckdb::make_shared_ptr<stream_bind_catalog>();
-    con->context->registered_state->Insert(stream_bind_catalog::kStateKey, catalog);
+    // OnConnectionOpened already registered this connection's catalog, and registered_state's
+    // Insert never overwrites a key, so a test must read that one rather than insert its own.
+    catalog = catalog_for(*con->context);
   }
 
   std::unique_ptr<duckdb::Connection> con;
@@ -586,8 +585,6 @@ TEST_CASE_METHOD(fragment_fixture,
     {
       auto other_con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
-      other_con->context->registered_state->Insert(stream_bind_catalog::kStateKey,
-                                                   duckdb::make_shared_ptr<stream_bind_catalog>());
       other_con->BeginTransaction();
       auto foreign = make_fragment(*other_con->context, kLeafQuery, {0});
       foreign->build();
@@ -1082,8 +1079,6 @@ TEST_CASE_METHOD(fragment_fixture,
 {
   auto other_con =
     std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
-  other_con->context->registered_state->Insert(stream_bind_catalog::kStateKey,
-                                               duckdb::make_shared_ptr<stream_bind_catalog>());
 
   con->BeginTransaction();
   other_con->BeginTransaction();
@@ -1263,8 +1258,7 @@ TEST_CASE_METHOD(fragment_fixture,
   auto source = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
   fragment_spec spec;
   spec.plan_source = [&, source](duckdb::ClientContext& context) {
-    // The extension registers the connection's catalog first, so the fixture's never binds.
-    catalog_rows = catalog_for(context)->estimated_rows(0);
+    catalog_rows = catalog->estimated_rows(0);
     auto bound   = source(context);
     estimated    = bound.plan->EstimateCardinality(context);
     return bound;
