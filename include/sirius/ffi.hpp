@@ -79,9 +79,10 @@ class SIRIUS_FFI_EXPORT Context {
 
   /// Lease `len` bytes of the exchange staging arena; returns the lease's byte offset from
   /// `staging_base()`. For the receive side of a transport: lease, land the remote bytes at
-  /// `staging_base() + offset`, `Fragment::push_packed`, then `staging_release`. (The send side's
-  /// `Fragment::export_packed` takes its own lease; releasing it after the transmit completes is
-  /// still the caller's job, through `staging_release`.)
+  /// `staging_base() + offset`, then `Fragment::push_packed`, which consumes a nonzero lease; do
+  /// not `staging_release` it after a successful push (see push_packed for its error paths). (The
+  /// send side's `Fragment::export_packed` takes its own lease; releasing it after the transmit
+  /// completes is still the caller's job, through `staging_release`.)
   /// @throws when no arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset) or on
   /// exhaustion — the error names the requested/free/capacity byte counts.
   std::uint64_t staging_lease(std::uint64_t len);
@@ -238,7 +239,8 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// The packing stream is synchronized before returning, so the caller may transmit from
   /// `[staging_base()+offset, +length)` immediately. The lease outlives this call by design:
   /// releasing it — via `Context::staging_release(offset)`, after the transmit completes — is
-  /// the caller's responsibility.
+  /// the caller's responsibility. In a same-process loopback that pushes this lease straight
+  /// into `push_packed`, the push consumes it instead.
   ///
   /// A zero-row batch is metadata-only: it returns the pack metadata with `offset == 0` and
   /// `length == 0` and holds NO lease — the caller must not release anything for it.
@@ -254,10 +256,16 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// into ordinary pool memory, push it into input stream `stream_id`, and release the receiver
   /// lease when `length != 0`. The copy is synchronized before returning.
   ///
+  /// Who releases the lease when this throws depends on where: an error up to and including the
+  /// copy (unknown stream, schema mismatch, out of memory, ...) leaves it with the caller; after
+  /// the copy the lease is already released, so an error from the push itself (the stream
+  /// already ended) must not be followed by a `staging_release`.
+  ///
   /// Legal between `build()` and `run()`, exactly where `relay_from` sits. Does not close the
   /// sender (the caller `close_input()`s).
   /// @throws before `build()`, on an unknown input stream, when no arena is configured, on an
-  /// out-of-bounds lease range or empty metadata, or when the stream already ended.
+  /// out-of-bounds lease range or empty metadata, on a schema mismatch, or when the stream
+  /// already ended.
   void push_packed(std::uint64_t stream_id,
                    std::uintptr_t metadata_addr,
                    std::size_t metadata_len,

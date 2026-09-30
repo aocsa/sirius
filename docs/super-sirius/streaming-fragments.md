@@ -257,8 +257,10 @@ moves. `pull`, `close_input`, and `drained` wrap the session. The session itself
 **Files:** `include/sirius/ffi.hpp`, `src/sirius_ffi.cpp`
 
 `Context` is an RAII handle to one embedded engine: a `duckdb::SiriusContext`, a
-`duckdb::DuckDB` plus `Connection`, and a `stream_bind_catalog`. Every `Fragment` created with
-`make_fragment(context)` shares that.
+`duckdb::DuckDB` plus `Connection`, a `stream_bind_catalog`, and, when
+`SIRIUS_EXCHANGE_STAGING_BYTES` is set, an exchange staging arena
+(`src/exec/exchange_staging_arena.hpp`). Every `Fragment` created with `make_fragment(context)`
+shares that.
 
 A `Fragment` with declared output streams is intermediate and roots in a `STREAMING_SINK`. A
 `Fragment` with no declared outputs is a result fragment, roots in a `RESULT_COLLECTOR`, and
@@ -269,7 +271,8 @@ flag.
 ### `build()` and `run()`: one transaction each
 
 ```
-declare_input_column / declare_input_sender / declare_output / declare_output_broadcast / declare_output_hash_key
+declare_input_column / declare_input_sender / declare_input_cardinality
+declare_output / declare_output_broadcast / declare_output_hash_key
                                           │
                                           ▼
 build():                  ┌─── in_transaction ──────────────────────┐
@@ -327,6 +330,40 @@ before anything moves:
 and the source's `sink_types()` before any batch moves. A mismatch throws instead of feeding a
 bad schema into cuDF.
 
+### Packed hops: `export_packed()` and `push_packed()`
+
+Across a process edge the embedder moves cuDF packed bytes through the staging arena instead of
+calling `relay_from()`:
+
+```
+sender:    run() → export_packed(stream) → transmit [staging_base()+offset, +length) → staging_release(offset)
+receiver:  build() → staging_lease(length) → bytes land at the lease → push_packed(...) → close_input(stream, sender) → run()
+```
+
+- **`export_packed(stream_id, offset, length, rows)`** pulls, so like `relay_from()` it requires
+  that the fragment has run. It packs the next parked batch into a fresh lease with
+  `cudf::chunked_pack`, synchronizes, and returns the pack metadata, or null when nothing is
+  parked. A zero-row batch returns metadata with `offset == 0` and `length == 0` and holds no
+  lease.
+- **`push_packed(stream_id, metadata, offset, length)`** is legal between `build()` and `run()`,
+  like `relay_from()`. It unpacks, checks the declared schema, deep-copies the table into pool
+  memory, synchronizes, and pushes. It does not close a sender; `close_input()` does.
+- **Lease ownership.** The exporter's lease is the caller's to release after the transmit.
+  `push_packed()` releases a nonzero receiver lease itself once the copy is done, so the caller
+  must not release it after a successful push. In a same-process loopback the exporter's lease is
+  the receiver lease, and the push consumes it. When `push_packed()` throws, an error up to and
+  including the copy (unknown stream, schema mismatch, out of memory) leaves the lease with the
+  caller; an error from the push itself (the stream already ended) comes after the release.
+- **`drained(stream_id)`** is true once an output stream has ended with an empty queue.
+  `output_row_count()` sums the rows parked on a stream without draining it.
+- **`declare_input_cardinality(stream_id, rows)`** stores a row count in the input's catalog
+  binding. `sirius_stream_source`'s cardinality callback reports it to DuckDB's optimizer during
+  `build()`. An undeclared stream keeps cardinality 1.
+- **Arena threading.** `Context`'s `staging_*` methods run on the thread that drives the context,
+  which also runs fragments. A transport that serves leases from other threads holds
+  `Context::staging_arena_handle()`, a `StagingArena` that shares the same allocator. Its
+  `lease()` and `release()` serialize on the arena mutex and make no CUDA calls.
+
 ### Other contracts
 
 - **A partition mode needs at least two destinations.** `declare_output_broadcast()` and
@@ -346,6 +383,8 @@ bad schema into cuDF.
 | `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
 | `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` |
 | `test/cpp/exec/test_sirius_ffi_embedder.cpp` | `[isolated_context][sirius_ffi]` |
+| `test/cpp/exec/test_sirius_ffi_packed.cpp` | `[isolated_context][sirius_ffi]` |
+| `test/cpp/exec/test_exchange_staging_arena.cpp` | `[staging_arena]` |
 
 FFI tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
 `SiriusContext` and GPU memory pools. The Catch2 listener in `test/cpp/unittest.cpp` pauses the
@@ -358,15 +397,21 @@ runs (on one and on two threads), `build()` and `run()` on different threads, dr
 a `build()` that fails after setup, and a hash key on one output. `test_streaming_fragment.cpp`
 covers spec errors, relay preconditions (FRAG-7), failed-run behavior (FRAG-8), hash partitioning
 (FRAG-9), out-of-order builds and runs (FRAG-10), another window between `build()` and `run()`
-(FRAG-11), the `run()` guards (FRAG-12), and runs from two threads (FRAG-13). Rollback of a `build()` that fails while resolving input types
+(FRAG-11), the `run()` guards (FRAG-12), runs from two threads (FRAG-13), a two-shard GROUP BY
+through a hash sink (FRAG-14), and a declared input cardinality reaching the plan's estimate
+(FRAG-15). Rollback of a `build()` that fails while resolving input types
 stays in `test_sirius_ffi_fragment.cpp`.
+
+`test_sirius_ffi_packed.cpp` checks that a packed hop returns what `relay_from()` returns and
+leaves no lease outstanding, that `export_packed()` requires `run()`, and that a zero-row batch
+holds no lease. `test_exchange_staging_arena.cpp` covers the arena's bookkeeping, alignment,
+exhaustion, coalescing, concurrency, and the `Context` staging calls (ARENA-1 to ARENA-14).
 
 ## Not yet ported
 
 `Fragment::run()` blocks. It goes through `streaming_fragment::run()` into
 `sirius_engine::execute()`, which waits on the future from `start_query()`. Fragments therefore
 run store-and-forward, one at a time, and every input must be closed before `run()`.
-`relay_from()` only moves batches already
-sitting in a local, finished source fragment's output repository. Remote senders need
-`push_arrow`, `pull_arrow`, and `drained` on `sirius::ffi::Fragment`, and non-blocking execution;
-both are tracked in [#1590](https://github.com/sirius-db/sirius/issues/1590).
+`relay_from()` and `export_packed()` only move batches already parked on a finished source
+fragment's output stream. Streaming a hop while its sender still runs needs non-blocking
+execution, tracked in [#1590](https://github.com/sirius-db/sirius/issues/1590).

@@ -188,9 +188,10 @@ mod ffi {
         /// offset, packed payload length, and the batch's row count; the device
         /// bytes are complete on return (the packing stream is synchronized).
         /// Releasing the exporter's lease — via `staging_release(offset)`, after
-        /// the transmit completes — is the caller's job. A zero-row batch
-        /// returns metadata with `offset == 0` and `length == 0` and holds no
-        /// lease.
+        /// the transmit completes — is the caller's job, unless a same-process
+        /// loopback hands the lease to `push_packed`, which consumes it. A
+        /// zero-row batch returns metadata with `offset == 0` and `length == 0`
+        /// and holds no lease.
         fn export_packed(
             self: Pin<&mut Fragment>,
             stream_id: u64,
@@ -204,7 +205,9 @@ mod ffi {
         /// memory), deep-copy the table out of the lease into pool memory, push
         /// it into an input stream, and release the receiver lease when
         /// `length != 0`. Legal between `build()` and `run()`. A push after the
-        /// stream ended is an `Err`, never a silent drop.
+        /// stream ended is an `Err`, never a silent drop. An `Err` raised before
+        /// the copy completes leaves the lease with the caller; one raised after
+        /// it (the stream already ended) comes after the release.
         ///
         /// # Safety
         /// `metadata_addr` must point at `metadata_len` readable bytes of pack

@@ -336,7 +336,10 @@ impl Fragment<'_> {
     /// receive-side mirror of [`export_packed`](Fragment::export_packed).
     ///
     /// The table is deep-copied out of the lease into ordinary pool memory before this returns.
-    /// When `batch.len != 0`, this call also releases that receiver lease. Legal between
+    /// When `batch.len != 0`, this call also releases that receiver lease once the copy is done.
+    /// An `Err` raised before then (unknown stream, schema mismatch, out of memory, ...) leaves
+    /// the lease with the caller to release; an `Err` from the push itself (the stream already
+    /// ended) comes after the release, so the caller must not release again. Legal between
     /// [`build`](Fragment::build) and [`run`](Fragment::run), like
     /// [`relay_from`](Fragment::relay_from); pushing after the stream ended is an error, never a
     /// silent drop.
