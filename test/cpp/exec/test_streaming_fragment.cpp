@@ -1247,3 +1247,45 @@ TEST_CASE_METHOD(fragment_fixture,
     throw;
   }
 }
+
+// ============================================================================
+// FRAG-15: build() hands a declared input cardinality to the optimizer
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-15: a declared input cardinality reaches the plan's estimate",
+                 "[integration][streaming_fragment]")
+{
+  constexpr std::uint64_t kRows = 1'000'003;
+  std::optional<std::uint64_t> catalog_rows;
+  duckdb::idx_t estimated = 0;
+
+  auto source = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+  fragment_spec spec;
+  spec.plan_source = [&, source](duckdb::ClientContext& context) {
+    // The extension registers the connection's catalog first, so the fixture's never binds.
+    catalog_rows = catalog_for(context)->estimated_rows(0);
+    auto bound   = source(context);
+    estimated    = bound.plan->EstimateCardinality(context);
+    return bound;
+  };
+  spec.inputs[0] = stream_input_spec{
+    {"a"},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    {0},
+    kRows};
+  spec.outputs = {1};
+
+  con->BeginTransaction();
+  try {
+    streaming_fragment fragment(*con->context, std::move(spec));
+    fragment.build();
+    REQUIRE(catalog_rows == kRows);
+    REQUIRE(estimated == kRows);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
