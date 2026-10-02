@@ -19,6 +19,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 
@@ -56,6 +57,15 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   return duckdb::make_uniq<stream_source_bind_data>(stream_id);
 }
 
+duckdb::unique_ptr<duckdb::NodeStatistics> stream_source_cardinality(
+  duckdb::ClientContext& context, const duckdb::FunctionData* bind_data)
+{
+  auto const stream_id = bind_data->Cast<stream_source_bind_data>().stream_id;
+  auto const rows      = catalog_for(context)->get(stream_id).estimated_rows;
+  if (!rows) { return nullptr; }
+  return duckdb::make_uniq<duckdb::NodeStatistics>(*rows);
+}
+
 /// Never runs: plan generator replaces this scan with STREAMING_SOURCE.
 void stream_source_function(duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&)
 {
@@ -75,6 +85,7 @@ void register_stream_source_function(duckdb::DatabaseInstance& instance)
                                       {duckdb::LogicalType::BIGINT},
                                       stream_source_function,
                                       stream_source_bind);
+  stream_source.cardinality = stream_source_cardinality;
 
   duckdb::CreateTableFunctionInfo info(stream_source);
   // Idempotent: extension callback and explicit callers may both register.
