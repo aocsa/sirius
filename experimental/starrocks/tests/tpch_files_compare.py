@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Compare a StarRocks FILES() TPC-H result TSV to DuckDB on the same parquet."""
+"""Compare a StarRocks FILES() TPC-H result TSV to DuckDB on the same parquet.
 
+usage: tpch_files_compare.py QUERY.sql DATA_ROOT RESULT.tsv [ORACLE_CACHE.json]
+"""
+
+import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -64,16 +69,41 @@ def cell_equal(got: str, want) -> bool:
     return math.isclose(have, want_f, rel_tol=5e-3, abs_tol=5e-3 * scale)
 
 
+def duckdb_answer(sql: str, data_root: Path) -> tuple[list[str], list[tuple]]:
+    config = {}
+    if os.environ.get("DUCKDB_MEMORY_LIMIT"):
+        config["memory_limit"] = os.environ["DUCKDB_MEMORY_LIMIT"]
+    con = duckdb.connect(config=config)
+    cur = con.execute(to_duckdb(sql, data_root, con))
+    return [desc[0] for desc in cur.description], cur.fetchall()
+
+
+def cached_answer(sql: str, data_root: Path, cache: Path) -> tuple[list[str], list[tuple]]:
+    """DuckDB's answer, computed once per (query, data) and reused.
+
+    At SF1000 recomputing the oracle costs minutes per query. Dates are cached as
+    ISO strings; cell_equal and the row key treat them the same as date objects.
+    """
+    if cache.exists():
+        cached = json.loads(cache.read_text())
+        return cached["names"], [tuple(row) for row in cached["rows"]]
+    names, rows = duckdb_answer(sql, data_root)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"names": names, "rows": rows}, default=str))
+    tmp.replace(cache)
+    return names, rows
+
+
 def main() -> None:
-    query_path, data_root, tsv_path = sys.argv[1:]
+    query_path, data_root, tsv_path, *cache = sys.argv[1:]
     sql = Path(query_path).read_text()
     sql = sql.replace("__TPCH_DATA__", str(Path(data_root)))
     header, got_rows = parse_tsv(Path(tsv_path).read_text())
-    con = duckdb.connect()
-    duck_sql = to_duckdb(sql, Path(data_root), con)
-    cur = con.execute(duck_sql)
-    names = [desc[0] for desc in cur.description]
-    want_rows = cur.fetchall()
+    if cache:
+        names, want_rows = cached_answer(sql, Path(data_root), Path(cache[0]))
+    else:
+        names, want_rows = duckdb_answer(sql, Path(data_root))
     if [name.lower() for name in header] != [name.lower() for name in names]:
         raise SystemExit(f"column mismatch fe={header} duckdb={names}")
     def key(row):
