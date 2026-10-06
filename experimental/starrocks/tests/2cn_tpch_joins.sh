@@ -37,6 +37,8 @@ REPO_ROOT=$(cd "$SR_DIR/../.." && pwd)
 
 # shellcheck source=/dev/null
 source /home/ubuntu/sirius-wt/env.sh
+# shellcheck source=cn_leak_check.sh
+source "$HERE/cn_leak_check.sh"
 export TMPDIR=${TMPDIR:-/opt/dlami/nvme/tmp}
 export TOOLS_DIR=${TOOLS_DIR:-/home/ubuntu/sirius-wt/tools}
 # nixl / UCX paths, UCX_TLS, and LD_LIBRARY_PATH (engine .so, nixl, UCX, pixi).
@@ -304,6 +306,10 @@ for q in $QUERIES; do
         results+=("PASS ${q}")
     else
         results+=("FAIL ${q}")
+        failed=$((failed + 1))
+    fi
+    if ! cn_leaks "$E2E" 2; then
+        results+=("FAIL ${q}-leak (a CN still holds GPU memory of ${q} after it ended)")
         failed=$((failed + 1))
     fi
 done

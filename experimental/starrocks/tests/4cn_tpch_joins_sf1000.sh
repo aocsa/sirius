@@ -30,6 +30,8 @@ REPO_ROOT=$(cd "$SR_DIR/../.." && pwd)
 # nixl / UCX paths, UCX_TLS, and LD_LIBRARY_PATH (engine .so, nixl, UCX, pixi).
 # shellcheck source=/dev/null
 source "$SR_DIR/scripts/cn-env.sh"
+# shellcheck source=cn_leak_check.sh
+source "$HERE/cn_leak_check.sh"
 
 RUN_ROOT=${RUN_ROOT:-/scratch/$USER/sirius-4cn-sf1000-joins}
 E2E=${SIRIUS_4CN_E2E_DIR:-$RUN_ROOT/run}
@@ -63,6 +65,9 @@ PIPELINE_THREADS=${PIPELINE_THREADS:-4}
 # Bind each CN's threads to the CPU socket of its GPU.
 NUMA_BIND=${NUMA_BIND:-1}
 QUERY_TIMEOUT_S=${QUERY_TIMEOUT_S:-3600}
+# Set to a query name (e.g. q05) to first run that query with one fragment failed on purpose, and
+# require that the CNs hold nothing afterwards. The query then runs again in the normal loop.
+INJECT_FAILURE_QUERY=${INJECT_FAILURE_QUERY:-}
 # DuckDB defaults to 80% of RAM, which would collide with the CNs' host tiers.
 export DUCKDB_MEMORY_LIMIT=${DUCKDB_MEMORY_LIMIT:-512GB}
 
@@ -269,6 +274,7 @@ start_cn() {
         RUST_LOG="${RUST_LOG:-sirius_starrocks_cn=info}" \
         RUST_BACKTRACE=1 \
         SIRIUS_CN_DUMP_FRAGMENTS="$E2E/frags" \
+        SIRIUS_CN_FAIL_ONCE_FILE="$E2E/fail-once" \
         "${bind[@]}" \
         stdbuf -oL -eL \
         "$CN_BIN" \
@@ -325,6 +331,29 @@ data_tag=$(printf '%s' "$TPCH_DATA" | tr -c 'A-Za-z0-9._-' '_')
 results=()
 failed=0
 cn_died=0
+
+if [[ -n "$INJECT_FAILURE_QUERY" ]]; then
+    q=$INJECT_FAILURE_QUERY
+    echo "== failing one fragment of TPC-H ${q} on purpose =="
+    sql=$(sed "s|__TPCH_DATA__|${TPCH_DATA}|g" "$SQL_DIR/${q}.sql")
+    # The first fragment any CN runs after this appears fails, and removes the file.
+    touch "$E2E/fail-once"
+    if mysql_table -e "${SESSION} ${sql}" >/dev/null 2>"$E2E/injected-${q}.err"; then
+        results+=("FAIL injected-${q} (the query passed; no fragment failed)")
+        failed=$((failed + 1))
+    elif [[ -e "$E2E/fail-once" ]]; then
+        results+=("FAIL injected-${q} (failed before any fragment ran: $(head -c 160 "$E2E/injected-${q}.err" | tr '\n' ' '))")
+        failed=$((failed + 1))
+    elif cn_leaks "$E2E" "$NUM_CNS"; then
+        results+=("PASS injected-${q} (failed as injected; the CNs hold nothing afterwards)")
+    else
+        results+=("FAIL injected-${q} (a CN still holds the failed query's GPU memory)")
+        failed=$((failed + 1))
+    fi
+    rm -f "$E2E/fail-once"
+    cns_alive || cn_died=1
+fi
+
 for q in $QUERIES; do
     if [[ "$cn_died" -eq 1 ]]; then
         results+=("SKIP ${q}")
@@ -353,6 +382,10 @@ for q in $QUERIES; do
         failed=$((failed + 1))
     fi
     cns_alive || cn_died=1
+    if [[ "$cn_died" -eq 0 ]] && ! cn_leaks "$E2E" "$NUM_CNS"; then
+        results+=("FAIL ${q}-leak (a CN still holds GPU memory of ${q} after it ended)")
+        failed=$((failed + 1))
+    fi
 done
 
 echo "== checking packed NIXL hops over transmit_chunk =="
@@ -384,4 +417,4 @@ printf '%s\n' "${results[@]}" "${hops} nixl-hops"
 [[ "$failed" -eq 0 ]] || exit 1
 
 dump_logs_on_fail=0
-echo "OK: SF1000 TPC-H join queries matched DuckDB across ${NUM_CNS} CNs with a packed NIXL shuffle"
+echo "OK: TPC-H join queries matched DuckDB across ${NUM_CNS} CNs with a packed NIXL shuffle"
