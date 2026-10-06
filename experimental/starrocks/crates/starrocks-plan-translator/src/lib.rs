@@ -105,6 +105,7 @@ pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
 mod node_translator;
+pub mod runtime_filter;
 mod scan_paths;
 pub(crate) mod type_mapper;
 
@@ -228,6 +229,18 @@ impl PlanTranslator {
         params: &TExecPlanFragmentParams,
         exchange_inputs: &[ExchangeInput],
     ) -> Result<TranslatedPlan> {
+        self.translate_fragment_with_inputs(params, exchange_inputs, &[])
+    }
+
+    /// Translates a fragment whose exchange nodes read the given input streams, and whose scans
+    /// keep only the rows matching the key stream bound to each runtime filter they probe. Each
+    /// applied filter adds its key stream to [`TranslatedPlan::stream_inputs`].
+    pub fn translate_fragment_with_inputs(
+        &self,
+        params: &TExecPlanFragmentParams,
+        exchange_inputs: &[ExchangeInput],
+        filter_inputs: &[runtime_filter::FilterInput],
+    ) -> Result<TranslatedPlan> {
         let fragment = params
             .fragment
             .as_ref()
@@ -253,6 +266,10 @@ impl PlanTranslator {
             .iter()
             .map(|input| (input.node_id, input))
             .collect::<HashMap<_, _>>();
+        let filter_inputs = filter_inputs
+            .iter()
+            .map(|input| (input.filter_id, input))
+            .collect::<HashMap<_, _>>();
         let mut registry = ExtensionRegistry::new();
         let node_translator::TranslatedFragment {
             root: mut translated,
@@ -262,6 +279,7 @@ impl PlanTranslator {
             &desc,
             &scan_paths,
             &exchange_inputs,
+            &filter_inputs,
             &mut registry,
         )?;
 
