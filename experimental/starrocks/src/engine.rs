@@ -26,7 +26,8 @@ use starrocks_plan_translator::{StreamInputSchema, TranslatedPlan};
 use tracing::{info, warn};
 
 use crate::fragment_executor::{
-    ExportedBatch, FragmentExecutor, FragmentResult, FragmentRun, SenderSlot,
+    DrainHandoff, DrainNext, ExportedBatch, FragmentExecutor, FragmentResult, FragmentRun,
+    OutputDrain, SenderSlot,
 };
 use crate::local_exchange::RemoteBatch;
 use crate::parked_registry::ParkedRegistry;
@@ -47,6 +48,8 @@ struct ExecuteRequest {
     broadcast: bool,
     /// Hash-partition key columns for a hash fan-out (empty otherwise).
     hash_keys: Vec<usize>,
+    /// Outputs to hand out as drains just before the run, so they ship while it runs.
+    drains: Option<DrainHandoff>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
 }
@@ -337,6 +340,27 @@ fn run_fragment<'ctx>(
     }
     let relayed = started.elapsed();
 
+    // Hand the drains out last: once taken, a failure before the run ends their streams (a
+    // fragment dropped without running fails its outputs), and the shipper sees that error.
+    let streamed = match &request.drains {
+        Some(handoff) => {
+            let drains = handoff
+                .streams
+                .iter()
+                .map(|&stream| {
+                    fragment
+                        .output_drain(stream as u64)
+                        .map(|drain| Box::new(EngineDrain(drain)) as Box<dyn OutputDrain>)
+                        .map_err(|err| format!("failed to drain output stream {stream}: {err}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // A closed channel means the shipper gave up; the output then stays parked.
+            let _ = handoff.respond.send(drains);
+            handoff.streams.len()
+        }
+        None => 0,
+    };
+
     fragment
         .run()
         .map_err(|err| format!("failed to execute fragment: {err}"))?;
@@ -361,10 +385,36 @@ fn run_fragment<'ctx>(
             inputs_us = (relayed - built).as_micros() as u64,
             run_us = (ran - relayed).as_micros() as u64,
             outputs = request.outputs.len(),
+            streamed,
             "fragment timing"
         );
     }
     Ok(result)
+}
+
+/// An engine [`sirius::OutputDrain`] behind the executor seam.
+#[derive(Debug)]
+struct EngineDrain(sirius::OutputDrain);
+
+impl OutputDrain for EngineDrain {
+    fn next(&mut self, timeout: std::time::Duration) -> Result<DrainNext, String> {
+        Ok(
+            match self
+                .0
+                .next(timeout)
+                .map_err(|err| format!("failed to export a streamed batch: {err}"))?
+            {
+                sirius::DrainNext::Batch(batch) => DrainNext::Batch(ExportedBatch {
+                    token: batch.token,
+                    rows: batch.rows,
+                    layout: batch.layout,
+                    src: batch.src,
+                }),
+                sirius::DrainNext::Waiting => DrainNext::Waiting,
+                sirius::DrainNext::End => DrainNext::End,
+            },
+        )
+    }
 }
 
 /// The parked sender outputs feeding exchange `node_id`.
@@ -447,6 +497,7 @@ impl FragmentExecutor for SiriusEngine {
             outputs: Vec::new(),
             broadcast: false,
             hash_keys: Vec::new(),
+            drains: None,
         })?
         .ok_or_else(|| "result fragment returned no rows".to_string())
     }
@@ -461,6 +512,7 @@ impl FragmentExecutor for SiriusEngine {
                 outputs: run.outputs,
                 broadcast: run.broadcast,
                 hash_keys: run.hash_keys,
+                drains: run.drains,
                 respond,
             })
         })
@@ -675,6 +727,7 @@ mod tests {
                     outputs: Vec::new(),
                     broadcast: false,
                     hash_keys: Vec::new(),
+                    drains: None,
                     respond,
                 })
             })
@@ -807,6 +860,7 @@ mod tests {
                 outputs: vec![slot],
                 broadcast: false,
                 hash_keys: Vec::new(),
+                drains: None,
             })
             .expect("park the sender output");
         assert!(parked.is_none(), "a sender fragment returns no rows");
@@ -819,6 +873,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                drains: None,
             })
             .expect("relay into the receiver")
             .expect("the receiver returns rows");
@@ -834,6 +889,7 @@ mod tests {
                 outputs: vec![slot],
                 broadcast: false,
                 hash_keys: Vec::new(),
+                drains: None,
             })
         };
         park().expect("park the sender output");
@@ -845,6 +901,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: vec![usize::MAX],
+                drains: None,
             })
             .expect_err("an overflowing hash key fails the receiver");
         park().expect("the failed receiver released its input");
@@ -867,6 +924,7 @@ mod tests {
                     outputs: slots.to_vec(),
                     broadcast,
                     hash_keys,
+                    drains: None,
                 })
                 .expect("park the fan-out");
             slots.map(|slot| {
@@ -878,6 +936,7 @@ mod tests {
                         outputs: Vec::new(),
                         broadcast: false,
                         hash_keys: Vec::new(),
+                        drains: None,
                     })
                     .expect("relay one destination")
                     .expect("the receiver returns rows");
