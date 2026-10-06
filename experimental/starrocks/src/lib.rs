@@ -44,12 +44,21 @@ use thrift::{
 };
 use tracing::{debug, info, instrument, warn};
 
+mod admin_command;
 mod brpc;
 mod compute_node_service;
 #[cfg(feature = "sirius-engine")]
 mod engine;
 mod file_schema;
 mod fragment_executor;
+mod local_exchange;
+// The sender half is used only by the NIXL transport.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod nixl_chunk;
+#[cfg(feature = "nixl-transport")]
+mod nixl_transport;
+#[cfg(any(test, feature = "sirius-engine"))]
+mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
@@ -59,6 +68,9 @@ pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use nixl_chunk::NixlEndpoint;
+#[cfg(feature = "nixl-transport")]
+pub use nixl_transport::NixlTransport;
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

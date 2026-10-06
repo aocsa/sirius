@@ -50,6 +50,8 @@ struct stream_input_spec {
   duckdb::vector<sirius::logical_type> types;
   /// Sender-set EOS: stream ends only once all have closed.
   std::set<sender_id_t> expected_senders;
+  /// Row count the optimizer plans with. nullopt keeps DuckDB's default of 1.
+  std::optional<std::uint64_t> estimated_rows;
 };
 
 /// Bound, optimized DuckDB logical plan from Substrait bytes, SQL, or similar.
@@ -118,6 +120,13 @@ class streaming_fragment {
                          stream_id_t input_stream_id,
                          sender_id_t sender_id);
 
+  /// Push one batch into input `id`, for batches that arrive from outside this process. Does not
+  /// close a sender.
+  /// @return false when the input already ended.
+  /// @throws sirius::invalid_input_exception before build(), after run() started, or on an
+  ///         undeclared input.
+  bool push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
+
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
@@ -125,6 +134,14 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before run() or on an unknown id.
   /// @throws the output's poison error, which after a failed run() is that run's cause.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(stream_id_t id);
+
+  /// The stream behind output `id`, for a consumer that exports batches while run() is still
+  /// producing them: classify() tells "nothing yet" from the end of the stream, which pull()
+  /// cannot before run() returns. The stream outlives this fragment. One that is destroyed
+  /// without having run poisons its outputs, so a consumer waiting on them is released.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or on a result
+  ///         fragment.
+  [[nodiscard]] std::shared_ptr<batch_stream> output_stream(stream_id_t id) const;
 
   /// False while batches remain, before EOS, and on a poisoned output.
   /// @throws sirius::invalid_input_exception before build() or on an unknown id.
@@ -144,6 +161,16 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build() or on an unknown id, including
   ///         any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(stream_id_t id) const;
+
+  /// Total rows parked on output stream `id`, without draining it. Each batch's rows are
+  /// recorded when it is parked, so the count holds after batches spill to host.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or when a batch
+  ///         reached the stream already off the GPU.
+  [[nodiscard]] std::uint64_t output_row_count(stream_id_t id) const;
+
+  /// The declared spec of input `id`.
+  /// @throws sirius::invalid_input_exception on an undeclared input.
+  [[nodiscard]] const stream_input_spec& input_spec(stream_id_t id) const;
 
   [[nodiscard]] bool is_result() const { return _spec.outputs.empty(); }
 

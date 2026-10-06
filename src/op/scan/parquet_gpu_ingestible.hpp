@@ -37,6 +37,7 @@
 #include <cudf/io/text/byte_range_info.hpp>
 
 // standard library
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +47,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -74,6 +76,14 @@ class parquet_ingestible_table_info : public ingestible_table_info {
  public:
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
+  /// Per-file byte ranges `[start, start+length)`, parallel to @ref resolved_file_paths. An
+  /// empty outer vector means every file is read whole; so does an empty list, or one holding
+  /// a `(0,0)` range, for one file. A ranged file reads only the row groups whose start offset
+  /// falls inside one of its ranges (see parquet_byte_range.hpp) — the mechanism behind
+  /// distributed byte-range splits, where N ranges of one file must read every row exactly
+  /// once across scan instances. One file keeps one entry even when this scan owns several of
+  /// its ranges: the bound read view requires one entry per bound file.
+  std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> resolved_file_ranges;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
@@ -92,9 +102,35 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  std::size_t scan_output_arity      = 0;
+  /// When true the coalescer never bundles row groups of different files into one
+  /// split: each emitted split holds slices of exactly one file (a large file still
+  /// splits under approximate_batch_size). The pin path sets this so every pinned
+  /// chunk has single-file provenance and a scan over a subset of the pinned files
+  /// can be served by selecting whole chunks. The query read path keeps fused
+  /// batches (false).
+  bool batch_within_file_boundaries = false;
+  std::size_t scan_output_arity     = 0;
 
   parquet_ingestible_table_info() = default;
+
+  /// True when file @p index is read whole (no ranges, or a `(0,0)` range among them).
+  [[nodiscard]] bool reads_whole_file(std::size_t index) const
+  {
+    if (index >= resolved_file_ranges.size()) { return true; }
+    auto const& ranges = resolved_file_ranges[index];
+    return ranges.empty() || std::any_of(ranges.begin(), ranges.end(), [](auto const& range) {
+             return range.first == 0 && range.second == 0;
+           });
+  }
+
+  /// True when any file is read through byte ranges rather than whole.
+  [[nodiscard]] bool has_byte_ranges() const
+  {
+    for (std::size_t i = 0; i < resolved_file_ranges.size(); ++i) {
+      if (!reads_whole_file(i)) { return true; }
+    }
+    return false;
+  }
 
   [[nodiscard]] std::span<std::string const> column_names() const override { return names; }
 
@@ -382,10 +418,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   }
 
  private:
-  /// Read one file's footer, prune its row groups against the filter, and record
-  /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
-  /// Runs on a scan-manager dispatcher thread (the task returned by
-  /// @ref next_split_provider).
+  /// Read one file's footer, prune its row groups against the file's byte ranges
+  /// (@ref parquet_ingestible_table_info::resolved_file_ranges at @p file_index) and the
+  /// filter, and record per-row-group byte accounting. Returns a single
+  /// @c parquet_file_scan_info. Runs on a scan-manager dispatcher thread (the task returned
+  /// by @ref next_split_provider).
   std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
                                                   std::size_t file_index,
                                                   std::shared_ptr<io::ioctx> const& io_ctx);

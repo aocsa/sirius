@@ -2,6 +2,8 @@ target_sources(
   sirius_objects
   PRIVATE admission_control.cpp
           batch_stream.cpp
+          exchange_direct.cpp
+          exchange_staging.cpp
           stream_session.cpp
           stream_bind_catalog.cpp
           stream_plan_bindings.cpp

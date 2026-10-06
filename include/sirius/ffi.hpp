@@ -38,9 +38,16 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
+namespace sirius::exec {
+class batch_stream;
+class direct_exchange;
+}  // namespace sirius::exec
+
 namespace sirius::ffi {
 
+class DirectExchange;
 class Fragment;
+class OutputDrain;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -71,12 +78,111 @@ class SIRIUS_FFI_EXPORT Context {
   /// translation or execution failure.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
+  /// A handle to this Context's direct exchange, or null unless the Context has one GPU memory
+  /// space and it uses `allocator: slab`.
+  [[nodiscard]] std::unique_ptr<DirectExchange> direct_exchange() const;
+
+  /// Pin a table into the engine's scan cache so later plans that scan the same
+  /// resolved source are served from memory. Runs the same `pin_table` table
+  /// function the DuckDB extension registers, on this context's embedded
+  /// connection, so argument validation and behavior match `CALL pin_table(...)`.
+  ///
+  /// `path` is a parquet file or glob (empty for format 'duckdb', where `name`
+  /// is the catalog table). `tier` is "gpu" or "host". `name` keys the pin
+  /// registry and selects the compression plan file. `cols_joined` is a
+  /// '\n'-separated column list; empty pins every column. `format` is
+  /// "parquet"/"duckdb", or empty to infer from the path suffix (a glob not
+  /// ending in `.parquet` needs the explicit format). `schema_name` applies to
+  /// format 'duckdb' only; empty means "main". Compression engages per the
+  /// context's YAML `sirius.compression.*` config — no SQL involved.
+  ///
+  /// Must run on the context's owning thread, and never between a Fragment's
+  /// build() and run() (pinning opens its own execution window; the engine
+  /// serializes them). Returns a one-line summary. Throws on bad arguments, an
+  /// unmatched glob, or any engine failure.
+  std::unique_ptr<std::string> pin_table(const std::string& path,
+                                         const std::string& tier,
+                                         const std::string& name,
+                                         const std::string& cols_joined,
+                                         const std::string& format,
+                                         const std::string& schema_name);
+
+  /// Remove the pinned entry `name` and release its memory. Same threading
+  /// contract as pin_table(). Returns a one-line summary; throws on failure.
+  std::unique_ptr<std::string> unpin_table(const std::string& name);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
   friend class Fragment;
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+};
+
+/// Receives batches straight into its Context's GPU slab. A sender exports a batch with
+/// Fragment::export_direct; the receiver allocates matching buffers here, the transport writes
+/// the sender's buffers into them, and the receiver hands them to Fragment::push_received.
+///
+/// Callable from any thread. After its Context is destroyed every call but the region
+/// accessors throws.
+class SIRIUS_FFI_EXPORT DirectExchange {
+ public:
+  explicit DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange);
+
+  /// The CUDA device and address range of the slab every buffer lies in.
+  [[nodiscard]] int device() const noexcept;
+  [[nodiscard]] std::uintptr_t region_base() const noexcept;
+  [[nodiscard]] std::uint64_t region_len() const noexcept;
+
+  /// Allocate buffers for the `layout_len`-byte layout at `layout_addr` that export_direct
+  /// returned on the sender, without waiting for memory, and set `token` to them.
+  /// @return [address, length] per buffer, pairing with the sender's `src`.
+  /// @throws on a malformed layout or when the memory cannot be reserved now.
+  std::unique_ptr<std::vector<std::uint64_t>> allocate(std::uintptr_t layout_addr,
+                                                       std::size_t layout_len,
+                                                       std::uint64_t& token) const;
+
+  /// Free what `token` holds: a sent batch once its buffers were written, or received buffers
+  /// that will not be pushed. Unknown and consumed tokens are ignored.
+  void release(std::uint64_t token) const;
+
+  /// Hold a fully received batch so that it may spill to host while it waits for its receiver.
+  /// A sealed token is still pushed with Fragment::push_received and freed with release().
+  void seal(std::uint64_t token) const;
+
+  /// Tokens neither released nor consumed.
+  [[nodiscard]] std::size_t outstanding() const;
+
+ private:
+  std::shared_ptr<sirius::exec::direct_exchange> exchange_;
+};
+
+/// Exports one output stream of a fragment for direct exchange while the fragment is still
+/// running, so its batches ship as the sink produces them instead of after run() returns. Created
+/// by Fragment::output_drain().
+///
+/// Callable from any thread, without the Context's connection: it shares only the stream and the
+/// DirectExchange. One consumer per stream; do not mix with export_direct() or relay_from() on
+/// the same stream. Destroy it before its Context.
+class SIRIUS_FFI_EXPORT OutputDrain {
+ public:
+  OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+              std::shared_ptr<sirius::exec::direct_exchange> exchange);
+
+  /// Export the next batch with rows, waiting up to `timeout_ms` for the sink to produce one.
+  /// On a batch, sets `token` (release on the DirectExchange once its buffers were written),
+  /// `rows` and `src` ([address, length] per buffer) and returns the layout. Otherwise returns
+  /// null, with `ended` true at the end of the stream and false when nothing arrived in time.
+  /// @throws the fragment's error once its run() failed, or on a batch it cannot send.
+  std::unique_ptr<std::vector<std::uint8_t>> export_next(std::uint32_t timeout_ms,
+                                                         bool& ended,
+                                                         std::uint64_t& token,
+                                                         std::uint64_t& rows,
+                                                         std::vector<std::uint64_t>& src) const;
+
+ private:
+  std::shared_ptr<sirius::exec::batch_stream> stream_;
+  std::shared_ptr<sirius::exec::direct_exchange> exchange_;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -110,6 +216,11 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// declared the stream expects single sender 0.
   /// @throws after build().
   void declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id);
+
+  /// Declare the row count of input stream `stream_id`, summed over its senders, so the
+  /// optimizer can pick a join's build side. Undeclared streams plan as 1 row. Last call wins.
+  /// @throws after build().
+  void declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows);
 
   /// Declare an output stream. A fragment with no output stream is a result fragment; two or
   /// more need declare_output_broadcast() or declare_output_hash_key(), or build() throws.
@@ -153,6 +264,31 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
+  /// Export the next batch parked on output stream `stream_id` for direct exchange, skipping
+  /// batches without rows. Sets `token`, to release on this Context's DirectExchange once the
+  /// batch's buffers were written, `rows`, and `src`, the [address, length] of each buffer.
+  /// @return the layout to pass to the receiver's DirectExchange::allocate, or null once the
+  /// stream is drained.
+  /// @throws before run(), on an unknown stream, without a DirectExchange, or on a batch it
+  /// cannot send (spilled, or a column neither fixed-width nor string).
+  std::unique_ptr<std::vector<std::uint8_t>> export_direct(std::uint64_t stream_id,
+                                                           std::uint64_t& token,
+                                                           std::uint64_t& rows,
+                                                           std::vector<std::uint64_t>& src);
+
+  /// A handle that exports output stream `stream_id` from any thread, including while run()
+  /// executes. Take it after build() and before run() to ship output as it is produced. A
+  /// fragment destroyed without running fails its drains.
+  /// @throws before build(), on an unknown stream or a result fragment, or without a
+  /// DirectExchange.
+  [[nodiscard]] std::unique_ptr<OutputDrain> output_drain(std::uint64_t stream_id) const;
+
+  /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
+  /// unless it throws before reading it: before build() or on an undeclared input.
+  /// @throws also after run() started, without a DirectExchange, on a token that holds no
+  /// received batch, on a schema mismatch, or when the input already ended.
+  void push_received(std::uint64_t stream_id, std::uint64_t token);
+
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
   /// (relay_from closes its own sender). Idempotent per sender.
   /// @throws before build() or on unknown stream/sender.
@@ -174,6 +310,10 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// Batches currently parked on output stream `stream_id`. For diagnostics. 0 before build().
   /// @throws after build() on an unknown id, including any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
+
+  /// Total rows parked on output stream `stream_id`, without draining it. 0 before build().
+  /// @throws after build() on an unknown id, or on a parked batch that is not GPU-resident.
+  [[nodiscard]] std::uint64_t output_row_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.
   /// @throws before build() or on a result fragment.
