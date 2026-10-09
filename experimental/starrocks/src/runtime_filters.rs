@@ -15,7 +15,7 @@
 //! count of each filter only to the query's root fragment, on the filter's merge node
 //! ([`RuntimeFilters::record_topology`]), which answers the other CNs.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ use starrocks_thrift::types::TNetworkAddress;
 
 use crate::fragment_executor::KeyStats;
 use crate::local_exchange::{ExchangeKey, ReadyFragment};
+use crate::recent_queries::RecentQueries;
 use crate::result_store::FragmentInstanceId;
 
 /// Logs that this CN applies runtime filter `filter_id` to a scan of `instance`.
@@ -180,13 +181,10 @@ struct State {
     /// The fragments that read exchanges on this CN, by `(query, exchange id)` of each exchange
     /// they read. Exchange ids are plan node ids, unique within a query.
     shapes: HashMap<(u64, i32), FragmentShape>,
-    /// Queries purged, by [`FragmentInstanceId::query_hi`], oldest first: nothing more is
+    /// Queries purged, by [`FragmentInstanceId::query_hi`], for a while: nothing more is
     /// recorded for them.
-    purged: VecDeque<u64>,
+    purged: RecentQueries<()>,
 }
-
-/// How many purged queries are remembered, as in the exchange.
-const PURGED_QUERIES: usize = 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeFilters {
@@ -197,7 +195,7 @@ impl RuntimeFilters {
     /// Records the broadcast filters receiver `receiver` builds, keeping the first site of each.
     pub(crate) fn record_builds(&self, receiver: FragmentInstanceId, built: Vec<BuiltFilter>) {
         let mut state = self.lock();
-        if state.purged.contains(&receiver.query_hi()) {
+        if state.purged.get(receiver.query_hi()).is_some() {
             return;
         }
         for filter in built {
@@ -218,7 +216,7 @@ impl RuntimeFilters {
         built: Vec<BuiltFilter>,
     ) {
         let mut state = self.lock();
-        if state.purged.contains(&query.query_hi()) {
+        if state.purged.get(query.query_hi()).is_some() {
             return;
         }
         for filter in built {
@@ -268,7 +266,7 @@ impl RuntimeFilters {
             .flatten()
             .filter_map(|(&filter_id, &count)| Some((filter_id, usize::try_from(count).ok()?)));
         let mut state = self.lock();
-        if state.purged.contains(&query.query_hi()) {
+        if state.purged.get(query.query_hi()).is_some() {
             return;
         }
         for (filter_id, shares) in counts {
@@ -312,7 +310,11 @@ impl RuntimeFilters {
     /// Marks filter exchange `key` as missing a share for good: a holder gave up.
     pub(crate) fn abandon(&self, key: ExchangeKey) {
         let mut state = self.lock();
-        if !state.purged.contains(&key.fragment_instance_id.query_hi()) {
+        if state
+            .purged
+            .get(key.fragment_instance_id.query_hi())
+            .is_none()
+        {
             state.abandoned.insert(key);
         }
     }
@@ -344,7 +346,7 @@ impl RuntimeFilters {
         scan: DeferredScan,
     ) -> Result<(), Box<DeferredScan>> {
         let mut state = self.lock();
-        if state.purged.contains(&instance.query_hi()) {
+        if state.purged.get(instance.query_hi()).is_some() {
             return Err(Box::new(scan));
         }
         state.deferred.insert(instance, scan);
@@ -354,7 +356,7 @@ impl RuntimeFilters {
     /// Records that receiver `instance` waits for `filters` once its inputs are complete.
     pub(crate) fn defer_receiver(&self, instance: FragmentInstanceId, pending: PendingReceiver) {
         let mut state = self.lock();
-        if !state.purged.contains(&instance.query_hi()) {
+        if state.purged.get(instance.query_hi()).is_none() {
             state.pending.insert(instance, pending);
         }
     }
@@ -367,7 +369,7 @@ impl RuntimeFilters {
     /// Records a fragment of `query` that reads exchanges, for [`Self::independent`].
     pub(crate) fn record_shape(&self, query: FragmentInstanceId, shape: FragmentShape) {
         let mut state = self.lock();
-        if state.purged.contains(&query.query_hi()) {
+        if state.purged.get(query.query_hi()).is_some() {
             return;
         }
         for &exchange in &shape.exchanges {
@@ -470,12 +472,7 @@ impl RuntimeFilters {
             .pending
             .retain(|instance, _| instance.query_hi() != query_hi);
         state.shapes.retain(|(query, _), _| *query != query_hi);
-        if !state.purged.contains(&query_hi) {
-            state.purged.push_back(query_hi);
-            if state.purged.len() > PURGED_QUERIES {
-                state.purged.pop_front();
-            }
-        }
+        state.purged.get_or_insert_with(query_hi, || ());
         let purged: Vec<FragmentInstanceId> = state
             .deferred
             .keys()
