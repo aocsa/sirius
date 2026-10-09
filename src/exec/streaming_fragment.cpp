@@ -56,12 +56,13 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
     case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT64};
     case sirius::type_id::BIGINT:
     case sirius::type_id::BOOLEAN:
+    case sirius::type_id::DATE:
     case sirius::type_id::VARCHAR: return cudf::data_type{cudf::type_id::EMPTY};
     case sirius::type_id::DECIMAL: return cudf::data_type{cudf::type_id::FLOAT64};
     default:
       throw sirius::invalid_input_exception(
-        "streaming_fragment: unsupported partition key type — only integer, boolean, varchar, and "
-        "decimal columns may be used as hash partition keys");
+        "streaming_fragment: unsupported partition key type — only integer, boolean, date, varchar, "
+        "and decimal columns may be used as hash partition keys");
   }
 }
 
