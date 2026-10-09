@@ -469,7 +469,7 @@ impl NixlEndpoint for RingTransport {
                 slot: hop.slot,
                 names: hop.names,
                 source: Source::Streamed(hop.drain),
-                deadline: self.deadline(None),
+                deadline: self.deadline(hop.deadline),
             })
             .collect();
         self.ship(hops)
