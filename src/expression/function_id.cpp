@@ -30,7 +30,7 @@ namespace {
 // Forward table: DuckDB function name -> Sirius function id.
 // Symbolic SQL operators and their Substrait spellings resolve to the same ids.
 // Linear scan; called once per BoundFunctionExpression at executor entry.
-constexpr std::array<std::pair<std::string_view, function_id>, 39> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, function_id>, 40> kForwardTable = {{
   {"+", function_id::add},
   {"add", function_id::add},
   {"-", function_id::sub},
