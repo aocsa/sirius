@@ -247,10 +247,41 @@ bool gpu_supports_round(duckdb::BoundFunctionExpression const& expr)
   return !value.IsNull() && value.type().id() == duckdb::LogicalTypeId::INTEGER;
 }
 
+// DuckDB binds unary minus as a one-argument "-". The GPU negates signed integers, floating point
+// and DECIMAL. Other inputs stay on the CPU: DuckDB wraps unsigned values, HUGEINT rides an INT64
+// carrier whose minimum DuckDB can still negate, and INTERVAL has no GPU representation.
+bool gpu_supports_negate(duckdb::LogicalType const& type)
+{
+  switch (type.id()) {
+    case duckdb::LogicalTypeId::TINYINT:
+    case duckdb::LogicalTypeId::SMALLINT:
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT:
+    case duckdb::LogicalTypeId::FLOAT:
+    case duckdb::LogicalTypeId::DOUBLE:
+    case duckdb::LogicalTypeId::DECIMAL: return true;
+    default: return false;
+  }
+}
+
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
 {
   auto func_id_opt = sirius::from_duckdb_function_name(expr.function.name);
   if (!func_id_opt.has_value()) { return nullptr; }
+  // DuckDB overloads "+" and "-" on arity: with one argument, "+" is the identity on a numeric
+  // type and "-" is negation. DuckDB also names BIGNUM negation "+", which IsNumeric excludes.
+  if (expr.children.size() == 1 && *func_id_opt == function_id::add) {
+    auto const& operand_type = expr.children[0]->return_type;
+    if (!operand_type.IsNumeric() || expr.return_type != operand_type) { return nullptr; }
+    return from_duckdb(*expr.children[0]);
+  }
+  if (expr.children.size() == 1 && *func_id_opt == function_id::sub) {
+    if (!gpu_supports_negate(expr.children[0]->return_type)) { return nullptr; }
+    func_id_opt = function_id::negate;
+  }
+  // The GPU handlers read their arguments by position, so an arity they do not take stays on the
+  // CPU rather than reaching the evaluator.
+  if (!accepts_argument_count(*func_id_opt, expr.children.size())) { return nullptr; }
   if (*func_id_opt == function_id::date_trunc) {
     // Match the GPU evaluator's supported frequencies. It requires a constant string;
     // reject other forms here so neither unsupported units nor dynamic units reach execution.
