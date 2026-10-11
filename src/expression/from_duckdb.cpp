@@ -274,6 +274,12 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
+  if (*func_id_opt == function_id::decimal_divide) {
+    // The evaluator reads the scale from the DECIMAL(38, s) return type the bind set.
+    if (expr.children.size() != 3 || expr.return_type.id() != duckdb::LogicalTypeId::DECIMAL) {
+      return nullptr;
+    }
+  }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);
