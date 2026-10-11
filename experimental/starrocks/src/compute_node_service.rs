@@ -3795,6 +3795,8 @@ mod tests {
         unreadable_keys: bool,
         /// Parked outputs dropped.
         dropped: Mutex<Vec<SenderSlot>>,
+        /// Those of them dropped without waiting for the engine thread.
+        dropped_later: Mutex<Vec<SenderSlot>>,
     }
 
     impl FilterRecorder {
@@ -3805,6 +3807,7 @@ mod tests {
                 outputs: Mutex::new(Vec::new()),
                 unreadable_keys: false,
                 dropped: Mutex::new(Vec::new()),
+                dropped_later: Mutex::new(Vec::new()),
             }
         }
 
@@ -3856,6 +3859,11 @@ mod tests {
         fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
             self.dropped.lock().unwrap().push(slot);
             Ok(())
+        }
+
+        fn drop_parked_later(&self, slot: SenderSlot) {
+            self.dropped_later.lock().unwrap().push(slot);
+            let _ = self.drop_parked(slot);
         }
     }
 
@@ -4780,12 +4788,19 @@ mod tests {
         });
         assert!(logs.contains(r#"reason="purged""#), "{logs}");
         assert_eq!(service.filters.deferred(), 0);
-        // The input it held is freed, not left parked.
-        assert!(executor.dropped.lock().unwrap().contains(&SenderSlot {
-            fragment_instance_id: FragmentInstanceId::from_halves(64, 40),
-            node_id: 30,
-            sender_id: 0,
-        }));
+        // The input it held is freed, not left parked, and without waiting for the engine
+        // thread, which may be busy with the run the purge interrupts.
+        assert!(
+            executor
+                .dropped_later
+                .lock()
+                .unwrap()
+                .contains(&SenderSlot {
+                    fragment_instance_id: FragmentInstanceId::from_halves(64, 40),
+                    node_id: 30,
+                    sender_id: 0,
+                })
+        );
         assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
 
         // One still waiting for its inputs is forgotten too.
