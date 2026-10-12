@@ -680,6 +680,7 @@ mod tests {
             column_type: "INTEGER".to_string(),
             distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Broadcast,
             merge_node: None,
+            served_by: None,
         }
     }
 
