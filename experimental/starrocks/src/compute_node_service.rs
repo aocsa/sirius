@@ -4728,7 +4728,7 @@ mod tests {
         let plan = scan.fragment.as_mut().unwrap().plan.as_mut().unwrap();
         plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].runtime_filter_merge_nodes =
             Some(Vec::new());
-        let logs = captured_logs(|| service.run_or_register(&scan).unwrap());
+        let logs = captured_logs(|| service.process_fragment(&scan).unwrap());
         assert!(
             logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="no_merge_node""#),
             "{logs}"
