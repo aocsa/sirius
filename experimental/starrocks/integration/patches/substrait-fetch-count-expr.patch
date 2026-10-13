@@ -1,0 +1,125 @@
+From 9b5b2d43ff929eeff328515782e0aa54406e2674 Mon Sep 17 00:00:00 2001
+From: Alexander Victor Ocsa Mamani <aocsa.cs@gmail.com>
+Date: Fri, 9 Oct 2026 13:44:07 +0000
+Subject: [PATCH] fix: read FetchRel count_expr and offset_expr
+
+Producers on Substrait 0.65+ write a fetch's bounds as `count_expr` and
+`offset_expr`. TransformFetchOp read only the deprecated `count` and
+`offset`, which are unset then, so every LIMIT became LIMIT 0 and every
+OFFSET was dropped (sirius-db/sirius#1963).
+
+Read whichever member of each oneof is set, as the spec says:
+- `count_expr` / `offset_expr`: an integer literal; a null literal means
+  all records for a count and 0 for an offset. A negative value or a
+  non-literal expression is an error.
+- the deprecated `count` (-1 means all records) and `offset` keep working,
+  since this branch's own producer still writes them.
+- an unset count means all records, and an unset offset means 0.
+
+main already reads count_expr/offset_expr since the Substrait 0.98
+upgrade (#245), which also removed the deprecated fields; this brings the
+same behaviour to duckdb-1.5.5 without dropping them.
+---
+ src/from_substrait.cpp | 76 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/src/from_substrait.cpp b/src/from_substrait.cpp
+index dd723b3..c8876f5 100644
+--- a/src/from_substrait.cpp
++++ b/src/from_substrait.cpp
+@@ -3,6 +3,7 @@
+ #include <cinttypes>
+ #include <cmath>
+ 
++#include "duckdb/common/optional_idx.hpp"
+ #include "duckdb/common/types/value.hpp"
+ #include "duckdb/parser/expression/list.hpp"
+ #include "duckdb/main/connection.hpp"
+@@ -581,11 +582,82 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformCrossProductOp(const substrait:
+ 	                                             TransformOp(sub_cross.right())->Alias("right"));
+ }
+ 
++// A FetchRel bound given as an expression (`count_expr`, `offset_expr`): a non-negative integer
++// literal, or a null literal, which the spec reads as "all records" for a count and 0 for an offset.
++static optional_idx TransformFetchBound(const substrait::Expression &sexpr, const char *field) {
++	if (!sexpr.has_literal()) {
++		throw NotImplementedException("FetchRel %s must be a literal", field);
++	}
++	auto &literal = sexpr.literal();
++	int64_t value;
++	switch (literal.literal_type_case()) {
++	case substrait::Expression_Literal::LiteralTypeCase::kNull:
++		return optional_idx();
++	case substrait::Expression_Literal::LiteralTypeCase::kI8:
++		value = literal.i8();
++		break;
++	case substrait::Expression_Literal::LiteralTypeCase::kI16:
++		value = literal.i16();
++		break;
++	case substrait::Expression_Literal::LiteralTypeCase::kI32:
++		value = literal.i32();
++		break;
++	case substrait::Expression_Literal::LiteralTypeCase::kI64:
++		value = literal.i64();
++		break;
++	default:
++		throw NotImplementedException("FetchRel %s must be an integer literal", field);
++	}
++	if (value < 0) {
++		throw InvalidInputException("FetchRel %s must not be negative, got %lld", field, (long long)value);
++	}
++	return optional_idx(static_cast<idx_t>(value));
++}
++
+ shared_ptr<Relation> SubstraitToDuckDB::TransformFetchOp(const substrait::Rel &sop,
+                                                          const google::protobuf::RepeatedPtrField<std::string> *names) {
+ 	auto &slimit = sop.fetch();
+-	idx_t limit = slimit.count() == -1 ? NumericLimits<idx_t>::Maximum() : slimit.count();
+-	idx_t offset = slimit.offset();
++	// An unset count means all records, and an unset offset means 0. The deprecated `count` and
++	// `offset` share a oneof with `count_expr` and `offset_expr`, so only one of each is ever set.
++	idx_t limit = NumericLimits<idx_t>::Maximum();
++	switch (slimit.count_mode_case()) {
++	case substrait::FetchRel::kCount:
++		if (slimit.count() < -1) {
++			throw InvalidInputException("FetchRel count must not be negative, got %lld", (long long)slimit.count());
++		}
++		// -1 means all records.
++		if (slimit.count() != -1) {
++			limit = static_cast<idx_t>(slimit.count());
++		}
++		break;
++	case substrait::FetchRel::kCountExpr: {
++		auto count = TransformFetchBound(slimit.count_expr(), "count_expr");
++		if (count.IsValid()) {
++			limit = count.GetIndex();
++		}
++		break;
++	}
++	default:
++		break;
++	}
++	idx_t offset = 0;
++	switch (slimit.offset_mode_case()) {
++	case substrait::FetchRel::kOffset:
++		if (slimit.offset() < 0) {
++			throw InvalidInputException("FetchRel offset must not be negative, got %lld", (long long)slimit.offset());
++		}
++		offset = static_cast<idx_t>(slimit.offset());
++		break;
++	case substrait::FetchRel::kOffsetExpr: {
++		auto skip = TransformFetchBound(slimit.offset_expr(), "offset_expr");
++		if (skip.IsValid()) {
++			offset = skip.GetIndex();
++		}
++		break;
++	}
++	default:
++		break;
++	}
+ 	return make_shared_ptr<LimitRelation>(TransformOp(slimit.input(), names), limit, offset);
+ }
+ 
+-- 
+2.43.0
+
