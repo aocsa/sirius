@@ -230,6 +230,11 @@ impl PlanTranslator {
     }
 
     /// Translates a fragment whose exchange nodes read the given input streams.
+    ///
+    /// `exchange_inputs` holds at most one entry per receiver `EXCHANGE_NODE` id; a duplicate id
+    /// is a [`TranslateError`]. Entries naming no exchange in the plan are ignored. Every exchange
+    /// that is lowered is reported in [`TranslatedPlan::stream_inputs`], and the caller must
+    /// declare those streams on the engine.
     pub fn translate_fragment_with_exchange_inputs(
         &self,
         params: &TExecPlanFragmentParams,
@@ -270,8 +275,15 @@ impl PlanTranslator {
         let scan_paths = ScanFilePaths::from_fragment(params, &desc)?;
         let exchange_inputs = exchange_inputs
             .iter()
-            .map(|input| (input.node_id, input))
-            .collect::<HashMap<_, _>>();
+            .try_fold(HashMap::new(), |mut map, input| {
+                match map.insert(input.node_id, input) {
+                    None => Ok(map),
+                    Some(_) => Err(TranslateError::malformed(format!(
+                        "exchange node {} is bound to more than one input stream",
+                        input.node_id
+                    ))),
+                }
+            })?;
         let filter_inputs = filter_inputs
             .iter()
             .map(|input| (input.filter_id, input))
