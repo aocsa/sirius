@@ -14,6 +14,7 @@ On top of `main` (30991b4f, #1956):
 | failures | #2115 failure frames → #2116 reportExecStatus → #2118 cancel reasons → #2120 interrupt and purge → #2121 query timeouts; #2105 engine interrupt |
 | from `main` PRs | #2100, #2101, #2107 (`LIMIT` fix, `substrait` submodule at 9b5b2d4), #2124 (decimal cast rounding) |
 | local | the fixes needed to combine the three stacks, and a function-table fix for `round` + `sirius_decimal_divide` |
+| #2037 review fixes | duplicate exchange bindings rejected, concurrent FILES() footer reads, `output_row_count` throws before `build()` (e65e6aa7, 2546fc3a) |
 
 Not included: #2125, #2128, #2131 (engine fixes TPC-H doesn't need) and #1965.
 
@@ -31,7 +32,7 @@ You need the 4× GB200 box (or similar), `pixi` in `~/.pixi/bin`, and the TPC-H 
 
 ```bash
 export WORK=/raid/$USER            # a local directory with ~40 GB free, not the NFS $HOME (BOX.md: /raid needs a one-time sudo mkdir)
-git clone -b tmp/sr-cn-integration-2026-10-13 https://github.com/aocsa/sirius.git $WORK/sirius
+git clone -b tmp/sr-cn-integration-2026-10-13b https://github.com/aocsa/sirius.git $WORK/sirius
 cd $WORK/sirius/experimental/starrocks/integration
 
 ./setup.sh            # tools repo (box/gb200) next to this checkout, then UCX/NIXL, engine, FE, CN
