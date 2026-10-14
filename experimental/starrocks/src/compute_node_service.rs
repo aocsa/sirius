@@ -2099,6 +2099,15 @@ impl SiriusComputeNodeService {
             .remove(query.query_hi());
     }
 
+    /// True for the empty table, marked `is_cached`, that StarRocks sends in place of a
+    /// descriptor table it already sent for the query.
+    fn is_cached_reference(desc: &TDescriptorTable) -> bool {
+        desc.is_cached == Some(true)
+            && desc.slot_descriptors.as_ref().is_none_or(Vec::is_empty)
+            && desc.tuple_descriptors.is_empty()
+            && desc.table_descriptors.as_ref().is_none_or(Vec::is_empty)
+    }
+
     /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<pid>-<seq>.txt`
     /// (debug format) for offline plan analysis. No-op when the variable is unset.
     fn dump_fragment(params: &TExecPlanFragmentParams) -> Option<u64> {
@@ -2959,7 +2968,8 @@ impl SiriusComputeNodeService {
         // The FE puts the query's descriptor table in common_param and gives each instance an
         // empty one marked cached. Like the BE, which prepares common_param before any instance,
         // cache the shared table for the query first.
-        self.resolve_descriptor_table(common)?;
+        self.resolve_descriptor_table(common)
+            .map_err(Self::internal_error)?;
 
         for (idx, instance) in instances.iter().enumerate() {
             let mut params = instance.clone();
@@ -5379,6 +5389,7 @@ mod tests {
         let instance = |plan, instance_id| {
             let cached = TDescriptorTable::new(None, Vec::new(), None, Some(true));
             let mut params = fragment_params(Some(plan), Some(cached));
+            params.fragment.as_mut().unwrap().output_sink = Some(result_sink());
             params.params = Some(exec_params(query_id.clone(), instance_id));
             params
         };
