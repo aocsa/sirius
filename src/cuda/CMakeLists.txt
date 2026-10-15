@@ -4,6 +4,7 @@ target_sources(
           dense_count_join_impl.cu
           low_cardinality_groupby.cu
           stable_hash_partition.cu
+          probe_accumulate_impl.cu
           device_copy_batch.cpp
           dynamic_filter_mask_ops.cu
           dynamic_filter_replica_transfer.cu

@@ -194,6 +194,18 @@ It applies only to one or two non-null one-character STRING keys, at most 64 gro
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
 
 **Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default). TPC-H SF1000 GB300: q1 0.884 s → 0.277 s.
+### Probe-Accumulate Join (unreleased, experimental)
+
+**Motivation:** `SELECT key, MIN/MAX/COUNT(...) FROM probe JOIN build USING (key) GROUP BY key` with a unique build side materializes every (probe row, build row) pair, gathers the joined rows and hashes them into one group per key, although the build side already is the set of groups. For TPC-H q21's candidate orders (144M keys at SF1000) the hash group-by was 113 ms of kernel time and the join/group-by/merge tail after the probe scan was about 200 ms.
+
+**Mechanism:** the join runs in a single-partition `BUILD_PROBE` mode with an accumulate context. One record per build row holds every aggregate (hits, counts, MIN/MAX values, one-byte seen flags). Each probe batch's `distinct_hash_join::inner_join` pairs are folded into the matched build row's record by one atomic kernel and the join returns empty batches; after the join's pipeline finishes, `PROBE_ACCUMULATE_EMIT` compacts the records with at least one match into `[key, aggregate...]`. The build side, dynamic-filter publication and sizing are the ordinary join's. A `PASSTHROUGH_SINK` between the join and the emit operator makes the emit run once instead of in every probe task. See [Probe-Accumulate Join](probe-accumulate.md).
+
+- `src/planner/sirius_plan_probe_accumulate.cpp` — detection, probe projection, capacity gate
+- `src/op/sirius_physical_hash_join.cpp` — accumulate branch of the `BUILD_PROBE` build and probe
+- `src/op/sirius_physical_probe_accumulate_emit.cpp` — result emission
+- `src/cuda/probe_accumulate_impl.cu` — record layout, accumulate/initialize/emit kernels
+
+**Config:** `enable_probe_accumulate` (default `false`, see [Configuration](configuration.md)); needs `max_build_hash_table_bytes` large enough for the build keys. TPC-H SF1000 GB300: q21 written as a shared-scan pre-aggregation 0.542 s -> 0.425 s (original q21 SQL is not matched yet; see the page's status section).
 
 ### Distinct Hash Join (PR #558)
 
