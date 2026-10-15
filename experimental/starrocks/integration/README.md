@@ -55,6 +55,11 @@ These were run on `tmp/sr-integration-v8` (b939f038), which is this branch witho
   - No query differed by more than 2%. `/opt` is I/O-bound; on `/scratch`, v7 ran the 22 queries in 39.20 s (44/44).
 - **Failure injection** (q05 with one fragment failed on purpose): passes, and the CNs hold nothing afterwards.
 
+**From a fresh clone of this branch** (Oct 15, following the steps below):
+- `setup.sh` fetched `substrait` bdfb4eac from the public repo and built everything in 14 minutes, with warm compiler and pixi caches.
+- `./test.sh smoke` passed 22/22.
+- `TPCH_QUERIES="q03 q10 q18" ./test.sh sf1000` on `/opt` passed 3/3 (9.3, 9.3 and 6.1 s, the same as above).
+
 Not re-measured on this branch: SF3000 and pinning with `PIN_COMPRESSION=1` (see the known issues).
 
 ## Setup, test, bench
@@ -62,7 +67,7 @@ Not re-measured on this branch: SF3000 and pinning with `PIN_COMPRESSION=1` (see
 You need the 4× GB200 box (or similar), `pixi` in `~/.pixi/bin`, and the TPC-H parquet data.
 
 ```bash
-export WORK=/tmp/$USER/sr-cn   # local disk with about 100 GB free, not the NFS $HOME
+export WORK=/tmp/$USER/sr-cn   # local disk with about 40 GB free, not the NFS $HOME
 git clone -b tmp/sr-cn-integration-2026-10-15 https://github.com/aocsa/sirius.git $WORK/sirius
 cd $WORK/sirius/experimental/starrocks/integration
 
