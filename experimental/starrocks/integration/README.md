@@ -33,7 +33,7 @@ These are not part of the stacks. Each is either an open PR against `main` or a 
 | f1ef77c7 | #2101: the CN heartbeat reports its StarRocks release (PR head d63046bf, same patch) | So `SHOW COMPUTE NODES` tells which StarRocks release a CN was built for. |
 | 6230805d | #2124: round GPU casts to DECIMAL like DuckDB, ported to v2 (same patch as cfc69510; the PR head 25820238 adds #2188's commit and a CI change on top) | StarRocks plans TPC-H revenue expressions with this cast. Without it, the GPU truncates (0.92 instead of 0.93) and results differ from DuckDB. The v2 port also covers v2's FLOAT→DECIMAL change. |
 | be489700, 29642db2 | #2107: the Substrait consumer reads `FetchRel.count_expr`/`offset_expr` (PR head 05bdf818, same code), with the `substrait` submodule at bdfb4eac | Without it, every `LIMIT` reads as `LIMIT 0` (q02, q03, q10, q18 and q21 have one). See below for the submodule. |
-| 883f3dd1 | fix(partition): a streaming sink converts its hash keys again ([#2217](https://github.com/sirius-db/sirius/pull/2217), draft) | #2092 on `main` broke DECIMAL partition keys in streaming fragments. q10 and q18 fail from #2127 (native DECIMAL) on without it. |
+| 883f3dd1, d71fbae9 | fix(partition): a streaming sink converts its hash keys again ([#2217](https://github.com/sirius-db/sirius/pull/2217), draft; d71fbae9 cherry-picks the PR head 325d323d over the earlier local 883f3dd1, adding its `<cstdint>` include, formatting and docs) | #2092 on `main` broke DECIMAL partition keys in streaming fragments. q10 and q18 fail from #2127 (native DECIMAL) on without it. |
 | b939f038 | glue for #2100 | Integration only: #2100 on top of #2038 (which requires a result sink) and #2118 (which returns `StatusPb`). |
 | (top) | the `substrait` pin and this directory | |
 
@@ -59,6 +59,10 @@ These were run on `tmp/sr-integration-v8` (b939f038), which is this branch witho
 - `setup.sh` fetched `substrait` bdfb4eac from the public repo and built everything in 14 minutes, with warm compiler and pixi caches.
 - `./test.sh smoke` passed 22/22.
 - `TPCH_QUERIES="q03 q10 q18" ./test.sh sf1000` on `/opt` passed 3/3 (9.3, 9.3 and 6.1 s, the same as above).
+
+**SF1000 on `/scratch`** (Oct 16, a fresh clone at 21cc7734, before d71fbae9, which changes no behavior):
+- `./test.sh smoke` passed 22/22.
+- `GPUS="0 1 2 3" ./bench.sh`: 66/66 (22 queries, 3 iterations), and the sum of median times was 39.08 s. q01 (about 5 s) is the first query on each fresh cluster.
 
 Not re-measured on this branch: SF3000 and pinning with `PIN_COMPRESSION=1` (see the known issues).
 
