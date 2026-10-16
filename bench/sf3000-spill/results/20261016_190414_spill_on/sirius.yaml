@@ -1,0 +1,53 @@
+# TPC-H SF3000 spill config -- one GPU sized like a g7e.8xlarge (RTX PRO 6000, 96 GB).
+# Derived from bench/sf1000-repro/sirius-sf1000.yaml. SF3000 (~1.1 TB parquet) does not fit
+# in 91 GB of GPU or 100 GB of pinned host, so intermediates spill GPU -> host -> disk, which
+# is the path spill compression (SET spill_compression) changes.
+#
+# Differences from the SF1000 repro:
+#   gpu.usage_limit_bytes   91 GB   (0.95 x 96 GB) instead of 0.95 of the whole card
+#   host.capacity_bytes     100 GB  matches the "100 GB host" runs; forces host -> disk spill
+#   disk.downgrade_root_dirs on /scratch (run.sh overrides it via SPILL_DIR)
+#   operator_params          scaled down for the smaller card
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            usage_limit_bytes: 91GB
+            reservation_limit_fraction: 1.0
+            downgrade_trigger_fraction: 0.9
+            downgrade_stop_fraction: 0.85
+        host:
+            capacity_bytes: 100GB
+            initial_number_pools: 12
+            pool_size: 128
+            block_size: 67108864
+        disk:
+            disk_id: 0
+            capacity_bytes: 8TB
+            downgrade_root_dirs: "/scratch/prestouser/aocsa/spill"
+    executor:
+        scan_manager:
+          memory_prefetcher:
+            enable: true
+            num_threads: 3
+          num_threads: 18
+          uring_n_reactors: 4
+        pipeline:
+            num_threads: 8
+        downgrade:
+            num_threads: 1
+        task_creator:
+            num_threads: 4
+    operator_params:
+        scan_task_batch_size: 2GB
+        max_sort_partition_bytes: 0               # 0: auto (33% GPU memory)
+        hash_partition_bytes: 8GB
+        concat_batch_bytes: 2GB
+        max_build_hash_table_bytes: 8GB
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB
+    compression:
+        enable_spill_compression: true

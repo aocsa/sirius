@@ -1,0 +1,4 @@
+estimate: ~4859781370 rows read (read_parquet ~2399890680, read_parquet ~2399890680, read_parquet ~30000000, read_parquet ~30000000, read_parquet ~5, 1 more), ~435026376 rows returned
+| ps_partkey:INTEGER | value:DECIMAL(38,2) |
+|---|---|
+0 rows, hash 0000000000000000

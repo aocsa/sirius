@@ -1,0 +1,4 @@
+estimate: ~3629513100 rows read (read_parquet ~3599513100, read_parquet ~30000000), ~2275326232 rows returned
+| s_suppkey:INTEGER | s_name:VARCHAR | s_address:VARCHAR | s_phone:VARCHAR | total_revenue:DECIMAL(38,4) |
+|---|---|---|---|---|
+| 28274750 | Supplier#028274750 | llEwSpHv6upg,HW89CnzRlaDdhIFOIKyikrppu | 10-249-759-3286 | 3669565.2176 |

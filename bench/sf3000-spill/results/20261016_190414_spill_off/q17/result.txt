@@ -1,0 +1,4 @@
+estimate: ~36115130435 rows read (read_parquet ~17997565500, read_parquet ~17997565500, read_parquet ~119999435), ~1 rows returned
+| avg_yearly:DOUBLE |
+|---|
+| 682979433.1671429 |

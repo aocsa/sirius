@@ -1,0 +1,34 @@
+# TPC-H SF3000, best measured g7e.8xlarge config from the SF3000 results atlas:
+#   "Sirius · 200 GiB host / 20 GB cache / compression ON"  (456.7 s cold, 426.6 s lukewarm, 416 s hot)
+#
+# GPU capped at a g7e.8xlarge's RTX PRO 6000 (96 GB x 0.95). Operator batch/partition sizes are left
+# unset so they derive from that GPU capacity, as on the g7e runs.
+#
+# "Cache" is the Sirius prefetching cache. It lives in the pinned host pool and is capped at
+# host capacity x scan_manager.cache.eviction_threshold_fraction (src/io/cache/types.cpp), so
+# 20 GB of a 200 GiB pool is 20e9 / 214.7e9 = 0.093.
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            usage_limit_bytes: 91GB
+        host:
+            capacity_bytes: 200GiB
+            block_size: 64MiB
+            pool_size: 128
+            initial_number_pools: 25
+        disk:
+            disk_id: 0
+            capacity_bytes: 8TB
+            downgrade_root_dirs: "/scratch/prestouser/aocsa/spill"
+    executor:
+        scan_manager:
+            cache:
+                mode: sirius
+                eviction: lru
+                eviction_threshold_fraction: 0.093
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB
