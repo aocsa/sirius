@@ -14,7 +14,8 @@
 # build made without it keeps the stub, which the CN refuses at start-up, until
 # `cargo clean -p nixl-sys`.
 #
-# Run-time settings the CN reads (not set here): SIRIUS_CN_NIXL_WINDOW (WRITEs in flight per hop,
+# Run-time settings the CN reads (not set here): SIRIUS_CN_EXCHANGE (ring, the default, or
+# direct) and SIRIUS_CN_RING_* (ring sizes; see ring_nixl.rs), SIRIUS_CN_NIXL_WINDOW (WRITEs in flight per hop,
 # default 4) and SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS (longest a WRITE may take, default 30); both
 # must be positive integers. Pin each CN to exactly one GPU with CUDA_VISIBLE_DEVICES=<n>.
 
