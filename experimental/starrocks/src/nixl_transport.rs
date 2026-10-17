@@ -973,7 +973,7 @@ fn hops_outcome(
 /// thread, so a peer that does not answer holds up neither the caller nor the other hops. Best
 /// effort: a peer that refuses the frame or does not answer within [`FAILED_TIMEOUT`] is logged,
 /// and past [`FAILED_IN_FLIGHT`] frames in flight the rest are dropped.
-fn send_failed(ends: Vec<(SocketAddr, SenderSlot)>, error: &str) {
+pub(crate) fn send_failed(ends: Vec<(SocketAddr, SenderSlot)>, error: &str) {
     // Nothing failed when the query ended normally: the receivers end with their own cancel from
     // the FE, and a failure frame would make a CN that has not had it yet fail a finished query.
     if crate::recent_queries::is_normal_end(error) {
@@ -1080,7 +1080,7 @@ fn is_pool_exhausted(error: &str) -> bool {
 }
 
 /// One `transmit_chunk` round trip to `peer`, returning the reply attachment.
-fn call(
+pub(crate) fn call(
     peer: SocketAddr,
     params: PTransmitChunkParams,
     envelope: &NixlEnvelope,
@@ -1164,7 +1164,7 @@ fn parse_positive(name: &str, value: Option<&str>) -> Result<Option<u64>, String
 
 /// One CN per GPU: cross-process `cuda_ipc` is only proven with each CN seeing its own device, so
 /// CUDA_VISIBLE_DEVICES must name exactly one.
-fn check_single_visible_device(visible: Option<&str>) -> Result<(), String> {
+pub(crate) fn check_single_visible_device(visible: Option<&str>) -> Result<(), String> {
     let Some(visible) = visible else {
         return Err("CUDA_VISIBLE_DEVICES is unset; pin each CN to one GPU".to_string());
     };
