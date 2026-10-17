@@ -38,6 +38,19 @@ mod ffi {
         /// to the C++ `const std::string&` parameter.
         fn make_context_from_config(config_path: &CxxString) -> Result<UniquePtr<Context>>;
 
+        /// Create a [`Context`] with a ring exchange: send and receive rings of
+        /// `frame_bytes` frames allocated before the engine's GPU pool, and
+        /// landing limits on the GPU and host tiers. An empty `config_path`
+        /// uses built-in defaults.
+        fn make_context_with_ring(
+            config_path: &CxxString,
+            frame_bytes: u64,
+            send_bytes: u64,
+            recv_bytes: u64,
+            gpu_landing_fraction: f64,
+            host_landing_bytes: u64,
+        ) -> Result<UniquePtr<Context>>;
+
         /// Execute a serialized Substrait plan on the GPU, writing the results
         /// into the Arrow C Data Interface stream at `out_stream_addr` — the
         /// address (as `usize`) of a caller-owned `ArrowArrayStream` the caller
@@ -147,6 +160,58 @@ mod ffi {
             max: &mut i64,
         ) -> Result<()>;
 
+        /// The engine's ends of the ring exchange: the send and receive rings and
+        /// the copies in and out of them. Callable from any thread; the contract
+        /// of every method is documented on the C++ class.
+        type RingExchange;
+
+        /// This context's ring exchange, or null unless it was made with one.
+        fn ring_exchange(self: &Context) -> UniquePtr<RingExchange>;
+
+        fn device(self: &RingExchange) -> i32;
+        fn send_base(self: &RingExchange) -> usize;
+        fn send_len(self: &RingExchange) -> u64;
+        fn recv_base(self: &RingExchange) -> usize;
+        fn recv_len(self: &RingExchange) -> u64;
+        fn frame_bytes(self: &RingExchange) -> u64;
+
+        /// A free frame's index, or -1 when every frame is leased.
+        fn lease_send(self: &RingExchange) -> Result<i64>;
+        fn lease_recv(self: &RingExchange) -> Result<i64>;
+        fn release_send(self: &RingExchange, frame: u32) -> Result<()>;
+        fn release_recv(self: &RingExchange, frame: u32) -> Result<()>;
+
+        /// Copy frame `k` of job `token` into send frame `frame`; returns a ticket.
+        fn stage(self: &RingExchange, token: u64, k: u32, frame: u32) -> Result<u64>;
+        /// Free what a job holds once its frames were written.
+        fn release_job(self: &RingExchange, token: u64) -> Result<()>;
+
+        /// Start landing the batch with this header; returns the landing.
+        ///
+        /// # Safety
+        /// `header_addr` must point at `header_len` readable bytes that outlive
+        /// this call. The safe wrapper upholds this.
+        unsafe fn begin(
+            self: &RingExchange,
+            header_addr: usize,
+            header_len: usize,
+            tier: &mut u8,
+            rows: &mut u64,
+            stream_bytes: &mut u64,
+            frames: &mut u32,
+        ) -> Result<u64>;
+        /// Copy receive frame `frame`, the stream's frame `k`, to a landing; returns a ticket.
+        fn copy_out(self: &RingExchange, landing: u64, k: u32, frame: u32, len: u64)
+        -> Result<u64>;
+        /// Hand a landing to the direct exchange; returns its token.
+        fn seal(self: &RingExchange, landing: u64) -> Result<u64>;
+        /// Free a landing that will not be sealed.
+        fn abort(self: &RingExchange, landing: u64) -> Result<()>;
+        /// Whether a ticket's copies finished; true consumes it.
+        fn done(self: &RingExchange, ticket: u64) -> Result<bool>;
+        /// Counters as one log line.
+        fn stats_line(self: &RingExchange) -> Result<UniquePtr<CxxString>>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches) or none (a result fragment, which produces Arrow). The
@@ -220,6 +285,17 @@ mod ffi {
         /// A handle exporting an output stream from any thread, including while
         /// the fragment runs. Take it after `build` and before `run`.
         fn output_drain(self: &Fragment, stream_id: u64) -> Result<UniquePtr<OutputDrain>>;
+
+        /// export_direct for the ring exchange: exports the next batch of a parked
+        /// output as a ring job and returns its header, or null once drained.
+        fn export_ring(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            token: &mut u64,
+            kind: &mut u8,
+            rows: &mut u64,
+            stream_bytes: &mut u64,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
 
         /// Add the non-null rows, distinct keys (per batch, summed), minimum
         /// and maximum of a signed integer column over every batch parked on
@@ -296,10 +372,22 @@ mod ffi {
             rows: &mut u64,
             src: Pin<&mut CxxVector<u64>>,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
+
+        /// export_next for the ring exchange: sets `token`, `kind`, `rows` and
+        /// `stream_bytes` and returns the job's header, or null as export_next.
+        fn export_ring_next(
+            self: &OutputDrain,
+            timeout_ms: u32,
+            ended: &mut bool,
+            token: &mut u64,
+            kind: &mut u8,
+            rows: &mut u64,
+            stream_bytes: &mut u64,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
     }
 }
 
 pub use ffi::{
-    Context, DirectExchange, Fragment, Interrupter, OutputDrain, make_context,
-    make_context_from_config, make_fragment, stream_view_name,
+    Context, DirectExchange, Fragment, Interrupter, OutputDrain, RingExchange, make_context,
+    make_context_from_config, make_context_with_ring, make_fragment, stream_view_name,
 };
