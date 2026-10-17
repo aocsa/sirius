@@ -1,0 +1,52 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 88272084664
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.9
+      downgrade_stop_fraction: 0.85
+    host:
+      capacity_bytes: 200GiB
+      block_size: 1MiB
+      pool_size: 128
+      initial_number_pools: 384
+    disk:
+      disk_id: 0
+      capacity_bytes: 800GB
+      downgrade_root_dirs: /scratch/prestouser/aocsa/spill/hot-host200GiB-cache20-gpu1-reactors16-sf3000-compression-on-b17d538c08
+  executor:
+    scan_manager:
+      backend: sirius
+      memory_prefetcher:
+        enable: true
+        num_threads: 4
+      num_threads: 16
+      rest_n_reactors: 16
+      max_readahead_scans: 48
+      max_readahead_bytes: 4GB
+      cache:
+        mode: sirius
+        eviction: lru
+        eviction_threshold_fraction: 0.09313225746154785
+    pipeline:
+      num_threads: 16
+    downgrade:
+      num_threads: 2
+    task_creator:
+      num_threads: 2
+  operator_params:
+    scan_task_batch_size: 1GB
+    hash_partition_bytes: 4GB
+    concat_batch_bytes: 2GB
+    max_build_hash_table_bytes: 4GB
+
+  compression:
+    enable_spill_compression: true
+  telemetry:
+    enable_quent: true
+    enable_nvtx: false
+    exporter: ndjson
+    output_directory: /scratch/prestouser/aocsa/spillcomp/repro-results/8xl-sf3k-hot/hot/sf3000/compression-on/telemetry
+    engine_name: hot-host200GiB-cache20-gpu1-reactors16-compression-on

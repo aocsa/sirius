@@ -1,0 +1,25 @@
+--- a/tools/benchmark.py
++++ b/tools/benchmark.py
+@@ -67,7 +67,7 @@
+     num_gpus: {num_gpus}
+   memory:
+     gpu:
+-      usage_limit_fraction: 0.86
++      usage_limit_bytes: {gpu_limit_bytes}
+       reservation_limit_fraction: 0.9
+       downgrade_trigger_fraction: 0.9
+       downgrade_stop_fraction: 0.85
+@@ -149,11 +149,11 @@
+         raise RuntimeError(f'Incomplete prior mode suite: {root}')
+     root.mkdir(parents=True,exist_ok=True)
+     enabled=engine=='compression-on'
+-    spill=Path('/opt/dlami/nvme/joost-spill/spill')/f'{a.mode}-host{a.host_label}-cache{a.cache_gb}-gpu{a.num_gpus}-reactors{a.reactors}-sf{a.scale}-{engine}-{hashlib.sha256(str(a.output).encode()).hexdigest()[:10]}'
++    spill=Path(os.environ.get('REPRO_SPILL_ROOT','/opt/dlami/nvme/joost-spill/spill'))/f'{a.mode}-host{a.host_label}-cache{a.cache_gb}-gpu{a.num_gpus}-reactors{a.reactors}-sf{a.scale}-{engine}-{hashlib.sha256(str(a.output).encode()).hexdigest()[:10]}'
+     if spill.exists():raise RuntimeError(f'Existing spill dir {spill}')
+     spill.mkdir(parents=True)
+     cfg=root/'config.yaml'
+-    cfg.write_text(CONFIG.format(host_capacity=(f"capacity_bytes: {a.host_gib}GiB" if a.host_gib else f"capacity_fraction: {a.host_fraction}"),bloom_config_line=(f"    max_dynamic_filter_bloom_bytes_per_gpu: {a.bloom_cap_mib}MiB" if a.bloom_cap_mib else ""),bloom_cap_mib=a.bloom_cap_mib,spill=spill,telemetry=root/'telemetry',name=f'{a.mode}-host{a.host_label}-cache{a.cache_gb}-gpu{a.num_gpus}-reactors{a.reactors}-{engine}',enabled=str(enabled).lower(),initial_pools=a.initial_pools,host_fraction=a.host_fraction,num_gpus=a.num_gpus,reactors=a.reactors,disk_gb=a.disk_gb,cache_fraction=((20 if a.cache_gb==0 else a.cache_gb)*10**9/a.host_bytes),cache_mode=('none' if a.cache_gb==0 else 'sirius')))
++    cfg.write_text(CONFIG.format(gpu_limit_bytes=os.environ.get('REPRO_GPU_LIMIT_BYTES',str(int(0.86*97887*2**20))),host_capacity=(f"capacity_bytes: {a.host_gib}GiB" if a.host_gib else f"capacity_fraction: {a.host_fraction}"),bloom_config_line=(f"    max_dynamic_filter_bloom_bytes_per_gpu: {a.bloom_cap_mib}MiB" if a.bloom_cap_mib else ""),bloom_cap_mib=a.bloom_cap_mib,spill=spill,telemetry=root/'telemetry',name=f'{a.mode}-host{a.host_label}-cache{a.cache_gb}-gpu{a.num_gpus}-reactors{a.reactors}-{engine}',enabled=str(enabled).lower(),initial_pools=a.initial_pools,host_fraction=a.host_fraction,num_gpus=a.num_gpus,reactors=a.reactors,disk_gb=a.disk_gb,cache_fraction=((20 if a.cache_gb==0 else a.cache_gb)*10**9/a.host_bytes),cache_mode=('none' if a.cache_gb==0 else 'sirius')))
+     env=os.environ.copy();env['SIRIUS_CONFIG_FILE']=str(cfg)
+     values=[]
+     setup='.bail on\n.timer off\n'

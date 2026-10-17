@@ -1,0 +1,65 @@
+{
+  "bloom_cap_mib": null,
+  "scale": 3000,
+  "mode": "lukewarm",
+  "host_bytes": 214748364800,
+  "host_label": "200GiB",
+  "host_fraction": 0.9,
+  "num_gpus": 1,
+  "reactors": 16,
+  "cache_gb": 20,
+  "cache_mode": "sirius",
+  "phase": "measured",
+  "query": 4,
+  "repeat": 1,
+  "engine": "compression-on",
+  "status": "ok",
+  "query_s": 18.777,
+  "process_wall_s": 18.778410592,
+  "exit_code": 0,
+  "window_start_ns": 1792234567183964864,
+  "window_end_ns": 1792234585961696864,
+  "source": "/scratch/sirius/datasets/tpch_sf3000",
+  "cache": "retained LRU cache; no table pins; initial reset only",
+  "nic_rx_bytes": {
+    "enP22p3s0f1np1": 295,
+    "enP18p3s0np0": 308,
+    "enp3s0np0": 684,
+    "enP6p3s0f0np0": 74841,
+    "enP2p3s0np0": 0,
+    "enP6p3s0f1np1": 295,
+    "bmc_redfish0": 0,
+    "enP22p3s0f0np0": 111789,
+    "enP5p9s0": 0,
+    "enP16p3s0np0": 308
+  },
+  "nic_rx_gbps_observed": 8.031350643927809e-05,
+  "nic_rx_note": "Whole-interface receive counters over the query wall window; excludes setup, includes any concurrent host traffic; not an S3-only byte counter.",
+  "memory_after_query": {
+    "timestamp_ns": 1792234585963180896,
+    "pid": 884526,
+    "system_mem_available_bytes": 1374335598592,
+    "VmLck": 0,
+    "VmPin": 268435456,
+    "VmHWM": 174462795776,
+    "VmRSS": 174210351104
+  },
+  "spill": {
+    "available": true,
+    "tiers": {
+      "HOST": {
+        "events": 4068,
+        "preconversion_bytes": 46901758276,
+        "destination_representation_bytes": 28261342756,
+        "unique_batches": 4068
+      },
+      "DISK": {
+        "events": 0,
+        "preconversion_bytes": 0,
+        "destination_representation_bytes": 0,
+        "unique_batches": 0
+      }
+    },
+    "semantics": "Successful downgrade events; repeat movements count again. Destination bytes are representation sizes after conversion, not filesystem I/O counters. Preconversion bytes can already be compressed for HOST to DISK."
+  }
+}
