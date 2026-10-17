@@ -1,0 +1,132 @@
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+| s_name:VARCHAR | numwait:BIGINT |
+|---|---|
+| Supplier#016924135 | 58 |
+| Supplier#013357335 | 57 |
+| Supplier#020611171 | 57 |
+| Supplier#010790063 | 54 |
+| Supplier#011927803 | 54 |
+| Supplier#007337624 | 53 |
+| Supplier#003723190 | 51 |
+| Supplier#019836991 | 51 |
+| Supplier#001048560 | 50 |
+| Supplier#004014589 | 50 |
+| Supplier#008044999 | 50 |
+| Supplier#014913777 | 50 |
+| Supplier#016602351 | 50 |
+| Supplier#023074850 | 50 |
+| Supplier#024348806 | 50 |
+| Supplier#027810441 | 50 |
+| Supplier#008196325 | 49 |
+| Supplier#027927845 | 49 |
+| Supplier#027965486 | 49 |
+| Supplier#000877743 | 48 |
+| Supplier#004653461 | 48 |
+| Supplier#004953276 | 48 |
+| Supplier#006813003 | 48 |
+| Supplier#015651978 | 48 |
+| Supplier#016974186 | 48 |
+| Supplier#022287834 | 48 |
+| Supplier#026189136 | 48 |
+| Supplier#028572136 | 48 |
+| Supplier#001619465 | 47 |
+| Supplier#005402966 | 47 |
+| Supplier#006297309 | 47 |
+| Supplier#010312959 | 47 |
+| Supplier#013005230 | 47 |
+| Supplier#015225036 | 47 |
+| Supplier#017393508 | 47 |
+| Supplier#022273859 | 47 |
+| Supplier#027070944 | 47 |
+| Supplier#027585978 | 47 |
+| Supplier#000774385 | 46 |
+| Supplier#001454212 | 46 |
+| Supplier#002280837 | 46 |
+| Supplier#009032200 | 46 |
+| Supplier#009932349 | 46 |
+| Supplier#011807592 | 46 |
+| Supplier#014843916 | 46 |
+| Supplier#015008489 | 46 |
+| Supplier#017516456 | 46 |
+| Supplier#017795225 | 46 |
+| Supplier#018486288 | 46 |
+| Supplier#020510833 | 46 |
+| Supplier#021182485 | 46 |
+| Supplier#023246827 | 46 |
+| Supplier#024605176 | 46 |
+| Supplier#025071674 | 46 |
+| Supplier#026258582 | 46 |
+| Supplier#026608706 | 46 |
+| Supplier#028262588 | 46 |
+| Supplier#029895793 | 46 |
+| Supplier#000676902 | 45 |
+| Supplier#001602992 | 45 |
+| Supplier#001795285 | 45 |
+| Supplier#002479440 | 45 |
+| Supplier#003087177 | 45 |
+| Supplier#003722796 | 45 |
+| Supplier#004763408 | 45 |
+| Supplier#004970365 | 45 |
+| Supplier#005661936 | 45 |
+| Supplier#005981838 | 45 |
+| Supplier#007698142 | 45 |
+| Supplier#008278283 | 45 |
+| Supplier#008608195 | 45 |
+| Supplier#009863768 | 45 |
+| Supplier#010855402 | 45 |
+| Supplier#011722450 | 45 |
+| Supplier#016636808 | 45 |
+| Supplier#017308310 | 45 |
+| Supplier#018226854 | 45 |
+| Supplier#018429914 | 45 |
+| Supplier#020404405 | 45 |
+| Supplier#021304047 | 45 |
+| Supplier#021444233 | 45 |
+| Supplier#023831420 | 45 |
+| Supplier#025601485 | 45 |
+| Supplier#025660710 | 45 |
+| Supplier#026571872 | 45 |
+| Supplier#026955302 | 45 |
+| Supplier#028198118 | 45 |
+| Supplier#028213820 | 45 |
+| Supplier#029159109 | 45 |
+| Supplier#029346761 | 45 |
+| Supplier#000876037 | 44 |
+| Supplier#003236414 | 44 |
+| Supplier#004877327 | 44 |
+| Supplier#007066703 | 44 |
+| Supplier#007134636 | 44 |
+| Supplier#007386918 | 44 |
+| Supplier#007472987 | 44 |
+| Supplier#008523195 | 44 |
+| Supplier#009307193 | 44 |
+| Supplier#009356349 | 44 |
+100 rows, hash efd1cc046f046358

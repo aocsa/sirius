@@ -1,0 +1,28 @@
+# TPC-H SF3000, closest valid stand-in for the atlas best config ("200 GiB host / 20 GB cache / ON").
+# The Sirius prefetching cache is off: with mode sirius + lru it kept every chunk it read and took
+# the whole 200 GiB host pool on q1 (eviction_threshold_fraction did not cap it), so scans OOMed on
+# host blocks and spills went straight to disk. GPU capped at 91 GB (g7e.8xlarge); operator batch
+# and partition sizes derive from that capacity.
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            usage_limit_bytes: 91GB
+        host:
+            capacity_bytes: 200GiB
+            block_size: 64MiB
+            pool_size: 128
+            initial_number_pools: 25
+        disk:
+            disk_id: 0
+            capacity_bytes: 8TB
+            downgrade_root_dirs: "/scratch/prestouser/aocsa/spill"
+    executor:
+        scan_manager:
+            cache:
+                mode: none
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB

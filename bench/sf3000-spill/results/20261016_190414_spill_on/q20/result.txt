@@ -1,0 +1,55 @@
+estimate: ~6149403220 rows read (read_parquet ~3599513100, read_parquet ~2399890680, read_parquet ~119999435, read_parquet ~30000000, read_parquet ~5), ~1200000 rows returned
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+| s_name:VARCHAR | s_address:VARCHAR |
+|---|---|
+| Supplier#000000048 | jg0U FNPMQDuyuKvTnLXXaLf3Wl6OtONA6mQlWJ |
+| Supplier#000000126 | CaO4YuZ oSkzemn |
+| Supplier#000000214 | B3uLKyb, xkfHbTSUBe6HwwaBPdCvhiOqO4y |
+| Supplier#000000341 | sdb9yPRPun Z awDuDPUId2NH0Yrz7dnJ1GBDc |
+| Supplier#000000482 | LkVra4orMCs |
+| Supplier#000000492 | 8wEulEYM zGvMXfDNNEw4B |
+| Supplier#000000514 | Q4ErX,NN,Z2UDP |
+| Supplier#000000588 | e3yF5zmSj y81I |
+| Supplier#000000715 | feMb9HkfGM8e,4i |
+| Supplier#000000835 | a7ZBr9561n7CHzwtrfoZnpNWf71uKtH |
+| Supplier#000001098 | gBFyTaxwwnJNvWpX,Zpn,e5KDnfv7 P |
+| Supplier#000001255 | I3YzBXBkSGYEV4dIEt76GMLWhIP26AWqrfmiBUE |
+| Supplier#000001583 | 2Nmh1yFFQPxH4nUw06iqQ2FC5eM8iM |
+| Supplier#000001632 | 6KZLzKm0GjIQgF2AZ4HDKRcffj9RTw |
+| Supplier#000002030 | nHJl8Qp1p2 |
+| Supplier#000002088 | 3OY9G5JC36TDMOwQ6yLXF1Kc |
+| Supplier#000002126 | eFM3Kvs3B8WrEi1kyx,7,WQ,V |
+| Supplier#000002259 | nOt4M6WnJb7Rrc,kzs qqcX5pJHq2CQLkMGw1w |
+| Supplier#000002354 | OifJATleNh13fks7KtW5QsVY26AB0hYBjjQW |
+| Supplier#000002364 | CbuBnUrU,S1294IMIKvqWhqG6nCm |
+first 20 of at least 100352 rows (query stopped early; .maxbytes 0 for all)

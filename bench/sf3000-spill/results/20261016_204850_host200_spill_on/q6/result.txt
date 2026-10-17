@@ -1,0 +1,4 @@
+estimate: ~3599513100 rows read (read_parquet ~3599513100), ~1 rows returned
+| revenue:DECIMAL(38,4) |
+|---|
+| 184910345488.9271 |

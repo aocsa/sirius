@@ -1,0 +1,10 @@
+Running TPC-H queries against SF3000 parquet data
+Engine: sirius
+Parquet dir: /scratch/sirius/datasets/tpch_sf3000
+Session: single (all queries in one process)
+Iterations: 2 (1 cold + 1 warm)
+Queries: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22
+Session timeout: disabled
+==========================================
+
+Running all queries in a single DuckDB session...

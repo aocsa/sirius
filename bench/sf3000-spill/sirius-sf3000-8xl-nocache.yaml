@@ -1,0 +1,35 @@
+# TPC-H SF3000, "8xl-sf3k" profile from the spill reproducer, adapted to one GB200.
+# Atlas target (g7e.8xlarge, S3, "200 GiB host / 20 GB cache / compression ON"):
+#   456.7 s cold, 426.6 s lukewarm, 416.0 s hot.
+#
+# g7e.8xlarge: 1x RTX PRO 6000 (96 GB), 32 vCPU, 256 GiB RAM.
+#   GPU   capped at 91 GB (0.95 x 96 GB).
+#   CPU   run.sh pins the process to 32 cores (TASKSET=0-31, GPU 0's NUMA node). Thread pools
+#         stay at their defaults: sizing the scan-manager pool to 24 threads made q6 2.4x slower
+#         (118 s vs 47 s cold); the default pool, oversubscribed on 32 cores, keeps scans fed.
+#   Host  200 GiB pinned pool.
+#   Cache 20 GB: needs #2155, which makes eviction_threshold_fraction a hard cap on resident
+# Operator batch/partition sizes are left unset so they derive from the 91 GB GPU.
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            usage_limit_bytes: 91GB
+        host:
+            capacity_bytes: 200GiB
+            block_size: 64MiB
+            pool_size: 128
+            initial_number_pools: 25
+        disk:
+            disk_id: 0
+            capacity_bytes: 8TB
+            downgrade_root_dirs: "/scratch/prestouser/aocsa/spill"
+    executor:
+        scan_manager:
+            cache:
+                mode: none
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB

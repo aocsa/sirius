@@ -1,0 +1,5 @@
+estimate: ~19497556418 rows read (read_parquet ~17997565500, read_parquet ~899994732, read_parquet ~449996700, read_parquet ~119999435, read_parquet ~30000000, 3 more), ~883502219 rows returned
+| o_year:BIGINT | mkt_share:DOUBLE |
+|---|---|
+| 1995 | 0.04027855683347975 |
+| 1996 | 0.0399365695078219 |

@@ -1,0 +1,5 @@
+estimate: ~8099486760 rows read (read_parquet ~4499973660, read_parquet ~3599513100), ~796300174 rows returned
+| l_shipmode:VARCHAR | high_line_count:HUGEINT | low_line_count:HUGEINT |
+|---|---|---|
+| REG AIR | 18708614 | 28041865 |
+| TRUCK | 18695385 | 28053649 |
