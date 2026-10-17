@@ -60,6 +60,10 @@ const OPEN_RETRY_MAX: Duration = Duration::from_secs(1);
 /// The loop sleeps this long, doubling up to [`IDLE_MAX`], when a pass made no progress.
 const IDLE_FIRST: Duration = Duration::from_micros(4);
 const IDLE_MAX: Duration = Duration::from_micros(100);
+/// A feeder whose export ran out of GPU memory asks again after this long, doubling up to
+/// [`OOM_RETRY_MAX`].
+const OOM_RETRY_FIRST: Duration = Duration::from_millis(10);
+const OOM_RETRY_MAX: Duration = Duration::from_secs(1);
 /// How often the loop logs the engine's ring counters, when they changed.
 const STATS_EVERY: Duration = Duration::from_secs(5);
 
@@ -764,6 +768,7 @@ impl<F: Fabric> RingLoop<F> {
             let (feed, feeder) = match spawn_feeder(
                 hop.source,
                 slot,
+                hop.deadline,
                 Arc::clone(&stop_feed),
                 Arc::clone(&self.shared.engine),
             ) {
@@ -1609,12 +1614,18 @@ impl<F: Fabric> RingLoop<F> {
     }
 }
 
+/// Whether an export failed only for want of GPU memory, as the engine reports it.
+fn is_out_of_memory(err: &str) -> bool {
+    err.contains("out_of_memory")
+}
+
 /// Exports a lane's batches on a thread of its own, a few ahead of the frames in flight, so a
 /// parked output's export (on the engine thread) or a streamed one's wait never holds up the
 /// loop.
 fn spawn_feeder(
     mut source: Source,
     slot: SenderSlot,
+    deadline: Instant,
     stop: Arc<AtomicBool>,
     engine: Arc<dyn RingEngine>,
 ) -> Result<(Receiver<Result<RingJob, String>>, JoinHandle<()>), String> {
@@ -1623,6 +1634,7 @@ fn spawn_feeder(
         .name("ring-feed".to_string())
         .spawn(move || {
             let stopped = || stop.load(Ordering::Acquire);
+            let mut backoff = OOM_RETRY_FIRST;
             loop {
                 if stopped() {
                     return;
@@ -1631,8 +1643,16 @@ fn spawn_feeder(
                     Ok(RingNext::Job(job)) => Ok(job),
                     Ok(RingNext::Waiting) => continue,
                     Ok(RingNext::End) => return,
+                    // Bringing a spilled batch back to the GPU found no memory: the engine kept
+                    // the batch, so wait for memory and ask again, until the deadline (I4).
+                    Err(err) if is_out_of_memory(&err) && Instant::now() + backoff < deadline => {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(OOM_RETRY_MAX);
+                        continue;
+                    }
                     Err(err) => Err(err),
                 };
+                backoff = OOM_RETRY_FIRST;
                 let failed = item.is_err();
                 // A full queue waits; a lane that failed meanwhile takes nothing more.
                 loop {
@@ -2369,6 +2389,67 @@ mod tests {
         });
         assert_eq!(a.sink.batches.lock().unwrap().len(), 20);
         assert_eq!(b.sink.batches.lock().unwrap().len(), 20);
+    }
+
+    /// Fails its first exports for want of memory, as an engine bringing a spilled batch back
+    /// would, then hands out its jobs.
+    #[derive(Debug)]
+    struct Tight {
+        jobs: Mutex<VecDeque<RingJob>>,
+        ooms: AtomicUsize,
+    }
+
+    impl FragmentExecutor for Tight {
+        fn execute(&self, _: &TranslatedPlan) -> Result<FragmentResult, String> {
+            unreachable!()
+        }
+        fn export_ring_next(&self, _slot: SenderSlot) -> Result<Option<RingJob>, String> {
+            if self.ooms.load(Ordering::Relaxed) > 0 {
+                self.ooms.fetch_sub(1, Ordering::Relaxed);
+                return Err(
+                    "std::bad_alloc: out_of_memory: direct exchange: 59916192 bytes to \
+                            bring a spilled batch back"
+                        .to_string(),
+                );
+            }
+            Ok(self.jobs.lock().unwrap().pop_front())
+        }
+    }
+
+    #[test]
+    fn an_export_out_of_memory_waits_and_asks_again() {
+        let cluster = Cluster::new();
+        let a = cluster.cn(1, 4, 4, Behavior::default(), settings());
+        let b = cluster.cn(2, 4, 4, Behavior::default(), settings());
+        let jobs: VecDeque<_> = (0..3).map(|i| a.engine.add_job(i, 100, 1)).collect();
+        let tight = Arc::new(Tight {
+            jobs: Mutex::new(jobs),
+            ooms: AtomicUsize::new(5),
+        });
+        a.transport
+            .send(b.addr, slot(5, 0), names(), tight)
+            .unwrap();
+        assert_eq!(b.sink.batches.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_export_out_of_memory_past_the_deadline_fails_the_hop() {
+        let cluster = Cluster::new();
+        let short = RingSettings {
+            max_wait: Duration::from_millis(200),
+            ..settings()
+        };
+        let a = cluster.cn(1, 4, 4, Behavior::default(), short);
+        let b = cluster.cn(2, 4, 4, Behavior::default(), short);
+        let tight = Arc::new(Tight {
+            jobs: Mutex::default(),
+            ooms: AtomicUsize::new(usize::MAX),
+        });
+        let err = a
+            .transport
+            .send(b.addr, slot(5, 0), names(), tight)
+            .unwrap_err();
+        assert!(err.contains("out_of_memory"), "{err}");
     }
 
     #[test]
