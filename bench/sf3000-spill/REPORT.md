@@ -90,6 +90,34 @@ host pool, cache off, compression ON, operator batch/partition sizes derived fro
   per pass instead of S3 + prefetching cache, the atlas harness's warmup/pinning protocol, and
   `ast_jit` being off. Closing it needs the atlas's exact config and harness, not more spill tuning.
 
+## 8xl-sf3k profile on `integ/spill-s3-8xl-sf3k` (adds #2155)
+
+Branch `integ/spill-s3-8xl-sf3k` = `main` `f32589fb` + stack `0997c1f3` (#2182/#2183/#2204) +
+#2155 `ba9cffa4` (fused S3 GETs, bounded readahead, cache memory cap). Profile reconstructed from the
+reproducer README and the atlas (the full `sirius-spill-reproducer` package was not available):
+GPU capped at 91 GB, process pinned to 32 cores (`taskset -c 0-31`), 200 GiB host pool, compression
+ON, operator sizes and thread pools at their defaults. Data and spill on GPFS, not S3/NVMe.
+
+| | OFF (100 GB host, old branch) | 8xl, 20 GB cache | 8xl, cache off |
+|---|---|---|---|
+| Cold, sum of 22 | 1,561.9 s | **1,143.9 s (−26.8%)** | 1,167.5 s (−25.3%) |
+| Warm, sum of 22 | 1,459.4 s | **1,136.8 s (−22.1%)** | 1,149.1 s (−21.3%) |
+| Session wall time | 3,028 s | 2,292 s | 2,328 s |
+| Spilled to host / disk | 4,192 / 1,501 GB | 4,033 / 394 GB | 4,024 / 378 GB |
+| Encode-OOM fallbacks | — | 120 | 22 |
+| Results vs OFF | — | 22/22 identical | 22/22 identical |
+| Atlas target (g7e, S3) | — | 456.7 s cold / 416.0 s hot | — |
+
+- **#2155 fixes the cache.** `eviction_threshold_fraction: 0.093` now holds the cache at ~20.3 GB of
+  the 200 GiB pool; no host OOMs, no CPU fallbacks (the same config without #2155 failed, Issue 1).
+- **The cache barely matters on GPFS: −2.0% cold.** Hit rate is under 1% (lineitem is 724 GB); its
+  value on g7e is hiding S3 round trips, which this box does not have.
+- **Best measured: 1,143.9 s cold — still 2.5× the atlas's 456.7 s.** Disk spill is under 400 GB, so
+  the remaining gap is not spill. The data path (S3 + #2155 fused reads on g7e vs GPFS here) and the
+  reproducer's exact `run.py`/profile are the untested differences.
+- **Do not size thread pools for 32 cores by hand.** A 24-thread scan-manager pool made q6 2.4×
+  slower (118 s vs 47 s cold); 32-core pinning with default pools was fine (46.8 s).
+
 ## Issues found
 
 1. **The atlas "20 GB cache" cannot be reproduced on this build.** With
@@ -121,3 +149,5 @@ All under `/scratch/prestouser/aocsa/spillcomp/sirius/bench/sf3000-spill/` (unco
 - `results/20261016_190414_spill_{off,on}/`, `results/compare_off_vs_on.txt`
 - `results/20261016_204028_atlas_spill_on/` (stopped), `results/20261016_204850_host200_spill_on/`
 - `results/compare_on100_vs_host200.txt`, `results/compare_off_vs_host200.txt`
+- `sirius-sf3000-8xl.yaml`, `sirius-sf3000-8xl-nocache.yaml`; `results/*_8xl-{cache20,nocache}_spill_on/`,
+  `results/compare_off_vs_8xl-{cache20,nocache}.txt`, `results/compare_8xl-nocache_vs_8xl-cache20.txt`

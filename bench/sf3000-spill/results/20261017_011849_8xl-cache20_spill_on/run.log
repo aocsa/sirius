@@ -8,3 +8,121 @@ Session timeout: disabled
 ==========================================
 
 Running all queries in a single DuckDB session...
+Total wall-clock time: 2291.338593504s
+
+========== Q1 ==========
+  Cold: 39.482s   Warm(best): 35.122s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q1/timings.csv
+
+========== Q2 ==========
+  Cold: 19.080s   Warm(best): 16.400s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q2/timings.csv
+
+========== Q3 ==========
+  Cold: 62.794s   Warm(best): 59.568s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q3/timings.csv
+
+========== Q4 ==========
+  Cold: 38.053s   Warm(best): 37.331s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q4/timings.csv
+
+========== Q5 ==========
+  Cold: 58.567s   Warm(best): 56.905s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q5/timings.csv
+
+========== Q6 ==========
+  Cold: 40.935s   Warm(best): 40.424s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q6/timings.csv
+
+========== Q7 ==========
+  Cold: 63.290s   Warm(best): 66.248s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q7/timings.csv
+
+========== Q8 ==========
+  Cold: 63.427s   Warm(best): 63.073s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q8/timings.csv
+
+========== Q9 ==========
+  Cold: 81.122s   Warm(best): 82.972s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q9/timings.csv
+
+========== Q10 ==========
+  Cold: 60.162s   Warm(best): 58.425s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q10/timings.csv
+
+========== Q11 ==========
+  Cold: 12.828s   Warm(best): 11.150s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q11/timings.csv
+
+========== Q12 ==========
+  Cold: 48.420s   Warm(best): 48.429s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q12/timings.csv
+
+========== Q13 ==========
+  Cold: 19.204s   Warm(best): 18.434s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q13/timings.csv
+
+========== Q14 ==========
+  Cold: 48.501s   Warm(best): 49.875s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q14/timings.csv
+
+========== Q15 ==========
+  Cold: 49.544s   Warm(best): 49.973s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q15/timings.csv
+
+========== Q16 ==========
+  Cold: 8.018s   Warm(best): 8.103s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q16/timings.csv
+
+========== Q17 ==========
+  Cold: 68.780s   Warm(best): 69.729s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q17/timings.csv
+
+========== Q18 ==========
+  Cold: 64.557s   Warm(best): 67.004s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q18/timings.csv
+
+========== Q19 ==========
+  Cold: 58.525s   Warm(best): 56.787s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q19/timings.csv
+
+========== Q20 ==========
+  Cold: 49.289s   Warm(best): 50.943s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q20/timings.csv
+
+========== Q21 ==========
+  Cold: 179.436s   Warm(best): 182.004s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q21/timings.csv
+
+========== Q22 ==========
+  Cold: 9.883s   Warm(best): 7.944s   (2 iterations)
+  Timings written to /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on/q22/timings.csv
+
+Splitting Sirius log per query (2 iterations per query)...
+  WARNING: expected 44 QueryBegin lines (queries × iterations) but found 96 — split may be misaligned.
+  Q1: lines 12-13 -> q1/sirius.log
+  Q2: lines 14-15 -> q2/sirius.log
+  Q3: lines 16-17 -> q3/sirius.log
+  Q4: lines 18-19 -> q4/sirius.log
+  Q5: lines 20-846 -> q5/sirius.log
+  Q6: lines 847-1673 -> q6/sirius.log
+  Q7: lines 1674-2124 -> q7/sirius.log
+  Q8: lines 2125-2575 -> q8/sirius.log
+  Q9: lines 2576-2772 -> q9/sirius.log
+  Q10: lines 2773-2970 -> q10/sirius.log
+  Q11: lines 2971-3105 -> q11/sirius.log
+  Q12: lines 3106-3243 -> q12/sirius.log
+  Q13: lines 3244-3690 -> q13/sirius.log
+  Q14: lines 3691-4149 -> q14/sirius.log
+  Q15: lines 4150-4198 -> q15/sirius.log
+  Q16: lines 4199-4247 -> q16/sirius.log
+  Q17: lines 4248-4662 -> q17/sirius.log
+  Q18: lines 4663-5115 -> q18/sirius.log
+  Q19: lines 5116-5690 -> q19/sirius.log
+  Q20: lines 5691-6211 -> q20/sirius.log
+  Q21: lines 6212-6508 -> q21/sirius.log
+  Q22: lines 6509-6805 -> q22/sirius.log
+
+==========================================
+All queries complete.
+Results saved under /scratch/prestouser/aocsa/spillcomp/sirius-8xl/bench/sf3000-spill/results/20261017_011849_8xl-cache20_spill_on

@@ -1,0 +1,4 @@
+estimate: ~4199510275 rows read (read_parquet ~3599513100, read_parquet ~599997175), ~1 rows returned
+| promo_revenue:DOUBLE |
+|---|
+| 16.671282577687624 |

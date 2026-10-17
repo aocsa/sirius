@@ -1,0 +1,66 @@
+estimate: ~4589507172 rows read (read_parquet ~3599513100, read_parquet ~899994732, read_parquet ~89999340), ~10 rows returned
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+| l_orderkey:BIGINT | revenue:DECIMAL(38,4) | o_orderdate:DATE | o_shippriority:INTEGER |
+|---|---|---|---|
+| 6783327621 | 513221.8291 | 1995-03-01 | 0 |
+| 15373262211 | 513221.8291 | 1995-03-01 | 0 |
+| 12644355877 | 510678.4413 | 1995-03-14 | 0 |
+| 4054421287 | 510678.4413 | 1995-03-14 | 0 |
+| 4692563456 | 505629.9154 | 1995-02-25 | 0 |
+| 13282498022 | 505629.9154 | 1995-02-25 | 0 |
+| 1056849411 | 503896.4103 | 1995-03-16 | 0 |
+| 9646784001 | 503896.4103 | 1995-03-16 | 0 |
+| 9293012070 | 503331.8719 | 1995-03-12 | 0 |
+| 17882946660 | 503331.8719 | 1995-03-12 | 0 |
+10 rows, hash 2b37411b388e145f

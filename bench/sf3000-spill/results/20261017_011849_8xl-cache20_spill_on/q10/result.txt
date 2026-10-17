@@ -1,0 +1,24 @@
+estimate: ~4949504557 rows read (read_parquet ~3599513100, read_parquet ~899994732, read_parquet ~449996700, read_parquet ~25), ~20 rows returned
+| c_custkey:INTEGER | c_name:VARCHAR | revenue:DECIMAL(38,4) | c_acctbal:DECIMAL(15,2) | n_name:VARCHAR | c_address:VARCHAR | c_phone:VARCHAR | c_comment:VARCHAR |
+|---|---|---|---|---|---|---|---|
+| 134181548 | Customer#134181548 | 1825506.6357 | -49.17 | INDONESIA | nqcVLMGrh2WeZXKK3Z | 19-749-970-2977 | telets. carefully silent accounts are against the pend |
+| 318692242 | Customer#318692242 | 1775272.0311 | 8284.32 | IRAQ | rFCbYGiQsRD6VJdY7uspNhS | 21-296-224-4486 |  packages. instructions boost slyly |
+| 201704602 | Customer#201704602 | 1768129.2462 | 5228.24 | CANADA | NlzzhcuGlfvY2b6gxuRZ | 13-896-948-8115 | s. blithely even packages nod agai |
+| 4200007 | Customer#004200007 | 1746613.0263 | 7124.75 | ALGERIA | P38d4Jet,ipN0lmLIK1DMzkpy8s | 10-904-456-2939 | es wake. furiously regular theodolites promise by the furiously even instructions. fluffily regular dependencies h |
+| 151343837 | Customer#151343837 | 1713231.8391 | 730.36 | JAPAN | JEElCsX9IBbEteskZAaqADdVjOJnisx6,lsF | 22-915-865-4691 | encies integrate fluffily according to the even ex |
+| 107069093 | Customer#107069093 | 1701784.6163 | 213.18 | ROMANIA | HsKTAXIjPn8l3BEWUvP7pZ | 29-945-430-1765 | uffily against the ironic requests. silent foxes use special requests. final, bold accounts wake slyly. quic |
+| 403269217 | Customer#403269217 | 1694031.8631 | 7663.04 | ARGENTINA | LIE4,3jGBukPlP | 11-766-137-8319 | ests haggle across the bold, final ideas. furiously  |
+| 129330226 | Customer#129330226 | 1675785.7326 | 9762.33 | EGYPT | C9e,dSRUslfeP | 14-380-358-1478 |  are fluffily finally even platelets. carefully regular deposit |
+| 134168834 | Customer#134168834 | 1670492.3256 | 2949.58 | RUSSIA | AJcrPPurGiq9QYa | 32-625-439-4351 | ickly ironic pinto beans cajole slyly above the eve |
+| 74801173 | Customer#074801173 | 1667809.2681 | 7358.97 | UNITED STATES | F9NaDI35TCXHeTSCHT | 34-390-368-5665 | tes. theodolites nag according to the furiously express theodolites. regular foxes wake slyly unusual platelets. fu |
+| 417293210 | Customer#417293210 | 1653491.4302 | 4074.36 | INDIA | I7KYAI1dxS2,UzLg3lgAA 58zkQ7Kw3n0NRW1 | 18-641-523-5357 | boost slyly across the pinto beans. ironic, ruthless accounts are quickly against the even, r |
+| 212681405 | Customer#212681405 | 1647174.5493 | 6881.08 | BRAZIL | gHXfudl5bJn 2Awggn5vemGtU8EnywlOKJx | 12-248-861-7565 | accounts cajole blithely among the quickly unus |
+| 200751085 | Customer#200751085 | 1632152.4057 | 9952.54 | IRAQ | 5ki92aJkDkPCxpElqtcJZoF,9,i1lI6Tv7Gx114Z | 21-198-316-8926 | . express, regular packages haggle quickly around the carefully bold platelets |
+| 9258049 | Customer#009258049 | 1621368.9384 | 8148.25 | MOZAMBIQUE | l,1Vf91swgLYGtRpMy4JaPl7GY,LMkdgCVosNcq8 | 26-841-628-6686 | he regular accounts cajole carefully after the express, pending frays. fluffily b |
+| 343197880 | Customer#343197880 | 1620908.2869 | 2672.55 | INDONESIA | uE af6x4ux2LdPvUnY6989bv2Hl7C8TwcTnP, | 19-676-691-5111 | ns? furiously ironic pinto beans mold  |
+| 338167592 | Customer#338167592 | 1618636.2957 | -311.77 | INDIA | hjiUJiN0Q5lqgx 85KspvACf9 ,y   | 18-226-135-3496 | ly fluffy requests cajole slyly pending,  |
+| 111909187 | Customer#111909187 | 1618300.3016 | 6647.37 | JAPAN | F3kgTJVb34K7AJwv7hmDoI | 22-612-972-7280 |  carefully. fluffily ironic excuses along the ironic ideas sleep b |
+| 293628166 | Customer#293628166 | 1611577.9206 | 3306.36 | BRAZIL | NI6R5bJut3dbGJNp 8c,Avc | 12-149-370-3457 | ual deposits sleep. final, pending accounts haggle express accounts. final courts acc |
+| 62087710 | Customer#062087710 | 1609050.4696 | 5117.30 | KENYA | a,arVFffyQ89oh | 24-554-280-5128 | s haggle slyly after the accounts. blithely regular account |
+| 97552526 | Customer#097552526 | 1607337.2250 | 9000.07 | UNITED KINGDOM | 1Fticy23F4GM94ZXbhzPNujRpVaQ | 33-104-412-7759 | . slyly special deposits may use blithely across the fluffily quiet ideas. final deposits w |
+20 rows, hash 790d90c0329fa1c7
