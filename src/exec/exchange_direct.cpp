@@ -257,10 +257,12 @@ direct_export describe_table(cudf::table_view const& table, rmm::cuda_stream_vie
   return out;
 }
 
-direct_exchange::direct_exchange(cucascade::memory::memory_space& gpu, memory::slab_region region)
+direct_exchange::direct_exchange(cucascade::memory::memory_space& gpu,
+                                 std::optional<memory::slab_region> region)
   : _gpu{gpu},
     _region{std::move(region)},
-    _stream{stream_on(_region.device)},
+    _device{_region ? _region->device : gpu.get_device_id()},
+    _stream{stream_on(_device)},
     _sealed{std::make_shared<cucascade::shared_data_repository>()}
 {
 }
@@ -270,7 +272,7 @@ std::optional<direct_exchange::exported> direct_exchange::export_batch(
 {
   bring_to_gpu(*batch);
   std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   require_open();
   auto const stream = _stream.view();
   direct_export described;
@@ -290,12 +292,12 @@ std::optional<direct_exchange::exported> direct_exchange::export_batch(
     }
     if (!is_sliced(view)) {
       described = describe_table(view, stream);
-      src       = sources(described, _region);
+      src       = sources(described, slab());
     }
     if (!src) {
       copy      = std::make_unique<cudf::table>(view, stream, _gpu.get_default_allocator());
       described = describe_table(copy->view(), stream);
-      src       = sources(described, _region);
+      src       = sources(described, slab());
     }
     // The NIC reads outside stream order, so the producer and the copy must be done.
     stream.synchronize();
@@ -318,7 +320,7 @@ std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
   std::span<std::uint8_t const> bytes)
 {
   auto layout     = decode_layout(bytes);
-  auto const plan = plan_buffers(layout, _region.len);
+  auto const plan = plan_buffers(layout, slab().len);
   // The tracker charges each allocation rounded up on its own; plan_buffers bounded this sum.
   auto const total = std::transform_reduce(
     plan.begin(), plan.end(), std::size_t{0}, std::plus<>{}, [](direct_buffer const& b) {
@@ -330,7 +332,7 @@ std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
   // and runs without the lock so other tokens move meanwhile.
   auto reservation = reserve(total);
   std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   require_open();
   if (!reservation) {
     throw rmm::out_of_memory(std::format(
@@ -362,7 +364,7 @@ std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
   for (std::size_t i = 0; i < plan.size(); ++i) {
     if (plan[i].wire == 0) { continue; }
     auto const at = address(entry.buffers[i].data());
-    if (!_region.covers(at, plan[i].wire)) {
+    if (!slab().covers(at, plan[i].wire)) {
       throw sirius::internal_exception("direct exchange: a receive buffer is not in the slab");
     }
     dst.push_back(at);
@@ -376,7 +378,7 @@ std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
 std::unique_ptr<cudf::table> direct_exchange::take(std::uint64_t token)
 {
   std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   require_open();
   auto const it     = _entries.find(token);
   auto* const entry = it == _entries.end() ? nullptr : std::get_if<received>(&it->second);
@@ -412,14 +414,17 @@ std::unique_ptr<cudf::table> direct_exchange::to_table(received&& taken)
 
 void direct_exchange::release(std::uint64_t token)
 {
-  std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
-  require_open();
-  _entries.erase(token);
-  if (auto const sealed = _sealed_ids.find(token); sealed != _sealed_ids.end()) {
-    (void)_sealed->pop_data_batch_by_id(sealed->second);
-    _sealed_ids.erase(sealed);
+  {
+    std::lock_guard const lock{_mutex};
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
+    require_open();
+    _entries.erase(token);
+    if (auto const sealed = _sealed_ids.find(token); sealed != _sealed_ids.end()) {
+      (void)_sealed->pop_data_batch_by_id(sealed->second);
+      _sealed_ids.erase(sealed);
+    }
   }
+  gone(token);
 }
 
 std::size_t direct_exchange::outstanding() const
@@ -431,14 +436,55 @@ std::size_t direct_exchange::outstanding() const
 
 void direct_exchange::close()
 {
-  std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
-  _entries.clear();
-  for (auto const& [token, batch_id] : _sealed_ids) {
-    (void)_sealed->pop_data_batch_by_id(batch_id);
+  std::map<std::uint64_t, std::function<void()>> on_gone;
+  {
+    std::lock_guard const lock{_mutex};
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
+    _entries.clear();
+    for (auto const& [token, batch_id] : _sealed_ids) {
+      (void)_sealed->pop_data_batch_by_id(batch_id);
+    }
+    _sealed_ids.clear();
+    on_gone.swap(_on_gone);
+    _closed = true;
   }
-  _sealed_ids.clear();
-  _closed = true;
+  for (auto& [token, callback] : on_gone) {
+    if (callback) { callback(); }
+  }
+}
+
+std::uint64_t direct_exchange::adopt(std::shared_ptr<cucascade::data_batch> batch,
+                                     std::function<void()> on_gone)
+{
+  std::lock_guard const lock{_mutex};
+  require_open();
+  auto const token = _next++;
+  _sealed_ids.emplace(token, batch->get_batch_id());
+  if (on_gone) { _on_gone.emplace(token, std::move(on_gone)); }
+  _sealed->add_data_batch(std::move(batch));
+  return token;
+}
+
+void direct_exchange::gone(std::uint64_t token)
+{
+  std::function<void()> callback;
+  {
+    std::lock_guard const lock{_mutex};
+    auto const it = _on_gone.find(token);
+    if (it == _on_gone.end()) { return; }
+    callback = std::move(it->second);
+    _on_gone.erase(it);
+  }
+  if (callback) { callback(); }
+}
+
+memory::slab_region const& direct_exchange::slab() const
+{
+  if (!_region) {
+    throw sirius::invalid_input_exception(
+      "direct exchange: writing straight into the pool needs allocator: slab");
+  }
+  return *_region;
 }
 
 void direct_exchange::enable_spill(exchange_staging& staging, make_room_fn make_room)
@@ -451,7 +497,7 @@ void direct_exchange::enable_spill(exchange_staging& staging, make_room_fn make_
 void direct_exchange::seal(std::uint64_t token)
 {
   std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   require_open();
   if (_sealed_ids.contains(token)) { return; }
   auto const it     = _entries.find(token);
@@ -470,14 +516,21 @@ void direct_exchange::seal(std::uint64_t token)
 std::shared_ptr<cucascade::data_batch> direct_exchange::take_batch(std::uint64_t token)
 {
   {
-    std::lock_guard const lock{_mutex};
-    require_open();
-    if (auto const sealed = _sealed_ids.find(token); sealed != _sealed_ids.end()) {
-      auto batch = _sealed->pop_data_batch_by_id(sealed->second);
-      _sealed_ids.erase(sealed);
-      if (!batch) {
-        throw sirius::internal_exception("direct exchange: sealed token {} lost its batch", token);
+    std::shared_ptr<cucascade::data_batch> batch;
+    {
+      std::lock_guard const lock{_mutex};
+      require_open();
+      if (auto const sealed = _sealed_ids.find(token); sealed != _sealed_ids.end()) {
+        batch = _sealed->pop_data_batch_by_id(sealed->second);
+        _sealed_ids.erase(sealed);
+        if (!batch) {
+          throw sirius::internal_exception("direct exchange: sealed token {} lost its batch",
+                                           token);
+        }
       }
+    }
+    if (batch) {
+      gone(token);
       return batch;
     }
   }
@@ -539,7 +592,7 @@ void direct_exchange::add_key_stats(cucascade::data_batch& batch, int column, ke
   // The reduction and the sync that reads its result run on the exchange's stream, under the lock
   // that serializes its use.
   std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   auto const ro = batch.to_read_only();
   if (ro.get_current_tier() != cucascade::memory::Tier::GPU) {
     throw sirius::invalid_input_exception("direct exchange: the batch is not on the GPU");
@@ -576,7 +629,7 @@ std::shared_ptr<cucascade::data_batch> direct_exchange::copy_column(cucascade::d
                                                                     int column)
 {
   bring_to_gpu(batch);
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   rmm::cuda_stream_view const stream{_gpu.acquire_stream()};
   std::unique_ptr<cudf::table> copy;
   {
@@ -642,7 +695,7 @@ void direct_exchange::bring_to_gpu(cucascade::data_batch& batch)
   // allocate() from attaching its reservation to meanwhile. As in export_batch(), the lock is
   // taken before the batch's.
   std::lock_guard const lock{_mutex};
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   require_open();
   // Blocking: whoever holds the batch now (the downgrade executor mid-spill) releases it soon.
   auto mutable_batch = batch.to_mutable();

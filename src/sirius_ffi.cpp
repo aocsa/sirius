@@ -406,11 +406,17 @@ DirectExchange::DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> ex
 {
 }
 
-int DirectExchange::device() const noexcept { return exchange_->region().device; }
+int DirectExchange::device() const noexcept { return exchange_->device(); }
 
-std::uintptr_t DirectExchange::region_base() const noexcept { return exchange_->region().base; }
+std::uintptr_t DirectExchange::region_base() const noexcept
+{
+  return exchange_->region() ? exchange_->region()->base : 0;
+}
 
-std::uint64_t DirectExchange::region_len() const noexcept { return exchange_->region().len; }
+std::uint64_t DirectExchange::region_len() const noexcept
+{
+  return exchange_->region() ? exchange_->region()->len : 0;
+}
 
 std::unique_ptr<std::vector<std::uint64_t>> DirectExchange::allocate(std::uintptr_t layout_addr,
                                                                      std::size_t layout_len,
@@ -828,7 +834,7 @@ void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
   auto& exchange = impl_->ctx.require_exchange();
   // The batch's writer event is created on the current device and recorded on a slab stream, and
   // the table is freed into the slab, so both happen on the slab's device.
-  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{exchange.region().device}};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{exchange.device()}};
   // Refuses an undeclared input or a running fragment before the token is consumed.
   impl_->fragment->require_pushable(stream_id);
   // push() checks the columns of a batch on the GPU. A sealed batch that spilled to host goes in
