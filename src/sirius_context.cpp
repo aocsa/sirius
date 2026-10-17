@@ -1304,7 +1304,8 @@ sirius::exec::exchange_staging& SiriusContext::get_exchange_staging()
 {
   throw_if_not_initialized();
   std::call_once(exchange_staging_once_, [this] {
-    exchange_staging_ = std::make_unique<sirius::exec::exchange_staging>(data_repository_registry_);
+    exchange_staging_ = std::make_unique<sirius::exec::exchange_staging>(data_repository_registry_,
+                                                                         &query_lifecycle_);
   });
   return *exchange_staging_;
 }
