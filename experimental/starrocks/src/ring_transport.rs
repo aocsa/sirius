@@ -60,6 +60,8 @@ const OPEN_RETRY_MAX: Duration = Duration::from_secs(1);
 /// The loop sleeps this long, doubling up to [`IDLE_MAX`], when a pass made no progress.
 const IDLE_FIRST: Duration = Duration::from_micros(4);
 const IDLE_MAX: Duration = Duration::from_micros(100);
+/// How often the loop logs the engine's ring counters, when they changed.
+const STATS_EVERY: Duration = Duration::from_secs(5);
 
 // ---- seams ---------------------------------------------------------------------------------
 
@@ -665,7 +667,18 @@ impl<F: Fabric> RingLoop<F> {
     fn serve(mut self, requests: Receiver<Request>) {
         let mut idle = IDLE_FIRST;
         let mut open = true;
+        let mut stats_at = Instant::now();
+        let mut last_stats = String::new();
         loop {
+            // The engine's counters, when they changed, at most every STATS_EVERY.
+            if stats_at.elapsed() >= STATS_EVERY {
+                stats_at = Instant::now();
+                let stats = self.engine().stats_line();
+                if stats != last_stats {
+                    info!(stats = %stats, lanes = self.lanes.len(), "ring exchange stats");
+                    last_stats = stats;
+                }
+            }
             let mut progressed = false;
             loop {
                 match requests.try_recv() {
