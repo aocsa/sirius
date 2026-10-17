@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "memory/capped_async_memory_resource.hpp"
 #include "memory/slab_memory_resource.hpp"
 #include "sirius_config.hpp"
 
@@ -182,6 +183,31 @@ TEST_CASE("sirius_config selects the slab pool on both GPU memory paths", "[gpu_
   CHECK(sirius::memory::find_slab(gpu).has_value());
 }
 
+TEST_CASE("sirius_config selects the capped async pool on both GPU memory paths",
+          "[gpu_allocator][config]")
+{
+  auto const text = GENERATE(as<std::string>{},
+                             "sirius:\n"
+                             "  memory:\n"
+                             "    gpu:\n"
+                             "      usage_limit_bytes: 4MiB\n"
+                             "      allocator: async_capped\n",
+                             "sirius:\n"
+                             "  space:\n"
+                             "    gpu:\n"
+                             "      - device_id: 0\n"
+                             "        memory_capacity: 4MiB\n"
+                             "        allocator: async_capped\n");
+  scoped_yaml yaml("sirius_gpu_allocator_capped.yaml", text);
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  cucascade::memory::memory_space gpu(
+    std::get<cucascade::memory::gpu_memory_space_config>(cfg.get_memory_space_configs().front()));
+  CHECK(sirius::memory::find_capped_pool(gpu) != nullptr);
+  CHECK_FALSE(sirius::memory::find_slab(gpu).has_value());
+}
+
 TEST_CASE("a slab space below 2 MiB fails to build", "[gpu_allocator][config]")
 {
   scoped_yaml yaml("sirius_small_slab.yaml",
@@ -216,5 +242,5 @@ TEST_CASE("sirius_config rejects an unknown GPU allocator", "[gpu_allocator][con
 
   sirius::sirius_config cfg;
   CHECK_THROWS_WITH(cfg.load_from_file(yaml.path),
-                    Catch::Matchers::ContainsSubstring("must be one of async, slab"));
+                    Catch::Matchers::ContainsSubstring("must be one of async, slab, async_capped"));
 }
