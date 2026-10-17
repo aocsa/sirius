@@ -17,6 +17,7 @@
 #include "exec/exchange_staging.hpp"
 
 #include "data/data_repository_manager_registry.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -97,9 +98,11 @@ class forwarding_repository final : public cucascade::shared_data_repository {
 
 }  // namespace
 
-exchange_staging::exchange_staging(sirius::data::data_repository_manager_registry& registry)
+exchange_staging::exchange_staging(sirius::data::data_repository_manager_registry& registry,
+                                   query_lifecycle_registry* lifecycle)
   : _targets(std::make_shared<targets>())
 {
+  if (lifecycle != nullptr) { lifecycle->open_query(query_id); }
   // Share the targets' mutex and vector with the registered view through aliasing pointers, so
   // the view stays valid after this object is gone (the registry may outlive it).
   auto mutex = std::shared_ptr<std::mutex>(_targets, &_targets->mutex);

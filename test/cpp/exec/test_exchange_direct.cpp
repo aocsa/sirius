@@ -20,6 +20,7 @@
 #include "data/sirius_converter_registry.hpp"
 #include "exec/exchange_direct.hpp"
 #include "exec/exchange_staging.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/slab_memory_resource.hpp"
 #include "sirius/exception.hpp"
@@ -600,6 +601,19 @@ TEST_CASE("direct_exchange asks again when making room was cancelled", "[exchang
   CHECK_THROWS_AS(exchange.allocate(int64_layout(0.75)), rmm::out_of_memory);
   CHECK(asked == 3);
   exchange.release(held);
+}
+
+TEST_CASE("exchange_staging opens its query so the downgrade executor can borrow it",
+          "[exchange_direct]")
+{
+  sirius::data::data_repository_manager_registry registry;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  // Without the lifecycle, the downgrade sweep's try_acquire_work fails and skips every exchange
+  // batch: sealed received batches, parked and streamed sender output.
+  CHECK_FALSE(lifecycle.try_acquire_work(exchange_staging::query_id));
+  exchange_staging staging(registry, &lifecycle);
+  CHECK(lifecycle.try_acquire_work(exchange_staging::query_id));
+  CHECK(registry.get(exchange_staging::query_id));
 }
 
 TEST_CASE("exchange_staging lists tracked repositories until they are gone", "[exchange_direct]")

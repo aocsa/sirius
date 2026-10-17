@@ -33,6 +33,8 @@ class data_repository_manager_registry;
 
 namespace sirius::exec {
 
+class query_lifecycle_registry;
+
 /**
  * @brief Makes exchange data spillable: parked fragment output, stream inputs and received
  * batches.
@@ -55,7 +57,11 @@ class exchange_staging {
   static constexpr sirius::query_id_t query_id =
     sirius::make_query_id(std::numeric_limits<std::uint32_t>::max());
 
-  explicit exchange_staging(sirius::data::data_repository_manager_registry& registry);
+  /// Registers the staging's repositories under query_id in @p registry, and opens query_id in
+  /// @p lifecycle: the downgrade executor spills a registered query's batches only while it can
+  /// borrow that query, so without it no exchange batch would ever spill.
+  explicit exchange_staging(sirius::data::data_repository_manager_registry& registry,
+                            query_lifecycle_registry* lifecycle = nullptr);
 
   /// Exposes @p repository to the downgrade executor until it is destroyed.
   void track(std::shared_ptr<cucascade::shared_data_repository> const& repository);
