@@ -38,6 +38,10 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
+namespace cucascade {
+class data_batch;
+}  // namespace cucascade
+
 namespace sirius::exec {
 class batch_stream;
 class direct_exchange;
@@ -298,7 +302,8 @@ class SIRIUS_FFI_EXPORT OutputDrain {
   /// setting `token`, `kind` (1 GPU columns, 2 host columns, 3 compressed), `rows` and
   /// `stream_bytes`, and returns its header. A batch spilled to host is sent from host, not
   /// brought back to the GPU.
-  /// @throws as export_next(), or without a RingExchange.
+  /// @throws as export_next(), or without a RingExchange; a `std::bad_alloc: out_of_memory`
+  ///         keeps the batch, which the next call exports first.
   std::unique_ptr<std::vector<std::uint8_t>> export_ring_next(std::uint32_t timeout_ms,
                                                               bool& ended,
                                                               std::uint64_t& token,
@@ -310,6 +315,9 @@ class SIRIUS_FFI_EXPORT OutputDrain {
   std::shared_ptr<sirius::exec::batch_stream> stream_;
   std::shared_ptr<sirius::exec::direct_exchange> exchange_;
   std::shared_ptr<sirius::exec::ring_exchange> ring_;
+  /// A batch export_ring_next() pulled but could not export for want of GPU memory; the next
+  /// call exports it first. One consumer per drain, so no lock.
+  mutable std::shared_ptr<cucascade::data_batch> ring_retry_;
 };
 
 /// Interrupts the [`Context`] it came from (see Context::interrupt()). Every method is safe to
