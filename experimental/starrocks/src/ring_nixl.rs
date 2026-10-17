@@ -25,8 +25,8 @@ const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PR
                         NIXL_PLUGIN_DIR, LD_LIBRARY_PATH) and set \
                         UCX_TLS=cuda_copy,cuda_ipc,tcp,self";
 
-/// The engine's ring sizes when `SIRIUS_CN_EXCHANGE=ring`, from the environment; `None` for the
-/// direct exchange (`direct`, the default).
+/// The engine's ring sizes for the ring exchange (`SIRIUS_CN_EXCHANGE=ring`, the default), from
+/// the environment; `None` for the direct exchange (`SIRIUS_CN_EXCHANGE=direct`).
 ///
 /// - `SIRIUS_CN_RING_FRAME_BYTES`: frame size, 64 MiB;
 /// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes, 1 GiB / 1.5 GiB;
@@ -37,8 +37,8 @@ const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PR
 pub fn ring_options_from_env() -> Result<Option<sirius::RingOptions>, String> {
     let env = |name: &str| std::env::var(name).ok();
     match env("SIRIUS_CN_EXCHANGE").as_deref().map(str::trim) {
-        None | Some("") | Some("direct") => return Ok(None),
-        Some("ring") => {}
+        Some("direct") => return Ok(None),
+        None | Some("") | Some("ring") => {}
         Some(other) => {
             return Err(format!(
                 "SIRIUS_CN_EXCHANGE must be ring or direct, not '{other}'"

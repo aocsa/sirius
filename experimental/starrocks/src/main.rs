@@ -70,8 +70,8 @@ impl Args {
         // up the GPU engine on its dedicated thread (fail-fast: a bad config or GPU failure exits
         // before FE can route work here); otherwise it is a stub. The handle is held for the
         // process lifetime and torn down after the servers stop, below.
-        // SIRIUS_CN_EXCHANGE=ring sends exchange batches through two small registered rings
-        // (the ring transport); direct, the default, writes them straight into a slab pool.
+        // Exchange batches go through two small registered rings (the ring transport, the
+        // default); SIRIUS_CN_EXCHANGE=direct writes them straight into a slab pool instead.
         #[cfg(feature = "nixl-transport")]
         let ring = ring_options_from_env().map_err(|err| anyhow!(err))?;
         #[cfg(all(feature = "sirius-engine", not(feature = "nixl-transport")))]
