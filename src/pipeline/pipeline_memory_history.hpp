@@ -19,9 +19,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace sirius::pipeline {
@@ -124,6 +126,13 @@ class pipeline_memory_history {
   void record_on_failure(std::size_t estimated_bytes, std::size_t peak_memory_bytes)
   {
     if (estimated_bytes == 0) { return; }
+    // SIRIUS_NO_FAILURE_RATCHET=1: a failed attempt's peak, taken under memory pressure, does not
+    // raise later estimates; only successful runs shape them.
+    static bool const no_ratchet = [] {
+      auto const* env = std::getenv("SIRIUS_NO_FAILURE_RATCHET");
+      return env != nullptr && std::string_view{env} == "1";
+    }();
+    if (no_ratchet) { return; }
 
     std::lock_guard<std::mutex> lock(_mutex);
 
