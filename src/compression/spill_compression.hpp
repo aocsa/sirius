@@ -81,6 +81,23 @@ void apply_spill_compression_config(compression_config const& config);
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
                                              rmm::cuda_stream_view stream);
 
+/// What became of a GPU batch the downgrade executor spilled, for the spill counters.
+enum class spill_outcome {
+  small,           ///< Below spill_min_batch_bytes: spilled raw without trying.
+  compressed,      ///< Spilled compressed.
+  no_headroom,     ///< The encode could not reserve its headroom: spilled raw.
+  incompressible,  ///< No column compresses, or the saving was too small: spilled raw.
+  encode_oom,      ///< The encode ran out of GPU memory: spilled raw.
+  failed,          ///< The encode failed otherwise: spilled raw.
+};
+
+/// Counts one spilled batch of @p bytes on the GPU, and @p stored bytes in its spilled form, and
+/// logs every counter at INFO when they last went out more than 5 s ago.
+void record_spill(spill_outcome outcome, std::size_t bytes, std::size_t stored);
+
+/// Every spill counter, as one log line.
+[[nodiscard]] std::string spill_stats_line();
+
 /// Thrown by a spill converter that chose not to compress (too small a saving, no
 /// encode headroom). The caller spills the batch uncompressed instead.
 class spill_compression_declined : public std::runtime_error {

@@ -18,6 +18,7 @@
 
 #include "compression/compressed_disk_representation.hpp"
 #include "compression/compressed_representation.hpp"
+#include "compression/spill_compression.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/exchange_direct.hpp"
 #include "log/logging.hpp"
@@ -994,7 +995,7 @@ std::string ring_exchange::stats_line() const
   return std::format(
     "sent gpu_columns {} ({}), host_columns {} ({}), compressed {} ({}); landed gpu {} ({}), "
     "host {} ({}), disk {} ({}); refused {}; held gpu {}, host {}; send ring peak {}/{}, receive "
-    "ring peak {}/{} frames",
+    "ring peak {}/{} frames; spills: {}",
     c.sent_batches[1],
     bytes_text(c.sent_bytes[1]),
     c.sent_batches[2],
@@ -1013,7 +1014,8 @@ std::string ring_exchange::stats_line() const
     _send.peak_leased(),
     _send.frames(),
     _recv.peak_leased(),
-    _recv.frames());
+    _recv.frames(),
+    compression::spill_stats_line());
 }
 
 }  // namespace sirius::exec

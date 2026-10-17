@@ -38,7 +38,9 @@
 #include <log/logging.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -80,6 +82,49 @@ spill_compression_settings get_spill_compression_settings()
 {
   std::lock_guard lock(g_settings_mutex);
   return g_settings;
+}
+
+namespace {
+
+struct spill_counter {
+  std::atomic<std::uint64_t> batches{0};
+  std::atomic<std::uint64_t> bytes{0};
+  std::atomic<std::uint64_t> stored{0};
+};
+
+constexpr std::array<char const*, 6> kOutcomeNames{
+  "small", "compressed", "no_headroom", "incompressible", "encode_oom", "failed"};
+std::array<spill_counter, 6> g_spill_counters;
+std::atomic<std::int64_t> g_spill_logged_ns{0};
+
+}  // namespace
+
+void record_spill(spill_outcome outcome, std::size_t bytes, std::size_t stored)
+{
+  auto& c = g_spill_counters[static_cast<std::size_t>(outcome)];
+  c.batches.fetch_add(1, std::memory_order_relaxed);
+  c.bytes.fetch_add(bytes, std::memory_order_relaxed);
+  c.stored.fetch_add(stored, std::memory_order_relaxed);
+  auto const now = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto last      = g_spill_logged_ns.load(std::memory_order_relaxed);
+  auto const wait =
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5))
+      .count();
+  if (now - last >= wait && g_spill_logged_ns.compare_exchange_strong(last, now)) {
+    SIRIUS_LOG_INFO("[spill_compression] stats: {}", spill_stats_line());
+  }
+}
+
+std::string spill_stats_line()
+{
+  std::string out;
+  for (std::size_t i = 0; i < kOutcomeNames.size(); ++i) {
+    auto const& c = g_spill_counters[i];
+    if (!out.empty()) { out += ", "; }
+    out += std::string{kOutcomeNames[i]} + " " + std::to_string(c.batches.load()) + " batches " +
+           std::to_string(c.bytes.load()) + " -> " + std::to_string(c.stored.load()) + " bytes";
+  }
+  return out;
 }
 
 bool spill_compression_applies(std::size_t bytes)
