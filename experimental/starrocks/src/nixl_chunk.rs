@@ -15,6 +15,8 @@
 //! | `Topology` | `i64 query hi, i64 query lo, i32 filter id` | see [`encode_topology`] |
 //! | `ShareAbandoned` | `i64 instance hi, i64 instance lo, i32 filter id` | empty |
 //! | `Failed` | utf-8 error | empty |
+//! | `RingOpen` | see [`crate::ring_wire::LaneOpen`] | see [`crate::ring_wire::LaneGrant`] |
+//! | `RingClose` | `u64 lane` | empty |
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,6 +36,8 @@ const RELEASE: u8 = 4;
 const TOPOLOGY: u8 = 5;
 const SHARE_ABANDONED: u8 = 6;
 const FAILED: u8 = 7;
+const RING_OPEN: u8 = 8;
+const RING_CLOSE: u8 = 9;
 
 /// Request attachment after `SRNX`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +69,11 @@ pub enum NixlEnvelope {
     /// The sender failed and will send nothing more, in place of EOS. Routed like a Packed
     /// frame; the receiver fails its query with `error`.
     Failed { error: String },
+    /// Open a ring-exchange lane for the sender routed by the params: the body is a
+    /// [`crate::ring_wire::LaneOpen`], the reply a [`crate::ring_wire::LaneGrant`].
+    RingOpen(Vec<u8>),
+    /// The sender is done with ring lane `lane`; its frames go back to the receiver.
+    RingClose(u64),
 }
 
 impl NixlEnvelope {
@@ -115,6 +124,14 @@ impl NixlEnvelope {
                 out.push(FAILED);
                 out.extend_from_slice(error.as_bytes());
             }
+            Self::RingOpen(body) => {
+                out.push(RING_OPEN);
+                out.extend_from_slice(body);
+            }
+            Self::RingClose(lane) => {
+                out.push(RING_CLOSE);
+                out.extend_from_slice(&lane.to_le_bytes());
+            }
         }
         out
     }
@@ -161,6 +178,8 @@ impl NixlEnvelope {
                 error: String::from_utf8(reader.rest())
                     .map_err(|err| format!("SRNX Failed error is not utf-8: {err}"))?,
             },
+            RING_OPEN => Self::RingOpen(reader.rest()),
+            RING_CLOSE => Self::RingClose(reader.u64()?),
             kind => return Err(format!("unknown SRNX kind {kind}")),
         };
         reader.finish()?;
@@ -327,6 +346,23 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     /// first error, after which each hop ends with a failure frame instead of its EOS.
     fn stream(&self, hops: Vec<StreamHop>) -> Result<(), String>;
 
+    /// Opens a ring-exchange lane for the sender `request` routes, from a `RingOpen` body;
+    /// returns the encoded grant. Only the ring transport has lanes.
+    fn ring_open(&self, _request: &PTransmitChunkParams, _body: &[u8]) -> Result<Vec<u8>, String> {
+        Err("this CN's exchange transport has no ring lanes".to_string())
+    }
+
+    /// Takes back ring lane `lane`'s frames once its sender is done with it.
+    fn ring_close(&self, _lane: u64) -> Result<(), String> {
+        Err("this CN's exchange transport has no ring lanes".to_string())
+    }
+
+    /// Where the ring transport hands the batches it lands. Other transports land nothing.
+    fn set_delivery(&self, _delivery: std::sync::Arc<dyn RingDelivery>) {}
+
+    /// Stops the transport and drops its delivery, which holds the service. Idempotent.
+    fn shut_down(&self) {}
+
     /// Sends `peer` a control message (`Topology`, `ShareAbandoned`) and returns its reply.
     fn control(&self, peer: SocketAddr, envelope: &NixlEnvelope) -> Result<Vec<u8>, String>;
 
@@ -361,6 +397,21 @@ pub struct StreamHop {
     pub slot: SenderSlot,
     pub names: Vec<String>,
     pub drain: Box<dyn OutputDrain>,
+    /// The query's deadline, which bounds the hop's waits; `None` when it has none.
+    pub deadline: Option<std::time::Instant>,
+}
+
+/// Where the ring transport hands a batch it landed whole: `token` holds it in this CN's direct
+/// exchange, and `request` routes it like a Packed frame with that sequence number.
+pub trait RingDelivery: Send + Sync {
+    /// Pushes the batch to its receiver; on an error the caller releases the token.
+    fn deliver(
+        &self,
+        request: &PTransmitChunkParams,
+        token: u64,
+        rows: u64,
+        names: &[String],
+    ) -> Result<(), String>;
 }
 
 /// Rejects StarRocks native shuffle so a stock BE `ChunkPB` cannot be treated as Sirius.

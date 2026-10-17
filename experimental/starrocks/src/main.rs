@@ -3,8 +3,6 @@ use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
-#[cfg(feature = "nixl-transport")]
-use sirius_starrocks_cn::NixlTransport;
 #[cfg(feature = "sirius-engine")]
 use sirius_starrocks_cn::SiriusEngine;
 #[cfg(not(feature = "sirius-engine"))]
@@ -14,6 +12,8 @@ use sirius_starrocks_cn::{
     Host, NixlEndpoint, SharedHeartbeatState, register_node, report_to_frontend_once,
     start_backend_server, start_heartbeat_server,
 };
+#[cfg(feature = "nixl-transport")]
+use sirius_starrocks_cn::{NixlTransport, ring_options_from_env, start_ring_transport};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -70,11 +70,19 @@ impl Args {
         // up the GPU engine on its dedicated thread (fail-fast: a bad config or GPU failure exits
         // before FE can route work here); otherwise it is a stub. The handle is held for the
         // process lifetime and torn down after the servers stop, below.
+        // SIRIUS_CN_EXCHANGE=ring sends exchange batches through two small registered rings
+        // (the ring transport); direct, the default, writes them straight into a slab pool.
+        #[cfg(feature = "nixl-transport")]
+        let ring = ring_options_from_env().map_err(|err| anyhow!(err))?;
+        #[cfg(all(feature = "sirius-engine", not(feature = "nixl-transport")))]
+        let ring = None;
         #[cfg(feature = "sirius-engine")]
-        let engine =
-            SiriusEngine::start(self.engine.sirius_config.clone()).map_err(|err| anyhow!(err))?;
+        let engine = SiriusEngine::start_with(self.engine.sirius_config.clone(), ring)
+            .map_err(|err| anyhow!(err))?;
         #[cfg(feature = "nixl-transport")]
         let direct_exchange = engine.direct_exchange();
+        #[cfg(feature = "nixl-transport")]
+        let ring_exchange = engine.take_ring_exchange();
         // Declared before `nixl`: locals drop in reverse order, so even an early return drops the
         // transport (deregistering the engine's slab) before the engine frees it.
         #[cfg(feature = "sirius-engine")]
@@ -88,17 +96,19 @@ impl Args {
         // Without a slab pool the CN still serves receivers on itself, and remote destinations
         // fail cleanly ("this CN has no NIXL transport").
         #[cfg(feature = "nixl-transport")]
-        let nixl: Option<Arc<dyn NixlEndpoint>> = match direct_exchange {
-            Some(exchange) => {
-                let agent_name = format!(
-                    "{}:{}",
-                    self.compute_node.advertise_host, self.compute_node.brpc_port
-                );
-                Some(Arc::new(
-                    NixlTransport::start(agent_name, exchange).map_err(|err| anyhow!(err))?,
-                ))
+        let agent_name = format!(
+            "{}:{}",
+            self.compute_node.advertise_host, self.compute_node.brpc_port
+        );
+        #[cfg(feature = "nixl-transport")]
+        let nixl: Option<Arc<dyn NixlEndpoint>> = match (ring_exchange, direct_exchange) {
+            (Some(ring), Some(exchange)) => {
+                Some(start_ring_transport(agent_name, ring, exchange).map_err(|err| anyhow!(err))?)
             }
-            None => {
+            (None, Some(exchange)) if exchange.region().2 > 0 => Some(Arc::new(
+                NixlTransport::start(agent_name, exchange).map_err(|err| anyhow!(err))?,
+            )),
+            _ => {
                 warn!(
                     "the engine's GPU pool is not a slab, so this CN runs without the NIXL \
                      transport and can't ship to other CNs; set sirius.memory.gpu.allocator: \
@@ -157,6 +167,11 @@ impl Args {
         // the transport ahead of the engine. Drop the transport first so it deregisters the
         // engine's pool, then the executor: the engine closes its thread and tears down the
         // context (joined) here.
+        // The ring transport delivers to the service, which holds the transport: break that
+        // before the drop.
+        if let Some(nixl) = &nixl {
+            nixl.shut_down();
+        }
         drop(nixl);
         #[cfg(feature = "sirius-engine")]
         info!("tearing down Sirius engine");

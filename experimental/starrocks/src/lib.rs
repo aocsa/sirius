@@ -58,6 +58,9 @@ mod local_exchange;
 mod nixl_chunk;
 #[cfg(feature = "nixl-transport")]
 mod nixl_transport;
+#[cfg(feature = "nixl-transport")]
+mod ring_nixl;
+// The loop runs only with NIXL; without it the tests drive it over an in-process fabric.
 #[cfg(any(test, feature = "sirius-engine"))]
 mod parked_registry;
 mod proto;
@@ -65,6 +68,10 @@ mod prpc;
 mod recent_queries;
 mod result_encoder;
 mod result_store;
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod ring_transport;
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod ring_wire;
 // The run record is used only by the engine; pending frees by every executor.
 #[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
 mod running_query;
@@ -77,6 +84,8 @@ pub use fragment_executor::{FragmentExecutor, FragmentResult, PendingFrees, Stub
 pub use nixl_chunk::NixlEndpoint;
 #[cfg(feature = "nixl-transport")]
 pub use nixl_transport::NixlTransport;
+#[cfg(feature = "nixl-transport")]
+pub use ring_nixl::{ring_options_from_env, start_ring_transport};
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

@@ -252,7 +252,7 @@ impl SiriusComputeNodeService {
         nixl: Option<Arc<dyn NixlEndpoint>>,
     ) -> Self {
         let ends = Arc::new(QueryEnds::default());
-        Self {
+        let service = Self {
             translator: PlanTranslator::new(),
             executor,
             results: Arc::new(ResultStore::default()),
@@ -273,13 +273,29 @@ impl SiriusComputeNodeService {
             ends,
             alloc_wait: alloc_wait_from_env(),
             deadlines: Arc::default(),
+        };
+        if let Some(nixl) = &service.nixl {
+            nixl.set_delivery(Arc::new(service.clone()));
         }
+        service
     }
 
     /// Reports instances' ends only to coordinators on `frontend_host`, the configured FE.
     pub(crate) fn reporting_to(mut self, frontend_host: Option<crate::Host>) -> Self {
         self.reports = Arc::new(ExecReports::new(frontend_host, Arc::clone(&self.ends)));
         self
+    }
+}
+
+impl crate::nixl_chunk::RingDelivery for SiriusComputeNodeService {
+    fn deliver(
+        &self,
+        request: &PTransmitChunkParams,
+        token: u64,
+        rows: u64,
+        names: &[String],
+    ) -> std::result::Result<(), String> {
+        self.deliver_ring_batch(request, token, rows, names)
     }
 }
 
@@ -1723,7 +1739,46 @@ impl SiriusComputeNodeService {
                 self.remote_sender_failed(request, &error)?;
                 Ok((Vec::new(), None))
             }
+            NixlEnvelope::RingOpen(body) => {
+                // A query that already failed here takes no more lanes: its sender stops at once,
+                // with the cause.
+                if let Some(cause) = request
+                    .finst_id
+                    .as_ref()
+                    .and_then(|id| self.exchanges.failure(FragmentInstanceId::from(id)))
+                {
+                    return Err(cause);
+                }
+                Ok((nixl.ring_open(request, &body)?, None))
+            }
+            NixlEnvelope::RingClose(lane) => {
+                nixl.ring_close(lane)?;
+                Ok((Vec::new(), None))
+            }
         }
+    }
+
+    /// A batch the ring transport landed whole, as the Packed frame `request` routes: pushed to
+    /// its receiver, whose ready fragments then run. Called on the transport thread, before the
+    /// lane's last credit for the batch leaves, so the sender's EOS comes after it.
+    fn deliver_ring_batch(
+        &self,
+        request: &PTransmitChunkParams,
+        token: u64,
+        rows: u64,
+        names: &[String],
+    ) -> std::result::Result<(), String> {
+        match self.push_packed(request, token, rows, names.to_vec())? {
+            Some(Some(ready)) => self.drain_ready_async(ready),
+            Some(None) => {}
+            // A runtime filter share for a scan that no longer waits for it.
+            None => {
+                if let Some(nixl) = &self.nixl {
+                    nixl.release(token);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Receive buffers for a batch with `layout`, on behalf of `request`'s sender. None for a
@@ -2260,6 +2315,10 @@ impl SiriusComputeNodeService {
             .map(|(slot, _)| outputs.iter().position(|output| output == slot))
             .collect::<Option<Vec<_>>>()
             .ok_or("a remote destination is not one of the fragment's outputs".to_string())?;
+        let deadline = run
+            .query
+            .and_then(|query| self.deadlines.remaining(query))
+            .map(|left| std::time::Instant::now() + left);
         let (respond, handed) = channel();
         run.drains = Some(DrainHandoff { streams, respond });
         let (ran, streamed) = std::thread::scope(|scope| {
@@ -2274,6 +2333,7 @@ impl SiriusComputeNodeService {
                         slot,
                         names: names.to_vec(),
                         drain,
+                        deadline,
                     })
                     .collect();
                 Some(nixl.stream(hops))

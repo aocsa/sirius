@@ -53,10 +53,37 @@ pub enum DrainNext {
     End,
 }
 
+/// One parked or streamed batch exported for the ring exchange: a job on this CN's ring, held
+/// until released there.
+#[derive(Clone, Debug)]
+pub struct RingJob {
+    pub token: u64,
+    pub rows: u64,
+    /// Bytes the job's frames carry.
+    pub stream_bytes: u64,
+    /// What the receiver lands the frames by.
+    pub header: Vec<u8>,
+}
+
+/// What [`OutputDrain::next_ring`] found within its timeout.
+#[derive(Debug)]
+pub enum RingNext {
+    Job(RingJob),
+    /// Nothing yet; the fragment may still produce more.
+    Waiting,
+    /// The stream ended and every batch was exported.
+    End,
+}
+
 /// Exports one output stream of a sender fragment while it runs, from any thread.
 pub trait OutputDrain: Send + std::fmt::Debug {
     /// The next batch, waiting up to `timeout` for one. Errors once the fragment failed.
     fn next(&mut self, timeout: Duration) -> Result<DrainNext, String>;
+
+    /// [`next`](Self::next) for the ring exchange.
+    fn next_ring(&mut self, _timeout: Duration) -> Result<RingNext, String> {
+        Err("this output drain does not export for the ring exchange".to_string())
+    }
 }
 
 /// Asks the executor to hand out drains for some output streams before it runs the fragment,
@@ -195,6 +222,12 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
         Err(format!(
             "this executor cannot export the output parked under {slot:?}"
         ))
+    }
+
+    /// [`export_direct_next`](Self::export_direct_next) for the ring exchange: the next batch
+    /// parked under `slot` as a ring job; `None` once drained.
+    fn export_ring_next(&self, _slot: SenderSlot) -> Result<Option<RingJob>, String> {
+        Err("this executor does not export for the ring exchange".to_string())
     }
 
     /// Rows, minimum and maximum of a runtime filter's integer keys, read in place.

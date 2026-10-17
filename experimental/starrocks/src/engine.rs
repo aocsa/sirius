@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use crate::fragment_executor::{
     DrainHandoff, DrainNext, ExportedBatch, FilterKeys, FilterRun, FragmentExecutor,
-    FragmentResult, FragmentRun, KeySource, KeyStats, OutputDrain, SenderSlot,
+    FragmentResult, FragmentRun, KeySource, KeyStats, OutputDrain, RingJob, RingNext, SenderSlot,
 };
 use crate::local_exchange::RemoteBatch;
 use crate::parked_registry::ParkedRegistry;
@@ -74,6 +74,11 @@ enum EngineRequest {
         slot: SenderSlot,
         respond: Sender<Result<Option<ExportedBatch>, String>>,
     },
+    /// Export the next batch parked under `slot` as a ring job.
+    ExportRing {
+        slot: SenderSlot,
+        respond: Sender<Result<Option<RingJob>, String>>,
+    },
     /// Rows, minimum and maximum of a runtime filter's keys, read in place.
     KeyStats {
         keys: FilterKeys,
@@ -100,8 +105,10 @@ pub struct SiriusEngine {
     requests: Mutex<Option<Sender<EngineRequest>>>,
     /// Engine thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
-    /// The context's direct exchange, present when its GPU pool is a slab.
+    /// The context's direct exchange, present when its GPU pool is a slab or it has a ring.
     direct_exchange: Option<Arc<sirius::DirectExchange>>,
+    /// The context's ring exchange, until the transport takes it.
+    ring_exchange: Mutex<Option<sirius::RingExchange>>,
     /// Parked sender fragments, published by the engine thread after every request so a reader
     /// never waits behind a running fragment.
     parked: Arc<AtomicUsize>,
@@ -137,6 +144,15 @@ impl SiriusEngine {
     /// failure surfaces here, before any RPC is served. `config` is the optional Sirius YAML path
     /// (built-in defaults when `None`).
     pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
+        Self::start_with(config, None)
+    }
+
+    /// [`start`](Self::start) with a ring exchange when `ring` says how big: its rings are
+    /// allocated before the engine's GPU pool.
+    pub fn start_with(
+        config: Option<PathBuf>,
+        ring: Option<sirius::RingOptions>,
+    ) -> Result<Self, String> {
         let (request_tx, request_rx) = channel::<EngineRequest>();
         let (ready_tx, ready_rx) = channel();
         let parked = Arc::new(AtomicUsize::new(0));
@@ -145,16 +161,26 @@ impl SiriusEngine {
         let engine_running = Arc::clone(&running);
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(config, request_rx, ready_tx, published, engine_running))
+            .spawn(move || {
+                engine_thread(
+                    config,
+                    ring,
+                    request_rx,
+                    ready_tx,
+                    published,
+                    engine_running,
+                )
+            })
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
-            Ok(Ok((direct_exchange, interrupter))) => Ok(Self {
+            Ok(Ok(ready)) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
-                direct_exchange: direct_exchange.map(Arc::new),
+                direct_exchange: ready.direct_exchange.map(Arc::new),
+                ring_exchange: Mutex::new(ready.ring_exchange),
                 parked,
                 running,
-                interrupter: Arc::new(Interrupter(interrupter)),
+                interrupter: Arc::new(Interrupter(ready.interrupter)),
                 frees: Arc::default(),
             }),
             Ok(Err(err)) => Err(err),
@@ -162,9 +188,17 @@ impl SiriusEngine {
         }
     }
 
-    /// The context's direct exchange, or `None` unless its GPU pool is a slab.
+    /// The context's direct exchange, or `None` unless its GPU pool is a slab or it has a ring.
     pub fn direct_exchange(&self) -> Option<Arc<sirius::DirectExchange>> {
         self.direct_exchange.clone()
+    }
+
+    /// The context's ring exchange, once: the transport that registers its rings owns it.
+    pub fn take_ring_exchange(&self) -> Option<sirius::RingExchange> {
+        self.ring_exchange
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// Sends one request to the engine thread and waits for its answer.
@@ -193,20 +227,30 @@ impl SiriusEngine {
 
 /// Engine-thread body: bring up the context, signal readiness, then serve requests until the
 /// request channel closes. The context is dropped here, on this thread, when the loop ends.
+/// What the engine thread hands back once its context is up.
+struct Ready {
+    direct_exchange: Option<sirius::DirectExchange>,
+    ring_exchange: Option<sirius::RingExchange>,
+    interrupter: sirius::Interrupter,
+}
+
 fn engine_thread(
     config: Option<PathBuf>,
+    ring: Option<sirius::RingOptions>,
     requests: Receiver<EngineRequest>,
-    ready: Sender<Result<(Option<sirius::DirectExchange>, sirius::Interrupter), String>>,
+    ready: Sender<Result<Ready, String>>,
     published: Arc<AtomicUsize>,
     running: Arc<RunningQuery>,
 ) {
-    let context = match build_context(config) {
+    let context = match build_context(config, ring) {
         Ok(context) => {
             // A send error means the caller is already gone; nothing to serve.
-            if ready
-                .send(Ok((context.direct_exchange(), context.interrupter())))
-                .is_err()
-            {
+            let handles = Ready {
+                direct_exchange: context.direct_exchange(),
+                ring_exchange: context.ring_exchange(),
+                interrupter: context.interrupter(),
+            };
+            if ready.send(Ok(handles)).is_err() {
                 return;
             }
             context
@@ -274,6 +318,9 @@ fn engine_thread(
             EngineRequest::ExportDirect { slot, respond } => {
                 let _ = respond.send(export_direct(&mut parked, &slot));
             }
+            EngineRequest::ExportRing { slot, respond } => {
+                let _ = respond.send(export_ring(&mut parked, &slot));
+            }
             EngineRequest::KeyStats { keys, respond } => {
                 let _ = respond.send(key_stats(&context, &mut parked, &keys));
             }
@@ -315,6 +362,27 @@ fn export_direct(
         layout: batch.layout,
         src: batch.src,
     }))
+}
+
+/// Exports the next batch parked under `slot` as a ring job.
+fn export_ring(
+    parked: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    slot: &SenderSlot,
+) -> Result<Option<RingJob>, String> {
+    let (fragment, stream) = parked.claim(slot, "export")?;
+    let job = fragment
+        .export_ring(stream)
+        .map_err(|err| format!("failed to export a batch of output stream {stream}: {err}"))?;
+    Ok(job.map(ring_job))
+}
+
+fn ring_job(job: sirius::RingJob) -> RingJob {
+    RingJob {
+        token: job.token,
+        rows: job.rows,
+        stream_bytes: job.stream_bytes,
+        header: job.header,
+    }
 }
 
 /// The plan one attempt at a fragment runs, with the runtime filters it reads.
@@ -640,6 +708,20 @@ impl OutputDrain for EngineDrain {
             },
         )
     }
+
+    fn next_ring(&mut self, timeout: std::time::Duration) -> Result<RingNext, String> {
+        Ok(
+            match self
+                .0
+                .next_ring(timeout)
+                .map_err(|err| format!("failed to export a streamed batch: {err}"))?
+            {
+                sirius::RingDrainNext::Job(job) => RingNext::Job(ring_job(job)),
+                sirius::RingDrainNext::Waiting => RingNext::Waiting,
+                sirius::RingDrainNext::End => RingNext::End,
+            },
+        )
+    }
 }
 
 /// The parked sender outputs feeding exchange `node_id`.
@@ -703,10 +785,14 @@ fn unix_us() -> u64 {
 }
 
 /// Brings up a [`SiriusContext`] from an optional config path (built-in defaults when `None`).
-fn build_context(config: Option<PathBuf>) -> Result<SiriusContext, String> {
-    let context = match config {
-        Some(path) => SiriusContext::from_config_file(&path),
-        None => SiriusContext::new(),
+fn build_context(
+    config: Option<PathBuf>,
+    ring: Option<sirius::RingOptions>,
+) -> Result<SiriusContext, String> {
+    let context = match (config, ring) {
+        (config, Some(ring)) => SiriusContext::with_ring(config.as_deref(), &ring),
+        (Some(path), None) => SiriusContext::from_config_file(&path),
+        (None, None) => SiriusContext::new(),
     }
     .map_err(|err| format!("failed to bring up Sirius engine: {err}"))?;
     info!("Sirius engine context created");
@@ -753,6 +839,10 @@ impl FragmentExecutor for SiriusEngine {
 
     fn export_direct_next(&self, slot: SenderSlot) -> Result<Option<ExportedBatch>, String> {
         self.call(|respond| EngineRequest::ExportDirect { slot, respond })
+    }
+
+    fn export_ring_next(&self, slot: SenderSlot) -> Result<Option<RingJob>, String> {
+        self.call(|respond| EngineRequest::ExportRing { slot, respond })
     }
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
