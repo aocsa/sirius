@@ -127,7 +127,11 @@ class direct_exchange {
     std::vector<std::uint64_t> src;  ///< [address, length] per non-empty buffer.
   };
 
-  direct_exchange(cucascade::memory::memory_space& gpu, memory::slab_region region);
+  /// @p region is the slab behind @p gpu's pool, which export_batch() and allocate() need: peers
+  /// write straight into it. Without one, the exchange still holds, seals and hands out batches
+  /// another transport landed (adopt()).
+  direct_exchange(cucascade::memory::memory_space& gpu,
+                  std::optional<memory::slab_region> region = std::nullopt);
 
   /// Frees at least `bytes` of GPU memory if it can, e.g. by spilling to host; blocks until done.
   using make_room_fn = std::function<void(std::size_t bytes)>;
@@ -160,6 +164,12 @@ class direct_exchange {
   /// Wraps a fully received batch as a data batch the downgrade executor may spill while it
   /// waits for its receiver. A sealed, consumed or unknown token is left as it is.
   void seal(std::uint64_t token);
+
+  /// Holds @p batch, already received whole, as if sealed: the downgrade executor may spill it,
+  /// and its receiver takes it by the returned token like any sealed batch. @p on_gone runs once
+  /// when the token is taken, released or closed, outside the exchange's lock.
+  [[nodiscard]] std::uint64_t adopt(std::shared_ptr<cucascade::data_batch> batch,
+                                    std::function<void()> on_gone = {});
 
   /// Consumes the token of a received batch, sealed (possibly spilled to host) or not.
   /// @throws sirius::invalid_input_exception on a token that holds no received batch.
@@ -203,7 +213,12 @@ class direct_exchange {
   /// Frees every token. Later calls throw, except close() and the accessors.
   void close();
 
-  [[nodiscard]] memory::slab_region const& region() const noexcept { return _region; }
+  /// The slab peers write into, if the pool is one.
+  [[nodiscard]] std::optional<memory::slab_region> const& region() const noexcept
+  {
+    return _region;
+  }
+  [[nodiscard]] int device() const noexcept { return _device; }
   [[nodiscard]] cucascade::memory::memory_space& space() const noexcept { return _gpu; }
 
  private:
@@ -216,8 +231,14 @@ class direct_exchange {
   /// Wraps @p entry's buffers as a table; @p entry is consumed.
   [[nodiscard]] static std::unique_ptr<cudf::table> to_table(received&& entry);
 
+  /// The slab, or @throws sirius::invalid_input_exception without one.
+  [[nodiscard]] memory::slab_region const& slab() const;
+  /// Runs and forgets @p token's on_gone, if any; call without the lock.
+  void gone(std::uint64_t token);
+
   cucascade::memory::memory_space& _gpu;
-  memory::slab_region _region;
+  std::optional<memory::slab_region> _region;
+  int _device;
   /// Declared before _entries, so an exported copy freed on it is gone before the stream is.
   rmm::cuda_stream _stream;
   mutable std::mutex _mutex;
@@ -233,6 +254,8 @@ class direct_exchange {
   std::shared_ptr<cucascade::data_repository> _sealed;
   /// Token -> batch id in _sealed.
   std::map<std::uint64_t, std::uint64_t> _sealed_ids;
+  /// Callbacks of adopted tokens, run when they go.
+  std::map<std::uint64_t, std::function<void()>> _on_gone;
 };
 
 }  // namespace sirius::exec

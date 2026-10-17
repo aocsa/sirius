@@ -494,6 +494,51 @@ TEST_CASE("direct_exchange seals a received batch until take_batch or release", 
   CHECK(manager->get_repositories().front()->get_batch_ids().empty());
 }
 
+TEST_CASE("direct_exchange without a slab adopts batches another transport landed",
+          "[exchange_direct]")
+{
+  cucascade::memory::gpu_memory_space_config config = slab_config();
+  config.mr_factory_fn                              = nullptr;  // the default async pool
+  memory_space gpu(config);
+  direct_exchange exchange(gpu);
+  CHECK_FALSE(exchange.region().has_value());
+  CHECK(exchange.device() == 0);
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  exchange.enable_spill(staging, [](std::size_t) {});
+
+  auto const table = sample_table(gpu.get_default_allocator());
+  // Writing straight into the pool needs the slab.
+  CHECK_THROWS_WITH(exchange.export_batch(batch_of(gpu, table->view(), table)),
+                    ContainsSubstring("allocator: slab"));
+  CHECK_THROWS_WITH(
+    exchange.allocate(encode_layout({rows, {direct_column{type(cudf::type_id::INT64), 0, false}}})),
+    ContainsSubstring("allocator: slab"));
+
+  int gone         = 0;
+  auto const token = exchange.adopt(batch_of(gpu, table->view(), table), [&] { ++gone; });
+  CHECK(exchange.outstanding() == 1);
+  // Adopted batches are sealed: the downgrade executor sees them.
+  auto const manager = registry.get(exchange_staging::query_id);
+  REQUIRE(manager);
+  CHECK(manager->get_repositories().front()->get_batch_ids().size() == 1);
+  CHECK(summarize(sirius::get_cudf_table_view(exchange.peek_batch(token)->to_read_only())) ==
+        summarize(table->view()));
+  auto batch = exchange.take_batch(token);
+  REQUIRE(batch);
+  CHECK(gone == 1);
+  CHECK(exchange.outstanding() == 0);
+
+  // Released or closed, the callback runs once too.
+  auto const released = exchange.adopt(batch_of(gpu, table->view(), table), [&] { ++gone; });
+  exchange.release(released);
+  exchange.release(released);
+  CHECK(gone == 2);
+  static_cast<void>(exchange.adopt(batch_of(gpu, table->view(), table), [&] { ++gone; }));
+  exchange.close();
+  CHECK(gone == 3);
+}
+
 TEST_CASE("direct_exchange makes room once before refusing an allocation", "[exchange_direct]")
 {
   memory_space gpu(slab_config());
@@ -507,7 +552,7 @@ TEST_CASE("direct_exchange makes room once before refusing an allocation", "[exc
   // request is well formed, but more than is left. The reservation fails, room is asked for
   // once, and the retry fails too because nothing here can spill.
   auto const slab_rows = [&](double share) {
-    return static_cast<cudf::size_type>(static_cast<double>(exchange.region().len) * share /
+    return static_cast<cudf::size_type>(static_cast<double>(exchange.region()->len) * share /
                                         sizeof(std::int64_t));
   };
   auto const int64_layout = [](cudf::size_type n) {
@@ -528,7 +573,7 @@ TEST_CASE("direct_exchange asks again when making room was cancelled", "[exchang
   exchange_staging staging(registry);
 
   auto const int64_layout = [&](double share) {
-    auto const rows = static_cast<cudf::size_type>(static_cast<double>(exchange.region().len) *
+    auto const rows = static_cast<cudf::size_type>(static_cast<double>(exchange.region()->len) *
                                                    share / sizeof(std::int64_t));
     return encode_layout({rows, {{type(cudf::type_id::INT64), 0, false}}});
   };
