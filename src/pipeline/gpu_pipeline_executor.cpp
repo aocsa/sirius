@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <format>
 #include <memory>
@@ -221,6 +222,20 @@ void gpu_pipeline_executor::process_task(
     // achievable; any per-batch overflow during execution is still handled by
     // the OOM-reschedule + tiering path. (Telemetry above intentionally reports
     // the pre-clamp estimate so the estimator can still be analyzed.)
+    // SIRIUS_MAX_TASK_RESERVATION_FRACTION caps one task's reservation at a share of the space
+    // (unset: no cap). A cold scan reserves several times its batch and every OOM retry at least
+    // doubles its last reservation, so a few retrying tasks can hold the whole pool between them
+    // and starve everyone else into the same retry loop; capped, they spill or retry within
+    // their share instead.
+    static double const task_share = [] {
+      auto const* env = std::getenv("SIRIUS_MAX_TASK_RESERVATION_FRACTION");
+      double value    = env != nullptr ? std::atof(env) : 0.0;
+      return value > 0.0 && value < 1.0 ? value : 0.0;
+    }();
+    if (auto const space_max = _memory_space->get_max_memory(); task_share > 0.0 && space_max > 0) {
+      auto const cap = static_cast<std::size_t>(task_share * static_cast<double>(space_max));
+      if (bytes_needs > cap) { bytes_needs = cap; }
+    }
     if (auto const space_max = _memory_space->get_max_memory();
         space_max > 0 && bytes_needs > space_max) {
       SIRIUS_LOG_DEBUG(
