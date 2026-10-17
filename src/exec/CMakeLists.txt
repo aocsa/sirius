@@ -5,6 +5,7 @@ target_sources(
           batch_stream.cpp
           exchange_direct.cpp
           exchange_ring.cpp
+          exchange_ring_wire.cpp
           exchange_staging.cpp
           stream_session.cpp
           stream_bind_catalog.cpp
