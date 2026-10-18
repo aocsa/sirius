@@ -59,6 +59,7 @@
 using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::MessageMatches;
 using cucascade::memory::memory_space;
+using cucascade::memory::reservation;
 using namespace sirius::exec;
 
 namespace {
@@ -451,7 +452,10 @@ TEST_CASE("direct_exchange seals a received batch until take_batch or release", 
   sirius::data::data_repository_manager_registry registry;
   exchange_staging staging(registry);
   std::size_t made_room = 0;
-  exchange.enable_spill(staging, [&](std::size_t) { ++made_room; });
+  exchange.enable_spill(staging, [&](std::size_t) -> std::unique_ptr<reservation> {
+    ++made_room;
+    return nullptr;
+  });
 
   auto const table = sample_table(gpu.get_default_allocator());
   auto const sent  = exchange.export_batch(batch_of(gpu, table->view(), table));
@@ -506,7 +510,8 @@ TEST_CASE("direct_exchange without a slab adopts batches another transport lande
   CHECK(exchange.device() == 0);
   sirius::data::data_repository_manager_registry registry;
   exchange_staging staging(registry);
-  exchange.enable_spill(staging, [](std::size_t) {});
+  exchange.enable_spill(staging,
+                        [](std::size_t) -> std::unique_ptr<reservation> { return nullptr; });
 
   auto const table = sample_table(gpu.get_default_allocator());
   // Writing straight into the pool needs the slab.
@@ -547,7 +552,10 @@ TEST_CASE("direct_exchange makes room once before refusing an allocation", "[exc
   sirius::data::data_repository_manager_registry registry;
   exchange_staging staging(registry);
   std::vector<std::size_t> asked;
-  exchange.enable_spill(staging, [&](std::size_t bytes) { asked.push_back(bytes); });
+  exchange.enable_spill(staging, [&](std::size_t bytes) -> std::unique_ptr<reservation> {
+    asked.push_back(bytes);
+    return nullptr;
+  });
 
   // Half the slab is taken, then three quarters are asked for: within the slab's size, so the
   // request is well formed, but more than is left. The reservation fails, room is asked for
@@ -582,9 +590,10 @@ TEST_CASE("direct_exchange asks again when making room was cancelled", "[exchang
   // what blocks the allocation.
   auto held = exchange.allocate(int64_layout(0.5)).first;
   int asked = 0;
-  exchange.enable_spill(staging, [&](std::size_t) {
+  exchange.enable_spill(staging, [&](std::size_t) -> std::unique_ptr<reservation> {
     if (++asked == 1) { throw std::runtime_error("downgrade executor shutting down"); }
     exchange.release(std::exchange(held, 0));
+    return nullptr;
   });
   auto const [token, buffers] = exchange.allocate(int64_layout(0.75));
   CHECK(asked == 2);
@@ -594,13 +603,42 @@ TEST_CASE("direct_exchange asks again when making room was cancelled", "[exchang
   // One that keeps failing gives up after a few attempts, with the pool's own error.
   held  = exchange.allocate(int64_layout(0.5)).first;
   asked = 0;
-  exchange.enable_spill(staging, [&](std::size_t) {
+  exchange.enable_spill(staging, [&](std::size_t) -> std::unique_ptr<reservation> {
     ++asked;
     throw std::runtime_error("downgrade executor shutting down");
   });
   CHECK_THROWS_AS(exchange.allocate(int64_layout(0.75)), rmm::out_of_memory);
   CHECK(asked == 3);
   exchange.release(held);
+}
+
+TEST_CASE("direct_exchange keeps the room it made when another reserver comes first",
+          "[exchange_direct]")
+{
+  memory_space gpu(slab_config());
+  direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+
+  auto const int64_layout = [&](double share) {
+    auto const rows = static_cast<cudf::size_type>(static_cast<double>(exchange.region()->len) *
+                                                   share / sizeof(std::int64_t));
+    return encode_layout({rows, {{type(cudf::type_id::INT64), 0, false}}});
+  };
+  // Making room frees half the slab and reserves it for the caller; a competing reserver then
+  // takes everything left before the caller could try again.
+  auto held = exchange.allocate(int64_layout(0.5)).first;
+  std::unique_ptr<reservation> competitor;
+  exchange.enable_spill(staging, [&](std::size_t bytes) {
+    exchange.release(std::exchange(held, 0));
+    auto made  = gpu.make_reservation_or_null(bytes);
+    competitor = gpu.make_reservation_upto(gpu.get_max_memory());
+    return made;
+  });
+  auto const [token, buffers] = exchange.allocate(int64_layout(0.75));
+  CHECK_FALSE(buffers.empty());
+  CHECK(competitor);
+  exchange.release(token);
 }
 
 TEST_CASE("exchange_staging opens its query so the downgrade executor can borrow it",

@@ -662,7 +662,7 @@ std::unique_ptr<cucascade::memory::reservation> direct_exchange::reserve(std::si
   constexpr int attempts = 3;
   for (int attempt = 1; attempt <= attempts; ++attempt) {
     try {
-      _make_room(bytes);
+      if (auto made = _make_room(bytes)) { return made; }
       break;
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN("direct exchange: making room for {} bytes failed (attempt {} of {}): {}",
