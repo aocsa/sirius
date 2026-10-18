@@ -491,7 +491,9 @@ void direct_exchange::enable_spill(exchange_staging& staging, make_room_fn make_
 {
   std::lock_guard const lock{_mutex};
   _make_room = std::move(make_room);
-  staging.track(_sealed);
+  // Received batches wait for receivers that start only once all their senders finished: they
+  // spill before a running fragment's output and inputs.
+  staging.track(_sealed, /*spill_first=*/true);
 }
 
 void direct_exchange::seal(std::uint64_t token)

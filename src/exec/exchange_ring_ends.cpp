@@ -208,6 +208,39 @@ std::string bytes_text(std::size_t bytes)
 struct ring_exchange::held {
   std::atomic<std::uint64_t> gpu{0};
   std::atomic<std::uint64_t> host{0};
+
+  /// One sealed landing's charge to its tier's budget, returned once: when the batch goes, or
+  /// earlier, when a spill moved it off that tier.
+  struct charge {
+    std::weak_ptr<cucascade::data_batch> batch;
+    Tier tier;
+    std::uint64_t bytes;
+    std::shared_ptr<std::atomic<bool>> returned = std::make_shared<std::atomic<bool>>(false);
+
+    void give_back(held& to) const
+    {
+      if (returned->exchange(true)) { return; }
+      (tier == Tier::GPU ? to.gpu : to.host).fetch_sub(bytes);
+    }
+  };
+  std::mutex mutex;
+  std::vector<charge> charges;
+
+  /// Gives back the charge of every sealed landing a spill moved off its tier, without waiting
+  /// on a batch whose lock is taken (I1); forgets those given back.
+  void return_moved()
+  {
+    std::lock_guard lock{mutex};
+    std::erase_if(charges, [&](charge const& c) {
+      if (c.returned->load()) { return true; }
+      auto const batch = c.batch.lock();
+      if (!batch) { return false; }  // its on_gone returns it
+      auto const ro = batch->try_to_read_only();
+      if (!ro || ro->get_current_tier() == c.tier) { return false; }
+      c.give_back(*this);
+      return true;
+    });
+  }
 };
 
 struct ring_exchange::job {
@@ -647,6 +680,7 @@ ring_exchange::landing ring_exchange::begin(std::span<std::uint8_t const> header
   if (!exchange) {
     throw sirius::invalid_input_exception("ring exchange: not attached, or closed");
   }
+  _held->return_moved();
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
   auto const frame_bytes = _recv.frame_bytes();
   st->frames = static_cast<std::uint32_t>((wire.stream_bytes + frame_bytes - 1) / frame_bytes);
@@ -980,6 +1014,11 @@ std::uint64_t ring_exchange::seal(std::uint64_t id)
     _landings.erase(it);
     exchange = _exchange;
   }
+  // Until the exchange holds the batch, a throw would leave the landing's charge taken for good.
+  held::charge charge{{}, st->tier, st->held_bytes};
+  absl::Cleanup give_back = [&] {
+    if (charge.bytes > 0) { charge.give_back(*_held); }
+  };
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
   auto const& wire = st->header;
   auto& gpu        = exchange->space();
@@ -1054,22 +1093,25 @@ std::uint64_t ring_exchange::seal(std::uint64_t id)
       break;
     }
   }
-  auto const tier  = st->tier;
-  auto const bytes = st->held_bytes;
   {
     std::lock_guard lock{_mutex};
-    auto const at = tier_index(tier);
+    auto const at = tier_index(st->tier);
     ++_counters.landed_batches[at];
     _counters.landed_bytes[at] += wire.stream_bytes;
   }
   st->sealed = true;
   std::function<void()> on_gone;
-  if (bytes > 0) {
-    on_gone = [held = _held, tier, bytes] {
-      (tier == Tier::GPU ? held->gpu : held->host).fetch_sub(bytes);
-    };
+  if (charge.bytes > 0) {
+    charge.batch = batch;
+    on_gone      = [held = _held, charge] { charge.give_back(*held); };
   }
-  return exchange->adopt(std::move(batch), std::move(on_gone));
+  auto const token = exchange->adopt(std::move(batch), std::move(on_gone));
+  std::move(give_back).Cancel();
+  if (charge.bytes > 0) {
+    std::lock_guard lock{_held->mutex};
+    _held->charges.push_back(std::move(charge));
+  }
+  return token;
 }
 
 void ring_exchange::abort(std::uint64_t id)
@@ -1142,6 +1184,7 @@ void ring_exchange::close()
 
 ring_exchange::counters ring_exchange::stats() const
 {
+  _held->return_moved();
   std::lock_guard lock{_mutex};
   auto out      = _counters;
   out.gpu_held  = _held->gpu.load();

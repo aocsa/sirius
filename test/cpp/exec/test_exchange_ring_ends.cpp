@@ -462,6 +462,41 @@ TEST_CASE("disk landings written by several threads overlap", "[exchange_ring][e
   fs::remove_all(dir);
 }
 
+TEST_CASE("a spilled sealed landing frees its GPU charge", "[exchange_ring][ends]")
+{
+  auto sender         = make_ring();
+  auto receiver       = make_ring();
+  auto batch          = gpu_batch(sample_table());
+  auto const expected = digest(*batch);
+  auto const job      = sender->export_batch(batch);
+  REQUIRE(job.has_value());
+  batch.reset();
+
+  auto const [landing, token] = ship(*sender, *receiver, *job);
+  REQUIRE(landing.tier == Tier::GPU);
+  CHECK(receiver->stats().gpu_held > 0);
+  // The downgrade executor spills it before its receiver takes it: the GPU budget is free again.
+  move_to(env().exchange->peek_batch(token), env().host);
+  CHECK(receiver->stats().gpu_held == 0);
+  auto received = env().exchange->take_batch(token);
+  CHECK(receiver->stats().gpu_held == 0);  // given back once
+  CHECK(digest(*received) == expected);
+}
+
+TEST_CASE("a throw in seal() gives back the landing's charge", "[exchange_ring][ends]")
+{
+  auto sender   = make_ring();
+  auto receiver = make_ring();
+  // adopt() refuses a batch once the exchange is closed.
+  auto closed = std::make_shared<direct_exchange>(*env().gpu);
+  receiver->attach(closed, {env().host, env().disk, 256 * MiB, 256 * MiB});
+  closed->close();
+  auto const job = sender->export_batch(gpu_batch(sample_table()));
+  REQUIRE(job.has_value());
+  CHECK_THROWS_AS(ship(*sender, *receiver, *job), sirius::invalid_input_exception);
+  CHECK(receiver->stats().gpu_held == 0);
+}
+
 TEST_CASE("I5: no room in any tier is the one failure, with every tier's numbers",
           "[exchange_ring][ends]")
 {
