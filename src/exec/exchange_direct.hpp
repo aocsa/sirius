@@ -26,6 +26,8 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -109,6 +111,10 @@ struct direct_export {
 [[nodiscard]] direct_export describe_table(cudf::table_view const& table,
                                            rmm::cuda_stream_view stream);
 
+/// Who brought a spilled exchange batch back to the GPU (direct_exchange::bring_to_gpu).
+enum class bring_caller : std::size_t { export_direct, key_stats, copy_column, export_ring };
+inline constexpr std::size_t bring_callers = 4;
+
 /**
  * @brief Batches sent and received by direct exchange, held by token until the transfer ends.
  *
@@ -183,7 +189,10 @@ class direct_exchange {
   /// runs on the exchange's stream, which then frees the batch's buffers, so the batch must not
   /// outlive the exchange; a fragment's batches do not outlive its Context.
   /// @throws rmm::out_of_memory when it cannot be reserved, even after making room.
-  void bring_to_gpu(cucascade::data_batch& batch);
+  void bring_to_gpu(cucascade::data_batch& batch, bring_caller caller);
+
+  /// Batches bring_to_gpu() moved back to the GPU, by caller.
+  [[nodiscard]] std::array<std::uint64_t, bring_callers> brought_to_gpu() const noexcept;
 
   /// Non-null rows, distinct keys, minimum and maximum of one integer column. `distinct` is
   /// counted per batch and summed: exact for one batch, at least the true count across batches.
@@ -235,6 +244,8 @@ class direct_exchange {
   [[nodiscard]] memory::slab_region const& slab() const;
   /// Runs and forgets @p token's on_gone, if any; call without the lock.
   void gone(std::uint64_t token);
+
+  std::array<std::atomic<std::uint64_t>, bring_callers> _brought{};
 
   cucascade::memory::memory_space& _gpu;
   std::optional<memory::slab_region> _region;

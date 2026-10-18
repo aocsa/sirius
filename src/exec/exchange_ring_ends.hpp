@@ -184,9 +184,12 @@ class ring_exchange {
     std::uint64_t sent_bytes[4]{};      ///< stream bytes, by batch_kind
     std::uint64_t landed_batches[3]{};  ///< by tier: GPU, host, disk
     std::uint64_t landed_bytes[3]{};
-    std::uint64_t refused{0};    ///< ring_no_room
-    std::uint64_t gpu_held{0};   ///< landed on GPU, not yet taken
-    std::uint64_t host_held{0};  ///< landed on host, not yet taken
+    std::uint64_t refused{0};           ///< ring_no_room
+    std::uint64_t gpu_held{0};          ///< landed on GPU, not yet taken
+    std::uint64_t host_held{0};         ///< landed on host, not yet taken
+    std::uint64_t live_jobs[4]{};       ///< exported and not yet released, by batch_kind
+    std::uint64_t live_job_bytes[4]{};  ///< their stream bytes, by batch_kind
+    std::uint64_t brought_to_gpu[4]{};  ///< direct_exchange::bring_to_gpu, by bring_caller
   };
   [[nodiscard]] counters stats() const;
   /// stats() as one log line.

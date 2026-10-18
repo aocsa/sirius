@@ -211,7 +211,7 @@ table_digest digest(cudf::table_view const& view)
 /// The digest of @p batch, brought back to the GPU first.
 table_digest digest(cucascade::data_batch& batch)
 {
-  env().exchange->bring_to_gpu(batch);
+  env().exchange->bring_to_gpu(batch, sirius::exec::bring_caller::export_ring);
   auto ro = batch.to_read_only();
   if (cudaEvent_t writer = ro.get_writer_event()) { cudaEventSynchronize(writer); }
   return digest(ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());

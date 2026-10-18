@@ -515,7 +515,7 @@ std::optional<ring_exchange::send_job> ring_exchange::export_batch(
   }
   if (!described_host) {
     // Anything else travels from the GPU: bring it back first (it may wait for memory).
-    exchange->bring_to_gpu(*batch);
+    exchange->bring_to_gpu(*batch, bring_caller::export_ring);
     auto const ro = batch->to_read_only();
     hold();
     if (ro.get_current_tier() != Tier::GPU) {
@@ -1117,6 +1117,15 @@ ring_exchange::counters ring_exchange::stats() const
   auto out      = _counters;
   out.gpu_held  = _held->gpu.load();
   out.host_held = _held->host.load();
+  for (auto const& [token, j] : _jobs) {
+    auto const kind = static_cast<std::size_t>(j->kind);
+    ++out.live_jobs[kind];
+    out.live_job_bytes[kind] += j->stream_bytes;
+  }
+  if (_exchange) {
+    auto const brought = _exchange->brought_to_gpu();
+    std::copy(brought.begin(), brought.end(), out.brought_to_gpu);
+  }
   return out;
 }
 
@@ -1126,7 +1135,9 @@ std::string ring_exchange::stats_line() const
   return std::format(
     "sent gpu_columns {} ({}), host_columns {} ({}), compressed {} ({}); landed gpu {} ({}), "
     "host {} ({}), disk {} ({}); refused {}; held gpu {}, host {}; send ring peak {}/{}, receive "
-    "ring peak {}/{} frames; spills: {}",
+    "ring peak {}/{} frames; live jobs gpu_columns {} ({}), host_columns {} ({}), compressed {} "
+    "({}); brought to gpu: export_direct {}, key_stats {}, copy_column {}, export_ring {}; spills: "
+    "{}",
     c.sent_batches[1],
     bytes_text(c.sent_bytes[1]),
     c.sent_batches[2],
@@ -1146,6 +1157,16 @@ std::string ring_exchange::stats_line() const
     _send.frames(),
     _recv.peak_leased(),
     _recv.frames(),
+    c.live_jobs[1],
+    bytes_text(c.live_job_bytes[1]),
+    c.live_jobs[2],
+    bytes_text(c.live_job_bytes[2]),
+    c.live_jobs[3],
+    bytes_text(c.live_job_bytes[3]),
+    c.brought_to_gpu[0],
+    c.brought_to_gpu[1],
+    c.brought_to_gpu[2],
+    c.brought_to_gpu[3],
     compression::spill_stats_line());
 }
 
