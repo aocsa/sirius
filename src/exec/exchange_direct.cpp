@@ -270,7 +270,7 @@ direct_exchange::direct_exchange(cucascade::memory::memory_space& gpu,
 std::optional<direct_exchange::exported> direct_exchange::export_batch(
   std::shared_ptr<cucascade::data_batch> batch)
 {
-  bring_to_gpu(*batch);
+  bring_to_gpu(*batch, bring_caller::export_direct);
   std::lock_guard const lock{_mutex};
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   require_open();
@@ -588,7 +588,7 @@ std::int64_t integer_value(cudf::scalar const& value, rmm::cuda_stream_view stre
 
 void direct_exchange::add_key_stats(cucascade::data_batch& batch, int column, key_stats& stats)
 {
-  bring_to_gpu(batch);
+  bring_to_gpu(batch, bring_caller::key_stats);
   // The reduction and the sync that reads its result run on the exchange's stream, under the lock
   // that serializes its use.
   std::lock_guard const lock{_mutex};
@@ -628,7 +628,7 @@ void direct_exchange::add_key_stats(cucascade::data_batch& batch, int column, ke
 std::shared_ptr<cucascade::data_batch> direct_exchange::copy_column(cucascade::data_batch& batch,
                                                                     int column)
 {
-  bring_to_gpu(batch);
+  bring_to_gpu(batch, bring_caller::copy_column);
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
   rmm::cuda_stream_view const stream{_gpu.acquire_stream()};
   std::unique_ptr<cudf::table> copy;
@@ -675,7 +675,7 @@ std::unique_ptr<cucascade::memory::reservation> direct_exchange::reserve(std::si
   return _gpu.make_reservation_or_null(bytes);
 }
 
-void direct_exchange::bring_to_gpu(cucascade::data_batch& batch)
+void direct_exchange::bring_to_gpu(cucascade::data_batch& batch, bring_caller caller)
 {
   std::size_t bytes = 0;
   {
@@ -708,6 +708,16 @@ void direct_exchange::bring_to_gpu(cucascade::data_batch& batch)
   absl::Cleanup detach = [&] { tracker->reset_stream_reservation(stream); };
   mutable_batch.convert_to<cucascade::gpu_table_representation>(
     sirius::converter_registry::get(), &_gpu, stream);
+  _brought[static_cast<std::size_t>(caller)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, bring_callers> direct_exchange::brought_to_gpu() const noexcept
+{
+  std::array<std::uint64_t, bring_callers> out{};
+  for (std::size_t i = 0; i < bring_callers; ++i) {
+    out[i] = _brought[i].load(std::memory_order_relaxed);
+  }
+  return out;
 }
 
 void direct_exchange::require_open() const
