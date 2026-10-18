@@ -31,7 +31,8 @@ const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PR
 /// - `SIRIUS_CN_RING_FRAME_BYTES`: frame size, 64 MiB;
 /// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes, 1 GiB / 1.5 GiB;
 /// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.1;
-/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold, 48 GiB.
+/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold, 48 GiB;
+/// - `SIRIUS_CN_RING_DISK_WRITERS`: threads writing batches that land on disk, 1.
 ///
 /// Sizes take a `KiB`, `MiB` or `GiB` suffix.
 pub fn ring_options_from_env() -> Result<Option<sirius::RingOptions>, String> {
@@ -68,6 +69,17 @@ pub fn ring_options_from_env() -> Result<Option<sirius::RingOptions>, String> {
         recv_bytes: bytes("SIRIUS_CN_RING_RECV_BYTES", 3 << 29)?,
         gpu_landing_fraction: fraction,
         host_landing_bytes: bytes("SIRIUS_CN_RING_HOST_LANDING_BYTES", 48 << 30)?,
+        disk_writers: match env("SIRIUS_CN_RING_DISK_WRITERS") {
+            None => 1,
+            Some(value) => value
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|&n| (1..=64).contains(&n))
+                .ok_or_else(|| {
+                    format!("SIRIUS_CN_RING_DISK_WRITERS must be in [1, 64], not '{value}'")
+                })?,
+        },
     }))
 }
 
