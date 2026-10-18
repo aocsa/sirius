@@ -224,6 +224,7 @@ struct ring_exchange::held {
     }
   };
   std::mutex mutex;
+  /// Charges return_moved() watches: every sealed landing's, with options::return_spilled.
   std::vector<charge> charges;
 
   /// Gives back the charge of every sealed landing a spill moved off its tier, without waiting
@@ -345,6 +346,7 @@ ring_exchange::ring_exchange(int device, options const& opts)
     _send_stream{stream_on(device)},
     _recv_stream{stream_on(device)},
     _held{std::make_shared<held>()},
+    _return_spilled{opts.return_spilled},
     _read_stream{stream_on(device)}
 {
   auto const writers = std::max<std::size_t>(opts.disk_writers, 1);
@@ -1107,7 +1109,7 @@ std::uint64_t ring_exchange::seal(std::uint64_t id)
   }
   auto const token = exchange->adopt(std::move(batch), std::move(on_gone));
   std::move(give_back).Cancel();
-  if (charge.bytes > 0) {
+  if (charge.bytes > 0 && _return_spilled) {
     std::lock_guard lock{_held->mutex};
     _held->charges.push_back(std::move(charge));
   }

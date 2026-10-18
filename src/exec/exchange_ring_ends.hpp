@@ -85,6 +85,10 @@ class ring_exchange {
     /// serializes its callers; more each copy a frame to a pinned bounce of their own and write
     /// it from host, so landings' writes overlap.
     std::size_t disk_writers = 1;
+    /// Give a landing's charge to the GPU or host budget back once a spill moves it off that
+    /// tier, not only when its receiver takes it. The freed budget lands more batches on the
+    /// GPU, which spill in turn: at SF10000 q09 that churn cost more than it saved.
+    bool return_spilled = false;
   };
 
   /// Allocates both rings on @p device. Call before the engine's pool is built, so the rings are
@@ -221,6 +225,7 @@ class ring_exchange {
   bool _closed{false};
   /// Bytes landed per tier and not yet taken; shared with the direct exchange's on_gone callbacks.
   std::shared_ptr<held> _held;
+  bool _return_spilled;
 
   mutable std::mutex _mutex;
   std::uint64_t _next{1};
