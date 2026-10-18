@@ -111,6 +111,8 @@ struct ring_env {
 ring_env& env()
 {
   static ring_env e;
+  // Another suite in this process may have shut the global registry down since.
+  sirius::converter_registry::initialize();
   return e;
 }
 
