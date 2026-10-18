@@ -140,7 +140,10 @@ class direct_exchange {
                   std::optional<memory::slab_region> region = std::nullopt);
 
   /// Frees at least `bytes` of GPU memory if it can, e.g. by spilling to host; blocks until done.
-  using make_room_fn = std::function<void(std::size_t bytes)>;
+  /// Returns a reservation of `bytes` it made as soon as there was room, so that no other reserver
+  /// takes the freed bytes first, or null to have the caller try once more itself.
+  using make_room_fn =
+    std::function<std::unique_ptr<cucascade::memory::reservation>(std::size_t bytes)>;
 
   /// Lets received batches spill: sealed batches are visible to @p staging, and allocate() and
   /// export_batch() call @p make_room once before giving up on GPU memory, again if it throws
