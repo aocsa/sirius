@@ -641,6 +641,27 @@ TEST_CASE("direct_exchange keeps the room it made when another reserver comes fi
   exchange.release(token);
 }
 
+TEST_CASE("exchange_staging lists a spill-first repository last", "[exchange_direct]")
+{
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  memory_space gpu(slab_config());
+  auto const table   = sample_table(gpu.get_default_allocator());
+  auto const landed  = std::make_shared<cucascade::shared_data_repository>();
+  auto const running = std::make_shared<cucascade::shared_data_repository>();
+  auto const first   = batch_of(gpu, table->view(), table);
+  auto const second  = batch_of(gpu, table->view(), table);
+  landed->add_data_batch(first);
+  running->add_data_batch(second);
+  // Tracked first, listed last: the downgrade sweep walks back to front.
+  staging.track(landed, /*spill_first=*/true);
+  staging.track(running);
+  auto const ids =
+    registry.get(exchange_staging::query_id)->get_repositories().front()->get_batch_ids();
+  CHECK(ids == std::vector<std::uint64_t>{second->get_batch_id(), first->get_batch_id()});
+  CHECK(staging.tracked() == 2);
+}
+
 TEST_CASE("exchange_staging opens its query so the downgrade executor can borrow it",
           "[exchange_direct]")
 {
