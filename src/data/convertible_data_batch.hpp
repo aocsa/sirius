@@ -23,6 +23,8 @@
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 
+#include <rmm/error.hpp>
+
 #include <cuda/stream>
 
 #include <cucascade/cuda/event.hpp>
@@ -41,6 +43,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace sirius {
@@ -213,18 +216,34 @@ class convertible_data_batch : public convertible_data {
                                    cucascade::memory::reservation& reservation,
                                    ::cuda::stream_ref stream)
   {
+    using compression::spill_outcome;
     auto* data = mut.get_data();
-    if (dynamic_cast<cucascade::gpu_table_representation*>(data) == nullptr ||
-        !compression::spill_compression_applies(data->get_size_in_bytes())) {
+    if (dynamic_cast<cucascade::gpu_table_representation*>(data) == nullptr) { return false; }
+    auto const bytes = data->get_size_in_bytes();
+    if (!compression::spill_compression_applies(bytes)) {
+      if (compression::get_spill_compression_settings().enabled) {
+        compression::record_spill(spill_outcome::small, bytes, bytes);
+      }
       return false;
     }
     try {
       mut.convert_to<Compressed>(sirius::converter_registry::get(), reservation, stream);
+      compression::record_spill(
+        spill_outcome::compressed, bytes, mut.get_data()->get_size_in_bytes());
       return true;
     } catch (compression::spill_compression_declined const& e) {
       SIRIUS_LOG_DEBUG("[spill_compression] spilling uncompressed: {}", e.what());
+      auto const why = std::string_view{e.what()}.starts_with("no GPU headroom")
+                         ? spill_outcome::no_headroom
+                         : spill_outcome::incompressible;
+      compression::record_spill(why, bytes, bytes);
+    } catch (rmm::out_of_memory const& e) {
+      SIRIUS_LOG_DEBUG("[spill_compression] encode ran out of memory, spilling uncompressed: {}",
+                       e.what());
+      compression::record_spill(spill_outcome::encode_oom, bytes, bytes);
     } catch (std::exception const& e) {
       SIRIUS_LOG_DEBUG("[spill_compression] encode failed, spilling uncompressed: {}", e.what());
+      compression::record_spill(spill_outcome::failed, bytes, bytes);
     }
     return false;
   }

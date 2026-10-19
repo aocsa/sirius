@@ -384,3 +384,62 @@ TEST_CASE("spill compression: batches spill uncompressed when it does not apply"
     CHECK(digest(*batch) == expected);
   }
 }
+
+TEST_CASE("spill compression: each spilled batch is counted by its outcome", "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  using sirius::compression::spill_counter;
+  using sirius::compression::spill_outcome;
+
+  SECTION("compressed: its GPU bytes and its stored bytes")
+  {
+    scoped_settings settings(enabled_settings());
+    auto batch                     = gpu_batch(compressible_table());
+    std::size_t const device_bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+    auto const before              = spill_counter(spill_outcome::compressed);
+    move_to(batch, env().host);
+    auto const stored = batch->to_read_only().get_data()->get_size_in_bytes();
+    auto const after  = spill_counter(spill_outcome::compressed);
+    CHECK(after.batches == before.batches + 1);
+    CHECK(after.bytes == before.bytes + device_bytes);
+    CHECK(after.stored == before.stored + stored);
+    CHECK(stored < device_bytes);
+  }
+  SECTION("small: below min_batch_bytes, stored as is")
+  {
+    auto s            = enabled_settings();
+    s.min_batch_bytes = 1ull << 40;
+    scoped_settings settings(s);
+    auto batch                     = gpu_batch(compressible_table());
+    std::size_t const device_bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+    auto const before              = spill_counter(spill_outcome::small);
+    move_to(batch, env().host);
+    auto const after = spill_counter(spill_outcome::small);
+    CHECK(after.batches == before.batches + 1);
+    CHECK(after.bytes == before.bytes + device_bytes);
+    CHECK(after.stored == before.stored + device_bytes);
+  }
+  SECTION("incompressible: no column compresses")
+  {
+    scoped_settings settings(enabled_settings());
+    std::vector<std::string> unique(1 << 16);
+    for (std::size_t i = 0; i < unique.size(); ++i) {
+      unique[i] = "value_" + std::to_string(i);
+    }
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(utils::make_string_column(
+      unique, utils::default_stream(), utils::get_resource_ref(*env().gpu)));
+    auto batch        = gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+    auto const before = spill_counter(spill_outcome::incompressible);
+    move_to(batch, env().host);
+    CHECK(spill_counter(spill_outcome::incompressible).batches == before.batches + 1);
+  }
+  SECTION("disabled: nothing is counted")
+  {
+    scoped_settings settings(spill_compression_settings{});
+    auto const before = sirius::compression::spill_stats_line();
+    auto batch        = gpu_batch(compressible_table());
+    move_to(batch, env().host);
+    CHECK(sirius::compression::spill_stats_line() == before);
+  }
+}
