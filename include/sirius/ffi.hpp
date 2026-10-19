@@ -38,9 +38,17 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
+namespace sirius::exec {
+class batch_stream;
+class direct_exchange;
+}  // namespace sirius::exec
+
 namespace sirius::ffi {
 
+class DirectExchange;
 class Fragment;
+class OutputDrain;
+class Interrupter;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -72,12 +80,128 @@ class SIRIUS_FFI_EXPORT Context {
   /// released; its last release can tear down the engine on the releasing thread.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
+  /// A handle to this Context's direct exchange, or null unless the Context has one GPU memory
+  /// space and it uses `allocator: slab`.
+  [[nodiscard]] std::unique_ptr<DirectExchange> direct_exchange() const;
+
+  /// Cancels the Fragment::run() or execute_substrait() in progress on this Context. Safe to
+  /// call from any thread while the run executes on another; it never waits for the run. The
+  /// run stops within one GPU task, including one retrying out-of-memory, and throws DuckDB's
+  /// interrupt error ("Interrupted!"); the query releases what it holds as on any failure, and
+  /// the Context stays usable. With no run in progress it does nothing: an interrupt never
+  /// carries over to a later run.
+  void interrupt() noexcept;
+
+  /// A handle that calls interrupt() from threads that cannot share the Context itself. It may
+  /// outlive the Context, after which it does nothing.
+  [[nodiscard]] std::unique_ptr<Interrupter> interrupter() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
   friend class Fragment;
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+};
+
+/// Receives batches straight into its Context's GPU slab. A sender exports a batch with
+/// Fragment::export_direct; the receiver allocates matching buffers here, the transport writes
+/// the sender's buffers into them, and the receiver hands them to Fragment::push_received.
+///
+/// Callable from any thread. After its Context is destroyed every call but the region
+/// accessors throws.
+class SIRIUS_FFI_EXPORT DirectExchange {
+ public:
+  /// The CUDA device and address range of the slab every buffer lies in.
+  [[nodiscard]] int device() const noexcept;
+  [[nodiscard]] std::uintptr_t region_base() const noexcept;
+  [[nodiscard]] std::uint64_t region_len() const noexcept;
+
+  /// Allocate buffers for the `layout_len`-byte layout at `layout_addr` that export_direct
+  /// returned on the sender, without waiting for memory, and set `token` to them.
+  /// @return [address, length] per buffer, pairing with the sender's `src`.
+  /// @throws on a malformed layout or when the memory cannot be reserved now.
+  std::unique_ptr<std::vector<std::uint64_t>> allocate(std::uintptr_t layout_addr,
+                                                       std::size_t layout_len,
+                                                       std::uint64_t& token) const;
+
+  /// Free what `token` holds: a sent batch once its buffers were written, or received buffers
+  /// that will not be pushed. Unknown and consumed tokens are ignored.
+  void release(std::uint64_t token) const;
+
+  /// Hold a fully received batch so that it may spill to host while it waits for its receiver.
+  /// A sealed token is still pushed with Fragment::push_received and freed with release().
+  void seal(std::uint64_t token) const;
+
+  /// Tokens neither released nor consumed.
+  [[nodiscard]] std::size_t outstanding() const;
+
+  /// Adds the non-null rows, minimum and maximum of signed integer column `column` of the sealed
+  /// batch under `token` to `rows`, `min` and `max`, leaving the batch for its receiver. A spilled
+  /// batch comes back to the GPU first.
+  /// @throws on a token that holds no sealed batch, or a column out of range or not an integer.
+  void key_stats(std::uint64_t token,
+                 std::uint32_t column,
+                 std::uint64_t& rows,
+                 std::int64_t& min,
+                 std::int64_t& max) const;
+
+ private:
+  explicit DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange);
+
+  std::shared_ptr<sirius::exec::direct_exchange> exchange_;
+
+  friend class Context;
+};
+
+/// Exports one output stream of a fragment for direct exchange while the fragment is still
+/// running, so its batches ship as the sink produces them instead of after run() returns. Created
+/// by Fragment::output_drain().
+///
+/// Callable from any thread, without the Context's connection: it shares only the stream and the
+/// DirectExchange. One consumer per stream; do not mix with export_direct() or relay_from() on
+/// the same stream. Destroy it before its Context.
+class SIRIUS_FFI_EXPORT OutputDrain {
+ public:
+  OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+              std::shared_ptr<sirius::exec::direct_exchange> exchange);
+
+  /// Export the next batch with rows, waiting up to `timeout_ms` for the sink to produce one.
+  /// On a batch, sets `token` (release on the DirectExchange once its buffers were written),
+  /// `rows` and `src` ([address, length] per buffer) and returns the layout. Otherwise returns
+  /// null, with `ended` true at the end of the stream and false when nothing arrived in time.
+  /// @throws the fragment's error once its run() failed, or on a batch it cannot send.
+  std::unique_ptr<std::vector<std::uint8_t>> export_next(std::uint32_t timeout_ms,
+                                                         bool& ended,
+                                                         std::uint64_t& token,
+                                                         std::uint64_t& rows,
+                                                         std::vector<std::uint64_t>& src) const;
+
+ private:
+  std::shared_ptr<sirius::exec::batch_stream> stream_;
+  std::shared_ptr<sirius::exec::direct_exchange> exchange_;
+};
+
+/// Interrupts the [`Context`] it came from (see Context::interrupt()). Every method is safe to
+/// call from any thread, concurrently with the Context's own calls.
+class SIRIUS_FFI_EXPORT Interrupter {
+ public:
+  ~Interrupter();
+
+  Interrupter(const Interrupter&)            = delete;
+  Interrupter& operator=(const Interrupter&) = delete;
+
+  /// Same as Context::interrupt(); does nothing once the Context is destroyed.
+  void interrupt() const noexcept;
+
+  /// Shared with the Context; defined in the implementation.
+  struct Gate;
+
+ private:
+  explicit Interrupter(std::shared_ptr<Gate> gate);
+  std::shared_ptr<Gate> gate_;
+
+  friend class Context;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -92,7 +216,8 @@ class SIRIUS_FFI_EXPORT Context {
 /// Any number of fragments may be built before any runs; run them in any order where each
 /// source runs before its receiver's relay_from. build(), run() and Context::execute_substrait
 /// execute one at a time per Context: a concurrent call waits for the one in progress. run() and
-/// destruction may happen on a thread other than build()'s.
+/// destruction may happen on a thread other than build()'s. Context::interrupt() cancels a run
+/// from another thread.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -159,6 +284,61 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
+  /// Export the next batch parked on output stream `stream_id` for direct exchange, skipping
+  /// batches without rows. Sets `token`, to release on this Context's DirectExchange once the
+  /// batch's buffers were written, `rows`, and `src`, the [address, length] of each buffer.
+  /// @return the layout to pass to the receiver's DirectExchange::allocate, or null once the
+  /// stream is drained.
+  /// @throws before run(), on an unknown stream, without a DirectExchange, or on a batch it
+  /// cannot send (spilled, or a column neither fixed-width nor string). A throw after the batch
+  /// was pulled drops it, and a later call exports the next one, so the caller must fail the
+  /// query rather than retry.
+  std::unique_ptr<std::vector<std::uint8_t>> export_direct(std::uint64_t stream_id,
+                                                           std::uint64_t& token,
+                                                           std::uint64_t& rows,
+                                                           std::vector<std::uint64_t>& src);
+
+  /// A handle that exports output stream `stream_id` from any thread, including while run()
+  /// executes. Take it after build() and before run() to ship output as it is produced. A
+  /// fragment destroyed without running fails its drains.
+  /// @throws before build(), on an unknown stream or a result fragment, or without a
+  /// DirectExchange.
+  [[nodiscard]] std::unique_ptr<OutputDrain> output_drain(std::uint64_t stream_id) const;
+
+  /// Adds the non-null rows, minimum and maximum of signed integer column `column` of every batch
+  /// parked on output `stream_id` to `rows`, `min` and `max`, without draining it.
+  /// @throws before build(), on an unknown stream, without a DirectExchange, or on a column out of
+  /// range or not an integer.
+  void output_key_stats(std::uint64_t stream_id,
+                        std::uint32_t column,
+                        std::uint64_t& rows,
+                        std::int64_t& min,
+                        std::int64_t& max) const;
+
+  /// Push a copy of column `column` of every batch parked on `source`'s output `source_stream_id`
+  /// into input stream `input_stream_id`, leaving the source as it was. Does not close a sender.
+  /// @return the number of batches copied.
+  /// @throws as push_received() does, and on a column out of range.
+  std::size_t copy_output_column(Fragment& source,
+                                 std::uint64_t source_stream_id,
+                                 std::uint64_t input_stream_id,
+                                 std::uint32_t column);
+
+  /// Push a copy of column `column` of the sealed batch under `token` into input stream
+  /// `input_stream_id`. The token is not consumed.
+  /// @throws as push_received() does, and on a column out of range.
+  void copy_received_column(std::uint64_t input_stream_id,
+                            std::uint64_t token,
+                            std::uint32_t column);
+
+  /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
+  /// unless it throws before reading it: before build(), without a DirectExchange, after run()
+  /// started, or on an undeclared input.
+  /// @throws also on a token that holds no received batch, on a schema mismatch (checked while
+  /// the batch is on the GPU; a sealed batch that spilled to host is not), or when the input
+  /// already ended.
+  void push_received(std::uint64_t stream_id, std::uint64_t token);
+
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
   /// (relay_from closes its own sender). Idempotent per sender.
   /// @throws before build() or on unknown stream/sender.
@@ -168,7 +348,7 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// (relay_from and close_input close their sender). Runs once; after a failure, build a new
   /// fragment.
   /// @throws before build(), while an input is open (the fragment stays runnable), on a second
-  /// call, or on execution failure.
+  /// call, or on execution failure, including Context::interrupt().
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at
