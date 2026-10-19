@@ -437,7 +437,10 @@ TEST_CASE("other wrappers hide opaque leaves from the fallback classifier",
 {
   SECTION("a global aggregate over a CTE_REF")
   {
-    REQUIRE_FALSE(build_relation_is_opaque(*make_aggregate_over(make_cte_ref())));
+    auto aggregate = make_aggregate_over(make_cte_ref());
+    aggregate->expressions.push_back(
+      duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)));
+    REQUIRE_FALSE(build_relation_is_opaque(*aggregate));
   }
 
   SECTION("a join over a CTE_REF")
