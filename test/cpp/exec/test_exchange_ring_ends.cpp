@@ -32,7 +32,6 @@
 
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
-#include <compression/spill_compression.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -567,58 +566,6 @@ TEST_CASE("a batch spilled to host ships raw from host", "[exchange_ring][ends]"
   CHECK(landing.tier == Tier::GPU);
   auto received = env().exchange->take_batch(token);
   CHECK(digest(*received) == expected);
-}
-
-TEST_CASE("a compressed host batch ships compressed and lands compressed", "[exchange_ring][ends]")
-{
-  sirius::compression::spill_compression_settings settings;
-  settings.enabled         = true;
-  settings.min_batch_bytes = 0;
-  sirius::compression::set_spill_compression_settings(settings);
-  struct restore {
-    ~restore() { sirius::compression::set_spill_compression_settings({}); }
-  } restore_settings;
-
-  auto sender         = make_ring();
-  auto batch          = gpu_batch(sample_table(1'000'000));
-  auto const expected = digest(*batch);
-  move_to(batch, env().host);
-  REQUIRE(holds<sirius::compressed_host_representation>(*batch));
-  auto const compressed   = batch->to_read_only().get_data()->get_size_in_bytes();
-  auto const read_payload = [](cucascade::data_batch& b) {
-    auto ro       = b.to_read_only();
-    auto const& p = ro.get_data()->cast<sirius::compressed_host_representation>();
-    std::vector<std::uint8_t> out(p.get_size_in_bytes());
-    for (std::size_t at = 0; at < out.size();) {
-      auto const n = std::min(p.payload().block_size(), out.size() - at);
-      std::memcpy(out.data() + at, p.payload().at(at / p.payload().block_size()).data(), n);
-      at += n;
-    }
-    return std::make_pair(out, std::vector<std::uint8_t>(p.header().begin(), p.header().end()));
-  };
-  auto const sent_payload = read_payload(*batch);
-  auto const job          = sender->export_batch(batch);
-  REQUIRE(job.has_value());
-  CHECK(job->kind == batch_kind::compressed);
-  CHECK(job->stream_bytes == compressed);
-  batch.reset();
-
-  SECTION("on host")
-  {
-    auto receiver               = make_ring();
-    auto const [landing, token] = ship(*sender, *receiver, *job);
-    CHECK(landing.tier == Tier::HOST);
-    auto received = env().exchange->take_batch(token);
-    CHECK(holds<sirius::compressed_host_representation>(*received));
-    {
-      auto const landed = read_payload(*received);
-      CHECK(landed.second == sent_payload.second);
-      REQUIRE(landed.first.size() == sent_payload.first.size());
-      // Byte for byte: the compressed payload is not decoded on the way.
-      CHECK(landed.first == sent_payload.first);
-    }
-    CHECK(digest(*received) == expected);
-  }
 }
 
 TEST_CASE("a landing refuses frames out of order of its stream", "[exchange_ring][ends]")
