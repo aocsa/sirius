@@ -890,6 +890,90 @@ bool output_is_reproducible(exists_match const& match, duckdb::LogicalOperator c
   return true;
 }
 
+/// DuckDB v2 decorrelates `EXISTS` / `NOT EXISTS` into a MARK delim join under a filter on its
+/// mark column, where 1.5 produced a SEMI / ANTI delim join. match_exists only accepts delim
+/// conditions that are null-safe (`IS NOT DISTINCT FROM`), under which the mark is never NULL, so
+/// the pair is exactly that SEMI / ANTI join. Replaces the filter in @p slot by the converted join
+/// when match_exists accepts it; otherwise leaves both untouched.
+bool absorb_mark_filter(duckdb::unique_ptr<duckdb::LogicalOperator>& slot)
+{
+  using duckdb::ExpressionClass;
+  using duckdb::ExpressionType;
+  using duckdb::JoinType;
+
+  if (slot->type != LogicalOperatorType::LOGICAL_FILTER || slot->children.size() != 1) {
+    return false;
+  }
+  auto& filter = slot->Cast<duckdb::LogicalFilter>();
+  if (filter.children[0]->type != LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+      filter.expressions.size() != 1 || filter.projection_map.empty()) {
+    return false;
+  }
+  auto& delim = filter.children[0]->Cast<duckdb::LogicalComparisonJoin>();
+  if (delim.join_type != JoinType::MARK || delim.delim_flipped || delim.children.size() != 2) {
+    return false;
+  }
+
+  // A MARK join emits the outer (left) columns, through its left projection map, then the mark.
+  auto const outer_width = delim.left_projection_map.empty() ? delim.children[0]->types.size()
+                                                             : delim.left_projection_map.size();
+  if (delim.types.size() != outer_width + 1) { return false; }
+  auto const is_mark = [&](duckdb::Expression const& expression) {
+    return expression.GetExpressionClass() == ExpressionClass::BOUND_REF &&
+           expression.Cast<duckdb::BoundReferenceExpression>().Index() == outer_width;
+  };
+  auto const& condition = *filter.expressions[0];
+  JoinType converted;
+  if (is_mark(condition)) {
+    converted = JoinType::SEMI;
+  } else if (condition.GetExpressionType() == ExpressionType::OPERATOR_NOT &&
+             condition.Cast<duckdb::BoundOperatorExpression>().GetChildren().size() == 1 &&
+             is_mark(*condition.Cast<duckdb::BoundOperatorExpression>().GetChildren()[0])) {
+    converted = JoinType::ANTI;
+  } else {
+    return false;
+  }
+
+  // The filter's projection map drops the mark; fold it into the join's left projection map.
+  duckdb::vector<duckdb::ProjectionIndex> left_map;
+  duckdb::vector<duckdb::LogicalType> types;
+  for (duckdb::idx_t const position : filter.projection_map) {
+    if (position >= outer_width) { return false; }
+    auto const column = delim.left_projection_map.empty()
+                          ? position
+                          : static_cast<duckdb::idx_t>(delim.left_projection_map[position]);
+    left_map.push_back(duckdb::ProjectionIndex(column));
+    types.push_back(delim.children[0]->types[column]);
+  }
+
+  auto const original_type  = delim.join_type;
+  auto original_map         = std::move(delim.left_projection_map);
+  auto original_types       = std::move(delim.types);
+  delim.join_type           = converted;
+  delim.left_projection_map = std::move(left_map);
+  delim.types               = std::move(types);
+  auto const match          = match_exists(delim);
+  if (!match || !output_is_reproducible(*match, delim)) {
+    delim.join_type           = original_type;
+    delim.left_projection_map = std::move(original_map);
+    delim.types               = std::move(original_types);
+    return false;
+  }
+  delim.SetEstimatedCardinality(filter.estimated_cardinality);
+  slot = std::move(filter.children[0]);
+  return true;
+}
+
+/// Convert every matching MARK delim join under its filter, innermost first, so that sibling
+/// subqueries nested through their outer rows form a chain match_chain can see.
+void absorb_mark_filters(duckdb::unique_ptr<duckdb::LogicalOperator>& slot)
+{
+  for (auto& child : slot->children) {
+    absorb_mark_filters(child);
+  }
+  absorb_mark_filter(slot);
+}
+
 void rewrite_tree(duckdb::ClientContext& context,
                   duckdb::unique_ptr<duckdb::LogicalOperator>& slot,
                   std::size_t& rewrites)
@@ -927,6 +1011,7 @@ std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
                                                  duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
   std::size_t rewrites = 0;
+  absorb_mark_filters(plan);
   rewrite_tree(context, plan, rewrites);
   if (rewrites > 0) {
     SIRIUS_LOG_INFO(

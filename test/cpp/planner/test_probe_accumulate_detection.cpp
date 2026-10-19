@@ -354,7 +354,9 @@ TEST_CASE_METHOD(
   set_flag(false);
   auto unrewritten = generate_sirius_plan(*con, delim_exists_query);
   CHECK(collect(unrewritten.get(), T::PROBE_ACCUMULATE_EMIT).empty());
-  CHECK_FALSE(collect(unrewritten.get(), T::RIGHT_DELIM_JOIN).empty());
+  // DuckDB's own decorrelation stays: a SEMI delim join (DuckDB 1.5) or a MARK one (v2).
+  CHECK((collect(unrewritten.get(), T::RIGHT_DELIM_JOIN).size() +
+         collect(unrewritten.get(), T::LEFT_DELIM_JOIN).size()) > 0);
 }
 
 TEST_CASE_METHOD(probe_accumulate_fixture,
