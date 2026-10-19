@@ -31,7 +31,6 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <compression/compressed_disk_representation.hpp>
 #include <compression/compressed_representation.hpp>
 #include <compression/spill_compression.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -618,15 +617,6 @@ TEST_CASE("a compressed host batch ships compressed and lands compressed", "[exc
       // Byte for byte: the compressed payload is not decoded on the way.
       CHECK(landed.first == sent_payload.first);
     }
-    CHECK(digest(*received) == expected);
-  }
-  SECTION("on disk")
-  {
-    auto receiver               = make_ring(0, 0);
-    auto const [landing, token] = ship(*sender, *receiver, *job);
-    CHECK(landing.tier == Tier::DISK);
-    auto received = env().exchange->take_batch(token);
-    CHECK(holds<sirius::compressed_disk_representation>(*received));
     CHECK(digest(*received) == expected);
   }
 }

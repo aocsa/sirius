@@ -16,7 +16,6 @@
 
 #include "exec/exchange_ring_ends.hpp"
 
-#include "compression/compressed_disk_representation.hpp"
 #include "compression/compressed_representation.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/exchange_direct.hpp"
@@ -1074,15 +1073,10 @@ std::uint64_t ring_exchange::seal(std::uint64_t id)
     default: {
       auto& disk = *_tiers.disk;
       if (wire.kind == batch_kind::compressed) {
-        batch =
-          cucascade::data_batch::make(batch_id,
-                                      std::make_unique<sirius::compressed_disk_representation>(
-                                        disk,
-                                        st->path,
-                                        st->file_bytes,
-                                        wire.uncompressed_bytes,
-                                        static_cast<std::int64_t>(wire.rows)),
-                                      std::move(probe));
+        // Landing a compressed batch on disk needs compressed_disk_representation, which spill
+        // compression (#2204) adds; this integration branch does not carry it.
+        throw sirius::invalid_input_exception(
+          "ring exchange: a compressed batch cannot land on disk without spill compression");
       } else {
         auto table = std::make_unique<cucascade::memory::disk_table_allocation>(
           st->path, st->disk_columns, st->file_bytes);
