@@ -906,6 +906,13 @@ TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][con
   REQUIRE(compression.spill_min_batch_bytes == 32ULL * 1024 * 1024);
   REQUIRE(compression.spill_encode_reserve_fraction == Approx(0.25));
 
+  // Without the key, batches of 4 MiB and up spill compressed; the engine's own default agrees.
+  sirius::sirius_config defaults;
+  REQUIRE_NOTHROW(defaults.load_from_file(data_dir / "valid_spill_compression_default_min.yaml"));
+  REQUIRE(defaults.get_compression_config().spill_min_batch_bytes == 4ULL * 1024 * 1024);
+  REQUIRE(sirius::compression::spill_compression_settings{}.min_batch_bytes ==
+          defaults.get_compression_config().spill_min_batch_bytes);
+
   for (auto const* fixture : {"invalid_spill_encode_reserve_fraction_above_one.yaml",
                               "invalid_spill_encode_reserve_fraction_negative.yaml",
                               "invalid_spill_encode_reserve_fraction_nan.yaml"}) {

@@ -48,7 +48,7 @@ struct spill_compression_settings {
   bool enabled{false};
   /// Batches smaller than this spill uncompressed: the encode's fixed costs are not
   /// worth paying for them (compression.spill_min_batch_bytes).
-  std::size_t min_batch_bytes{64ULL * 1024 * 1024};
+  std::size_t min_batch_bytes{4ULL * 1024 * 1024};
   /// Keep the compressed form only when header + payload is at most this fraction of
   /// the batch's device size (compression.max_compressed_fraction).
   double max_compressed_fraction{0.75};

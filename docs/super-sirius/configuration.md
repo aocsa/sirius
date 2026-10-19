@@ -205,7 +205,7 @@ uncompressed.
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
 | `enable_spill_compression` | `spill_compression` | bool | false | Compress spilled batches. The setting applies to the whole process. |
-| `spill_min_batch_bytes` | — | bytes | 64Mi | Spill batches smaller than this uncompressed. |
+| `spill_min_batch_bytes` | — | bytes | 4Mi | Spill batches smaller than this uncompressed. |
 | `spill_encode_reserve_fraction` | — | double in [0, 1] | 0.5 | Encode only when this fraction of the batch's size could be reserved in its GPU memory space; otherwise the batch spills uncompressed. `0` skips the check. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Shared with input-table compression: a spilled batch stays compressed only at or below this fraction of its device size. |
 

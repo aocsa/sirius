@@ -310,8 +310,9 @@ struct compression_config {
   /// max_compressed_fraction) or fails to encode spills uncompressed.
   bool enable_spill_compression{false};
 
-  /// Batches smaller than this spill uncompressed.
-  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+  /// Batches smaller than this spill uncompressed. 4 MiB: at SF10000 most spilled bytes are in
+  /// batches under 64 MiB, which a larger minimum leaves raw.
+  std::size_t spill_min_batch_bytes{4ULL * 1024 * 1024};  // 4 MiB
 
   /// Encode a spilled batch only when this fraction of its size could be reserved in
   /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
