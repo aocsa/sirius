@@ -19,7 +19,8 @@
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
 // that fails after setup, execute_substrait, a direct exchange round trip, and
-// pin_table/unpin_table. Spec errors and failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// pin_table/unpin_table. Spec errors and failed-build rollback live in test_streaming_fragment.cpp
+// and test_sirius_ffi_fragment.cpp.
 
 #include "exec/exchange_direct.hpp"
 #include "sirius/exception.hpp"
@@ -863,6 +864,7 @@ TEST_CASE("FFI interrupt() from another thread cancels a run, and the next run w
   ArrowArrayStream stream{};
   ctx->execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&stream));
   REQUIRE(collect_i64_column(stream) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}
 
 TEST_CASE("FFI pin_table serves scans of the pinned files, and unpin_table releases the pin",
           "[isolated_context][sirius_ffi]")
