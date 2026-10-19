@@ -227,6 +227,10 @@ impl NixlEndpoint for NixlTransport {
         )
     }
 
+    fn control(&self, peer: SocketAddr, envelope: &NixlEnvelope) -> Result<Vec<u8>, String> {
+        call(peer, control_params(), envelope)
+    }
+
     fn fail(&self, peer: SocketAddr, slot: SenderSlot, error: &str) {
         send_failed(vec![(peer, slot)], error);
     }
