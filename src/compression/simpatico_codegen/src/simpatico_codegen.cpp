@@ -18,6 +18,7 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime.h>
 
@@ -182,7 +183,13 @@ struct leased_pool {
     pool.streams =
       global_stream_cache().checkout(device, static_cast<size_t>(std::max(1, column_threads)));
 
-    if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
+    if (pool.streams.empty()) {
+      // Stream creation failed under resource pressure, not a plan problem: report
+      // it as an OOM so a caller that retries on OOM does.
+      (void)cudaGetLastError();
+      throw rmm::out_of_memory("failed to lease internal streams on device " +
+                               std::to_string(device));
+    }
   }
 
   ~leased_pool()
@@ -456,6 +463,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     auto const& col = table.columns[idx];
     if (!col.plan_tree || col.num_rows != num_rows)
       return refuse("selected column missing plan_tree or row-count mismatch");
+    // A compacted decode returns the surviving rows while the stored bitmask
+    // still spans the whole chunk, and nothing on this path compacts one against
+    // the other. Refused here, before any device work, rather than as a
+    // per-column failure that unwinds the whole batch mid-flight.
+    if (!col.plan_tree->validity.empty()) return refuse("selected column is nullable");
   }
   for (auto const& f : request.filters) {
     if (f.column >= selected.size()) return refuse("filter directive column out of range");
