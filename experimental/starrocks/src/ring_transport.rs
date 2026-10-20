@@ -469,7 +469,7 @@ impl NixlEndpoint for RingTransport {
                 slot: hop.slot,
                 names: hop.names,
                 source: Source::Streamed(hop.drain),
-                deadline: self.deadline(None),
+                deadline: self.deadline(hop.deadline),
             })
             .collect();
         self.ship(hops)
@@ -477,6 +477,10 @@ impl NixlEndpoint for RingTransport {
 
     fn control(&self, peer: SocketAddr, envelope: &NixlEnvelope) -> Result<Vec<u8>, String> {
         self.shared.control.call(peer, control_params(), envelope)
+    }
+
+    fn fail(&self, peer: SocketAddr, slot: SenderSlot, error: &str) {
+        self.shared.control.fail(vec![(peer, slot)], error);
     }
 
     fn ring_open(&self, request: &PTransmitChunkParams, body: &[u8]) -> Result<Vec<u8>, String> {

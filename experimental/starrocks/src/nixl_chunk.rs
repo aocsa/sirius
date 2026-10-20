@@ -14,6 +14,7 @@
 //! | `ShareAbandoned` | `i64 instance hi, i64 instance lo, i32 filter id` | empty |
 //! | `RingOpen` | see [`crate::ring_wire::LaneOpen`] | see [`crate::ring_wire::LaneGrant`] |
 //! | `RingClose` | `u64 lane` | empty |
+//! | `Failed` | utf-8 error | empty |
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ const MD: u8 = 1;
 const PACKED: u8 = 3;
 const TOPOLOGY: u8 = 5;
 const SHARE_ABANDONED: u8 = 6;
+const FAILED: u8 = 7;
 const RING_OPEN: u8 = 8;
 const RING_CLOSE: u8 = 9;
 
@@ -56,6 +58,9 @@ pub enum NixlEnvelope {
         instance: FragmentInstanceId,
         filter_id: i32,
     },
+    /// The sender failed and will send nothing more, in place of EOS. Routed like a Packed
+    /// frame; the receiver fails its query with `error`.
+    Failed { error: String },
     /// Open a ring-exchange lane for the sender routed by the params: the body is a
     /// [`crate::ring_wire::LaneOpen`], the reply a [`crate::ring_wire::LaneGrant`].
     RingOpen(Vec<u8>),
@@ -107,6 +112,10 @@ impl NixlEnvelope {
                 out.extend_from_slice(&id.lo.to_le_bytes());
                 out.extend_from_slice(&filter_id.to_le_bytes());
             }
+            Self::Failed { error } => {
+                out.push(FAILED);
+                out.extend_from_slice(error.as_bytes());
+            }
         }
         out
     }
@@ -146,6 +155,10 @@ impl NixlEnvelope {
                     reader.u64()? as i64,
                 ),
                 filter_id: reader.u32()? as i32,
+            },
+            FAILED => Self::Failed {
+                error: String::from_utf8(reader.rest())
+                    .map_err(|err| format!("SRNX Failed error is not utf-8: {err}"))?,
             },
             RING_OPEN => Self::RingOpen(reader.rest()),
             RING_CLOSE => Self::RingClose(reader.u64()?),
@@ -246,8 +259,8 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     /// Received batches this CN's exchange inbox still holds.
     fn outstanding(&self) -> usize;
 
-    /// Ships every batch parked under `slot` to `peer`, then EOS. Blocks until the hop ends. On
-    /// error the peer gets no EOS.
+    /// Ships every batch parked under `slot` to `peer`, then EOS, or a failure frame if the hop
+    /// fails. Blocks until the hop ends.
     fn send(
         &self,
         peer: SocketAddr,
@@ -257,9 +270,15 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     ) -> Result<(), String>;
 
     /// Ships every batch of each hop's drain to its peer as the fragment produces it, serving all
-    /// hops at once, then sends each EOS. Returns once every drain ended, or on the
-    /// first error, after which no hop sends its EOS.
+    /// hops at once, then sends each EOS. Returns once every drain ended, or on the first error,
+    /// after which each hop ends with a failure frame instead of its EOS.
     fn stream(&self, hops: Vec<StreamHop>) -> Result<(), String>;
+
+    /// Tells `slot`'s receiver on `peer` that its sender failed, in place of the EOS it will never
+    /// send, so the receiver fails at once instead of waiting. [`send`](Self::send) and
+    /// [`stream`](Self::stream) already end each hop they were given this way when it fails.
+    /// Best effort, and returns without waiting for the peer.
+    fn fail(&self, peer: SocketAddr, slot: SenderSlot, error: &str);
 
     /// Opens a ring-exchange lane for the sender `request` routes, from a `RingOpen` body;
     /// returns the encoded grant. Only the ring transport has lanes.
@@ -289,6 +308,8 @@ pub struct StreamHop {
     pub slot: SenderSlot,
     pub names: Vec<String>,
     pub drain: Box<dyn OutputDrain>,
+    /// The query's deadline, which bounds the hop's waits; `None` when it has none.
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// Where the ring transport hands a batch it landed whole: `token` holds it in this CN's direct
@@ -344,6 +365,12 @@ pub(crate) fn packed_params(slot: Option<SenderSlot>, seq: i64, eos: bool) -> PT
     }
 }
 
+/// Params for a Failed frame from `slot`'s sender: routed like a Packed frame, and not EOS, so
+/// nothing reads it as the end of a complete stream.
+pub(crate) fn failed_params(slot: SenderSlot) -> PTransmitChunkParams {
+    packed_params(Some(slot), 0, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +399,12 @@ mod tests {
                 instance: FragmentInstanceId::from_halves(4, -2),
                 filter_id: 3,
             },
+            NixlEnvelope::Failed {
+                error: "scan exploded: GPU out of memory".into(),
+            },
+            NixlEnvelope::Failed {
+                error: String::new(),
+            },
             NixlEnvelope::RingOpen(b"lane-open".to_vec()),
             NixlEnvelope::RingClose(9),
         ] {
@@ -396,6 +429,7 @@ mod tests {
             b"SRNX".as_slice(),
             b"SRNX\x09".as_slice(),
             b"SRNX\x04\x01\x00".as_slice(),
+            b"SRNX\x05\xff".as_slice(),
             trailing.as_slice(),
             &packed[..packed.len() - 1],
         ] {
@@ -465,5 +499,12 @@ mod tests {
             (Some(2), Some(1), Some(3), Some(true))
         );
         assert_eq!(control_params().finst_id, None);
+        // A failure frame routes like its sender's frames, but is never EOS.
+        let failed = failed_params(slot);
+        assert_eq!(failed.finst_id, params.finst_id);
+        assert_eq!(
+            (failed.node_id, failed.sender_id, failed.eos),
+            (Some(2), Some(1), Some(false))
+        );
     }
 }
