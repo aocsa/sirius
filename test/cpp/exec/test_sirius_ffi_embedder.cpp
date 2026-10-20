@@ -688,63 +688,64 @@ TEST_CASE("FFI interrupt() from another thread cancels a run, and the next run w
   ArrowArrayStream stream{};
   ctx->execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&stream));
   REQUIRE(collect_i64_column(stream) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}
 
-  TEST_CASE("FFI pin_table serves scans of the pinned files, and unpin_table releases the pin",
-            "[isolated_context][sirius_ffi]")
-  {
-    sirius::test::scratch_dir scratch("ffi_embedder_pin_table");
-    auto const low  = scratch.file("ids_low.parquet");
-    auto const high = scratch.file("ids_high.parquet");
-    write_ids_parquet(low);
-    write_i64_parquet(high, "(6::BIGINT), (7::BIGINT), (8::BIGINT)");
-    auto const glob = (fs::path(low).parent_path() / "ids_*.parquet").string();
+TEST_CASE("FFI pin_table serves scans of the pinned files, and unpin_table releases the pin",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_pin_table");
+  auto const low  = scratch.file("ids_low.parquet");
+  auto const high = scratch.file("ids_high.parquet");
+  write_ids_parquet(low);
+  write_i64_parquet(high, "(6::BIGINT), (7::BIGINT), (8::BIGINT)");
+  auto const glob = (fs::path(low).parent_path() / "ids_*.parquet").string();
 
-    auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-    std::vector<std::int64_t> const low_rows{1, 2, 3, 4, 5};
-    std::vector<std::int64_t> const high_rows{6, 7, 8};
-    REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  std::vector<std::int64_t> const low_rows{1, 2, 3, 4, 5};
+  std::vector<std::int64_t> const high_rows{6, 7, 8};
+  REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
 
-    // An empty format infers parquet from the glob's suffix; empty columns pin every column.
-    REQUIRE(*ctx->pin_table(glob, "gpu", "ids", "", "", "") == "pinned 'ids' tier=gpu");
+  // An empty format infers parquet from the glob's suffix; empty columns pin every column.
+  REQUIRE(*ctx->pin_table(glob, "gpu", "ids", "", "", "") == "pinned 'ids' tier=gpu");
 
-    // Each scan reads one of the two pinned files, so the pin may serve it only from that file's
-    // chunks: the rows are that file's, never the other's.
-    REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
-    REQUIRE(execute_i64s(*ctx, local_files_plan(high)) == high_rows);
-    auto fragment = sirius::ffi::make_fragment(*ctx);
-    fragment->build(local_files_plan(high));
-    fragment->run();
-    auto fragment_rows = result_i64s(*fragment);
-    std::sort(fragment_rows.begin(), fragment_rows.end());
-    REQUIRE(fragment_rows == high_rows);
-    fragment.reset();
+  // Each scan reads one of the two pinned files, so the pin may serve it only from that file's
+  // chunks: the rows are that file's, never the other's.
+  REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
+  REQUIRE(execute_i64s(*ctx, local_files_plan(high)) == high_rows);
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->build(local_files_plan(high));
+  fragment->run();
+  auto fragment_rows = result_i64s(*fragment);
+  std::sort(fragment_rows.begin(), fragment_rows.end());
+  REQUIRE(fragment_rows == high_rows);
+  fragment.reset();
 
-    REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
-    // Like CALL unpin_table, removing a name that isn't pinned does nothing.
-    REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
-    REQUIRE_NOTHROW(ctx->unpin_table("never_pinned"));
-    REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+  // Like CALL unpin_table, removing a name that isn't pinned does nothing.
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+  REQUIRE_NOTHROW(ctx->unpin_table("never_pinned"));
+  REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
 
-    // The same name can be pinned again after an unpin, here on the host tier.
-    REQUIRE(*ctx->pin_table(glob, "host", "ids", "a", "parquet", "") == "pinned 'ids' tier=host");
-    REQUIRE(execute_i64s(*ctx, local_files_plan(high)) == high_rows);
-    REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
-  }
+  // The same name can be pinned again after an unpin, here on the host tier.
+  REQUIRE(*ctx->pin_table(glob, "host", "ids", "a", "parquet", "") == "pinned 'ids' tier=host");
+  REQUIRE(execute_i64s(*ctx, local_files_plan(high)) == high_rows);
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+}
 
-  TEST_CASE("FFI pin_table refuses bad arguments and leaves the Context usable",
-            "[isolated_context][sirius_ffi]")
-  {
-    sirius::test::scratch_dir scratch("ffi_embedder_pin_table_refusals");
-    auto const path = scratch.file("ids.parquet");
-    write_ids_parquet(path);
+TEST_CASE("FFI pin_table refuses bad arguments and leaves the Context usable",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_pin_table_refusals");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
 
-    auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-    REQUIRE_THROWS_WITH(ctx->pin_table(path, "disk", "ids", "", "", ""),
-                        Catch::Matchers::ContainsSubstring("tier='disk'"));
-    REQUIRE_THROWS_WITH(ctx->pin_table(path, "", "ids", "", "", ""),
-                        Catch::Matchers::ContainsSubstring("'tier'"));
-    auto const missing = (fs::path(path).parent_path() / "none_*.parquet").string();
-    REQUIRE_THROWS(ctx->pin_table(missing, "gpu", "ids", "", "", ""));
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  REQUIRE_THROWS_WITH(ctx->pin_table(path, "disk", "ids", "", "", ""),
+                      Catch::Matchers::ContainsSubstring("tier='disk'"));
+  REQUIRE_THROWS_WITH(ctx->pin_table(path, "", "ids", "", "", ""),
+                      Catch::Matchers::ContainsSubstring("'tier'"));
+  auto const missing = (fs::path(path).parent_path() / "none_*.parquet").string();
+  REQUIRE_THROWS(ctx->pin_table(missing, "gpu", "ids", "", "", ""));
 
-    REQUIRE(execute_i64s(*ctx, local_files_plan(path)) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
-  }
+  REQUIRE(execute_i64s(*ctx, local_files_plan(path)) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}
