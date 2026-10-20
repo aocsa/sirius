@@ -169,6 +169,38 @@ impl SiriusContext {
         (!inner.is_null()).then_some(RingExchange { inner })
     }
 
+    /// Pin a table into the engine's scan cache so later plans that scan the
+    /// same resolved source are served from memory — the FFI mirror of
+    /// `CALL pin_table(...)`.
+    ///
+    /// Blocks for the whole materialization on this context's owning thread;
+    /// never call it while a fragment sits between `build` and `run`.
+    /// Compression engages per the context's YAML `sirius.compression.*`
+    /// config. Returns a one-line summary.
+    pub fn pin_table(&mut self, spec: &PinTableSpec) -> Result<String, Exception> {
+        let_cxx_string!(path = spec.path.as_deref().unwrap_or(""));
+        let_cxx_string!(tier = spec.tier.as_str());
+        let_cxx_string!(name = spec.name.as_str());
+        let cols_joined = spec.cols.as_deref().unwrap_or(&[]).join("\n");
+        let_cxx_string!(cols = cols_joined.as_str());
+        let_cxx_string!(format = spec.format.as_deref().unwrap_or(""));
+        let_cxx_string!(schema = spec.schema.as_deref().unwrap_or(""));
+        let summary = self
+            .inner
+            .get_mut()
+            .pin_mut()
+            .pin_table(&path, &tier, &name, &cols, &format, &schema)?;
+        Ok(summary.to_string_lossy().into_owned())
+    }
+
+    /// Remove the pinned entry `name` and release its memory. Same threading
+    /// contract as [`pin_table`](Self::pin_table).
+    pub fn unpin_table(&mut self, name: &str) -> Result<String, Exception> {
+        let_cxx_string!(name = name);
+        let summary = self.inner.get_mut().pin_mut().unpin_table(&name)?;
+        Ok(summary.to_string_lossy().into_owned())
+    }
+
     /// A handle that cancels this context's run in progress from another thread.
     ///
     /// `SiriusContext` stays on the thread that runs queries; hand the returned
@@ -695,37 +727,6 @@ impl std::fmt::Debug for RingExchange {
             .field("send", &self.send_region())
             .field("recv", &self.recv_region())
             .finish()
-    }
-
-    /// Pin a table into the engine's scan cache so later plans that scan the
-    /// same resolved source are served from memory — the FFI mirror of
-    /// `CALL pin_table(...)`.
-    ///
-    /// Blocks for the whole materialization on this context's owning thread;
-    /// never call it while a fragment sits between `build` and `run`.
-    /// Compression engages per the context's YAML `sirius.compression.*`
-    /// config. Returns a one-line summary.
-    pub fn pin_table(&mut self, spec: &PinTableSpec) -> Result<String, Exception> {
-        let_cxx_string!(path = spec.path.as_deref().unwrap_or(""));
-        let_cxx_string!(tier = spec.tier.as_str());
-        let_cxx_string!(name = spec.name.as_str());
-        let cols_joined = spec.cols.as_deref().unwrap_or(&[]).join("\n");
-        let_cxx_string!(cols = cols_joined.as_str());
-        let_cxx_string!(format = spec.format.as_deref().unwrap_or(""));
-        let_cxx_string!(schema = spec.schema.as_deref().unwrap_or(""));
-        let summary = self
-            .inner
-            .pin_mut()
-            .pin_table(&path, &tier, &name, &cols, &format, &schema)?;
-        Ok(summary.to_string_lossy().into_owned())
-    }
-
-    /// Remove the pinned entry `name` and release its memory. Same threading
-    /// contract as [`pin_table`](Self::pin_table).
-    pub fn unpin_table(&mut self, name: &str) -> Result<String, Exception> {
-        let_cxx_string!(name = name);
-        let summary = self.inner.pin_mut().unpin_table(&name)?;
-        Ok(summary.to_string_lossy().into_owned())
     }
 }
 
