@@ -110,14 +110,14 @@ Settings: `GPU_ALLOCATOR=async_capped`, `SIRIUS_CN_RING_GPU_LANDING_FRACTION=0.2
 ## Setup, test, bench
 
 You need `pixi` in `~/.pixi/bin`, the TPC-H parquet data, and a box profile in the tools repo:
-- **4× GB200:** `box/gb200` (the default).
+- **4× GB200:** `dynamic-defaults` (the default). It is the `box/gb200` profile on `main`, with the harness sized from the machine: the pool fraction and pipeline threads follow the GPU's memory, the host tier has no 128 GiB cap, and a disk tier is on by default (`DISK_DIR=` turns it off).
 - **AWS g7e, and 2× RTX PRO 4500 boxes:** `export TOOLS_BRANCH=box/aws-g7e`. On 32 GB GPUs also set `DISK_DIR` to a directory on local NVMe (for example `/opt/dlami/nvme/sirius-disk`): at SF1000 the ring lands about 25 GiB per CN on disk.
 
-The tools repo needs commit `75c3494` or later on its box branch (the harness reads `GPU_ALLOCATOR` and `DISK_DIR`).
+`box/aws-g7e` does not have these defaults yet. On it, set `DISK_DIR` as above. The tools repo needs commit `75c3494` or later on its box branch (the harness reads `GPU_ALLOCATOR` and `DISK_DIR`).
 
 ```bash
 export WORK=/opt/dlami/nvme/sr-cn   # local disk with about 40 GB free, not the NFS $HOME
-git clone -b tmp/sr-cn-integration-2026-10-20c https://github.com/aocsa/sirius.git $WORK/sirius
+git clone -b tmp/sr-cn-integration-2026-10-20g https://github.com/aocsa/sirius.git $WORK/sirius
 cd $WORK/sirius/experimental/starrocks/integration
 
 export TOOLS_BRANCH=box/aws-g7e DISK_DIR=/opt/dlami/nvme/sirius-disk   # 2× RTX PRO 4500 / g7e only
@@ -144,7 +144,7 @@ GPUS="0 1" ./test.sh sf1000      # one CN per GPU, SF1000, all 22 queries, each 
   - `SIRIUS_LIB=$SIRIUS_DIR/build/release`: the tests look for `libsirius.so` there.
   - No ring settings: the engine derives them from the hardware (`docs/super-sirius/memory-management.md`, "Ring exchange sizes"), and the tools repo defaults to `GPU_ALLOCATOR=async_capped`. To override them, use `SIRIUS_CN_RING_*` (frame, send and receive ring sizes, host landing bytes, disk writers, credits, wait limit) and `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`, documented in `experimental/starrocks/scripts/cn-env.sh`.
   - `NO_COLOR=1`: ANSI codes in the CN logs break the harness's log checks.
-  - `DATA_ROOT` on `box/gb200`: it reads `/scratch/sirius/datasets`. When `/scratch` is unreachable (a stale file handle), `env.sh` switches to `/opt/sirius-ci/datasets` and says so. That copy is about 5× slower at SF1000, so don't compare its timings with `/scratch` ones. Set `DATA_ROOT` yourself to choose.
+  - `DATA_ROOT` on the GB200 profile: it reads `/scratch/sirius/datasets`. When `/scratch` is unreachable (a stale file handle), `env.sh` switches to `/opt/sirius-ci/datasets` and says so. That copy is about 5× slower at SF1000, so don't compare its timings with `/scratch` ones. Set `DATA_ROOT` yourself to choose.
 - **Where results go:**
   - CN, FE and query logs: under `$RUN_ROOT_BASE` (printed at the start of a run; the box profile sets it).
   - Bench results: under `.../bench/<timestamp>_<label>/`.

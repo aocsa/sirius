@@ -12,10 +12,12 @@ export SIRIUS_LIB=${SIRIUS_LIB:-$SIRIUS_DIR/build/release}
 export WORK=${WORK:-$(cd "$SIRIUS_DIR/.." && pwd)}
 export TOOLS_REPO=${TOOLS_REPO:-$WORK/starrocks-setup-test-tools}
 TOOLS_REMOTE=${TOOLS_REMOTE:-https://github.com/aocsa/starrocks-setup-test-tools.git}
-TOOLS_BRANCH=${TOOLS_BRANCH:-box/gb200}
-# box/gb200 reads TPC-H from /scratch/sirius/datasets (GPFS). When that mount is unreachable (a
-# stale file handle), use the CI copy in /opt/sirius-ci/datasets instead. That copy is slower:
-# SF1000 takes about 205 s for the 22 queries there, against about 40 s on /scratch.
+# dynamic-defaults: the 4x GB200 box profile on main, with the harness sized from the machine (pool
+# fraction, pipeline threads, host tier, a disk tier on by default) for the ring exchange.
+TOOLS_BRANCH=${TOOLS_BRANCH:-dynamic-defaults}
+# The GB200 profile reads TPC-H from /scratch/sirius/datasets (GPFS). When that mount is
+# unreachable (a stale file handle), use the CI copy in /opt/sirius-ci/datasets instead. That copy
+# is slower: SF1000 takes about 205 s for the 22 queries there, against about 40 s on /scratch.
 if [[ -z "${DATA_ROOT:-}" && -d /opt/sirius-ci/datasets ]] &&
     ! timeout 10 ls /scratch/sirius/datasets >/dev/null 2>&1; then
     echo "note: /scratch/sirius/datasets is unreachable; using DATA_ROOT=/opt/sirius-ci/datasets" >&2
