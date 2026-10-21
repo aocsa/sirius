@@ -1,8 +1,8 @@
 # StarRocks CN integration branch (temporary)
 
-`tmp/sr-cn-integration-2026-10-20f` combines the open PRs of the Sirius StarRocks compute-node (CN) work on `main`, so they can be built and tested together before the stacks merge. **It is temporary and is not meant to be merged.** The PRs themselves are on sirius-db/sirius.
+`tmp/sr-cn-integration-2026-10-20g` combines the open PRs of the Sirius StarRocks compute-node (CN) work on `main`, so they can be built and tested together before the stacks merge. **It is temporary and is not meant to be merged.** The PRs themselves are on sirius-db/sirius.
 
-It replaces `tmp/sr-cn-integration-2026-10-20c`. Since then stack A became two PRs: #2038, then one ring PR (#2258) that folds in #2251, #2039, #2061, #2256 and #2257. Stack C was rebased onto it, #2124/#2125 became #2254, and #2259 is the pin/byte-range rule.
+It is 20f plus two branches that are not PRs yet: the ring sizes derived from the hardware (`stacked/sr-ring-sizing` on #2258), and senders run off the `exec_plan_fragment` call (a new commit on #2121). With them `env.sh` sets no ring settings. 20f replaced `tmp/sr-cn-integration-2026-10-20c`. Since then stack A became two PRs: #2038, then one ring PR (#2258) that folds in #2251, #2039, #2061, #2256 and #2257. Stack C was rebased onto it, #2124/#2125 became #2254, and #2259 is the pin/byte-range rule.
 
 ## What's in it
 
@@ -23,6 +23,8 @@ The base is `main` at e034d221 (#2241). Merged in this order (heads as of Oct 20
 | 11 | #2107 (0d41dfc0) | Substrait `FetchRel.count_expr`/`offset_expr` (substrait at bdfb4eac, ext#5) |
 | 12 | #2100 (c0364803) | batch dispatch uses the shared descriptor table |
 | 13 | #2101 (d63046bf) | the CN heartbeat reports its StarRocks release |
+| 14 | `stacked/sr-ring-sizing` (36fcd7cd) | ring sizes, host and GPU landings, sink piece and GPU pool cap from the hardware; a fix hint when no tier has room |
+| 15 | `stacked/sr-fail-timeout` + 96246724 | sender fragments run off the `exec_plan_fragment` call (eeac9e62 from 19-ring), so a sender longer than the FE's 300 s deploy wait no longer fails the query |
 
 Integration-only changes, in no PR:
 - **filters × failures** (in the step-2 merge): `RecentQueries: Default`; `run_and_ship` returns `FragmentFailure`; a filter share's run carries its query, so a purge stops it; a purge keeps its deferred scans' params to end their hops; SRNX kinds TOPOLOGY 5, SHARE_ABANDONED 6, FAILED 7.
@@ -30,11 +32,24 @@ Integration-only changes, in no PR:
 - **#2253 × stack A:** `pin_table`/`unpin_table` take the context through its `RefCell`; #2253's tests go after A's.
 - **#2129 × #2128:** ids abs 33 (main), decimal_divide 34, negate 35 (36 in all); #2128's signature table gains `{"sirius_decimal_divide", 3, 3}`.
 - **#2100 × stack A/failures:** `resolve_descriptor_table` maps to `StatusPb`; the batch test's instances get a result sink.
+- **sizing × failures (step 14):** `ring_nixl.rs` keeps the failure-frame constants next to the new ring env doc.
+- **senders × filters (step 15):** `compute_node_service.rs` takes 20f's filter-aware shape: the sender plan's local slots and streams, `held_shares` and `senders_running` in the leak counters.
 - **#2104:** two translator tests dropped whose fixtures no PR carries (20c f6dff01e).
 
 **Not included:** #1965 (host Arrow input), #2131 (`regexp_replace`), #2232 (NUMA placement for pins), the CN pin command (needs a port onto #2258).
 
-## Results on 4× GB200 (189 GB each, one CN per GPU, every result checked against DuckDB)
+## 20g results on 4× GB200 (185 GiB each, one CN per GPU, every result checked against DuckDB)
+
+No ring settings in the environment. Tools repo `dynamic-defaults` (3f694d8): the GPU pool fraction and pipeline threads follow the GPU's memory, the host tier has no 128 GiB cap, and a disk tier is on by default (`DISK_DIR=` turns it off). Each CN logs the sizes it got: frames 64 MiB, rings 1 GiB / 1.5 GiB, GPU landings about 31 GiB, host landings half the host tier.
+
+- **Unit tests:** C++ ring, sink, FFI, exchange and config tests: 108 cases pass. The engine-linked CN tests pass (212, 1 ignored).
+- **SF1 smoke:** 22/22. **`INJECT_FAILURE_QUERY=q05`:** q05 fails as injected, and the CNs hold nothing afterwards.
+- **SF1000, 2 iterations:** 44/44, sum of medians **40.7 s** (20f 41.1 s).
+- **SF3000 without a disk tier:** **22/22, 380.8 s**. 20f failed q08 and q18 here on the 48 GiB host landing cap.
+- **SF3000 with a disk tier:** 22/22, 373.1 s (20f 376.4 s).
+- **SF500 on a simulated 27 GiB GPU** (`GPU_FRACTION=0.146 PIPELINE_THREADS=2`, rings 512 MiB / 768 MiB): 22/22, 29.4 s.
+
+## 20f results on 4× GB200 (185 GiB each, one CN per GPU, every result checked against DuckDB)
 
 Settings: `GPU_ALLOCATOR=async_capped`, `SIRIUS_CN_RING_GPU_LANDING_FRACTION=0.25` (env.sh), 85% of each GPU for the pool,
 128 GiB host tier per CN (SF1000), 4 pipeline threads, data on `/scratch/sirius/datasets` (GPFS). Tools repo: `box/gb200`
@@ -127,7 +142,7 @@ GPUS="0 1" ./test.sh sf1000      # one CN per GPU, SF1000, all 22 queries, each 
   - `./test.sh sf3000`: SF3000, with 256 GiB of host spill per CN.
 - **`env.sh`** (sourced by the others) sets what the tools repo doesn't know about this branch:
   - `SIRIUS_LIB=$SIRIUS_DIR/build/release`: the tests look for `libsirius.so` there.
-  - The ring's settings: `GPU_ALLOCATOR=async_capped` (the harness defaults to the slab the direct path needed) and `SIRIUS_CN_RING_GPU_LANDING_FRACTION=0.25` (the share of the GPU pool that received batches may hold before they land on host, then disk). The other ring settings are `SIRIUS_CN_RING_*` (frame, send and receive ring sizes, host landing bytes, disk writers, credits, wait limit) and `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`, documented in `experimental/starrocks/scripts/cn-env.sh`.
+  - No ring settings: the engine derives them from the hardware (`docs/super-sirius/memory-management.md`, "Ring exchange sizes"), and the tools repo defaults to `GPU_ALLOCATOR=async_capped`. To override them, use `SIRIUS_CN_RING_*` (frame, send and receive ring sizes, host landing bytes, disk writers, credits, wait limit) and `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`, documented in `experimental/starrocks/scripts/cn-env.sh`.
   - `NO_COLOR=1`: ANSI codes in the CN logs break the harness's log checks.
   - `DATA_ROOT` on `box/gb200`: it reads `/scratch/sirius/datasets`. When `/scratch` is unreachable (a stale file handle), `env.sh` switches to `/opt/sirius-ci/datasets` and says so. That copy is about 5× slower at SF1000, so don't compare its timings with `/scratch` ones. Set `DATA_ROOT` yourself to choose.
 - **Where results go:**
