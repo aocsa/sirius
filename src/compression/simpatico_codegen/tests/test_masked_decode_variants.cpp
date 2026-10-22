@@ -1426,6 +1426,10 @@ int main()
                                                arch);
     run_index_walk_selectivities<std::int64_t>(
       "int64_t", "int64/40b", 8035, 1LL << 40, {180u}, arch);
+    // DECIMAL128 storage: a narrow chunk and one wider than 32 bits, which needs the full-width
+    // unpack rather than the 32-bit one.
+    run_index_walk_selectivities<__int128>("__int128", "int128/12b", 8035, 2526, {180u}, arch);
+    run_index_walk_selectivities<__int128>("__int128", "int128/40b", 8035, 1LL << 40, {180u}, arch);
     // The delta mask walk and the dictionary gather.
     run_delta_masked<std::int64_t>("int64_t", arch);
     run_delta_masked<std::int32_t>("int32_t", arch);
