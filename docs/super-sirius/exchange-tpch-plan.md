@@ -5,9 +5,9 @@ host. Every query ran in its own process, 1 GPU and 2 ranks, and its answer was 
 DuckDB's CPU answer at SF1 (numbers within 1e-9 relative). At SF1000 the 2-rank answer was compared
 to the 1-GPU answer.
 
-## Status: F1-F3 done, 14 of 22
+## Status: F1-F4 done, 14 of 22
 
-F1, F2 and F3 are on branch `exchange-operator-v3`. With them, 14 queries are correct on 2 ranks:
+F1-F4 are on branch `exchange-operator-v3`. With them, 14 queries are correct on 2 ranks:
 Q1, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q12, Q14, Q18, Q19, Q21. That is exactly the set predicted
 below.
 
@@ -18,8 +18,8 @@ below.
   - NESTED_LOOP_JOIN: Q11
   - DENSE_COUNT_JOIN: Q13
   - COUNT(DISTINCT): Q16
-- **F4 shows up at SF1:** Q7 took 242 s and Q21 122 s at SF1, each waiting out 120 s Bloom-merge
-  timeouts. At SF1000 neither timed out.
+- **F4 (Bloom-merge stall) is fixed.** At SF1, Q7 went from 242 s to 1.6 s and Q21 from 122 s
+  to 1.7 s. No merge timed out at SF1 or SF1000, and the filters are still merged and pushed.
 
 SF1000, one run per process (the first, so it includes reading the data). Not a benchmark:
 
@@ -138,21 +138,27 @@ Q5 and Q12 were verified at SF1000 earlier (see the dist-sirius-scripts notes).
 - **Cost:** the comment there measured the CTE shapes 1.2-3.5x slower on one GPU at SF1000 for
   Q20, Q21 and Q22. Coverage first; F9 recovers the speed.
 
-### F4. Bloom merges that wait on each other (medium; Q7 performance only)
+### F4. A rank with no build filter owed its share of the merge until too late (done)
 
 - **What happened at SF1:** rank 0 waited 120 s in the all-gather for one join's filter, a 2-row
-  build (`filters not merged across ranks ... 1 of 2 ranks in 120000 ms`). Rank 1 logged nothing
-  until rank 0 gave up, then published a different join's filter at once. This happened twice:
-  241 s in total.
-- The answer stays correct, because a timed-out merge drops the filter. At SF1000 the same query
-  took 4.6 s, so this depends on timing.
-- **Likely cause:** `merge_across_ranks` blocks a worker thread inside `exchange::all_gather`. If
-  two ranks reach their joins' merges in different orders, each blocks on the merge the other has
-  not reached yet. This is not yet confirmed: the next step is a stack dump of both ranks during
-  the stall.
-- **Fix direction:** do not block a worker on a peer. Post the contribution and finish the
-  publication when every rank's piece has landed, or run every rank's merges in plan order on a
-  dedicated thread.
+  build (`filters not merged across ranks ... 1 of 2 ranks in 120000 ms`). Q7 did this twice, 241 s
+  in total; Q21 once. The answers stayed correct, because a timed-out merge drops the filter.
+- **Stack dumps of both ranks during the stall:**
+  - Rank 0: one worker in `all_gather` <- `merge_across_ranks` <- `observe_whole_build` <-
+    `CONCAT::sink`, delivering its build.
+  - Rank 1: every worker and the task creator idle.
+  - It was not two merges waiting on each other.
+- **Cause, a wait cycle:**
+  - Both nation rows hashed to rank 0, so rank 1's build was empty and no batch reached its join.
+  - Such a rank contributes only from `finish_input()`, which a hash join called from
+    `on_finalize_operator`, after its probe side.
+  - Rank 1's probe needs rank 0's probe rows. Rank 0 does not start its probe side until its build
+    pipeline ends, which waits on that merge.
+- **Fix:**
+  - When a distributed hash join's build CONCAT finishes, it closes the join's publication
+    (`finish_input`), before the probe side starts.
+  - A rank without a filter now takes part in each merge with `leave_all_gather`: it sends its end
+    and does not wait, since it ignores the merged filters anyway.
 
 ### F5. DENSE_COUNT_JOIN (small-medium) -> Q13
 
@@ -205,8 +211,8 @@ local to its keys. Another is to broadcast the DISTINCT set to every rank. Not n
    - F1 also removes the only silent wrong answers.
 2. **F5, F6: Q13 and Q16, 16 queries.** Each is a self-contained rewriter case.
 3. **F7 + F8: the last 6, 22 queries.** F8 first, since Q17 and Q20 need only F8 (plus F1).
-4. **F4.** It doesn't block correctness, but it has to be fixed before any timing is published.
-   Run it with a stack dump to confirm the cause first.
+4. **F4 (done).** It didn't block correctness, but it had to be fixed before any timing is
+   published.
 5. **Scale-up.** Rerun all 22 at SF1000 on 2 GPUs, then SF3000 with spilling, using the
    dist-sirius-scripts benchmark.
 
