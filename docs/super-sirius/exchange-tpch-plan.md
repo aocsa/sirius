@@ -1,0 +1,234 @@
+# Distributed TPC-H: what runs today, and the plan for the other queries
+
+First measured on branch `exchange-operator-v2` (head `0006f65a`), 2 ranks on 2 RTX PRO 4500 GPUs of one
+host. Every query ran in its own process, 1 GPU and 2 ranks, and its answer was compared to
+DuckDB's CPU answer at SF1 (numbers within 1e-9 relative). At SF1000 the 2-rank answer was compared
+to the 1-GPU answer.
+
+## Status: F1-F3 done, 14 of 22
+
+F1, F2 and F3 are on branch `exchange-operator-v3`. With them, 14 queries are correct on 2 ranks:
+Q1, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q12, Q14, Q18, Q19, Q21. That is exactly the set predicted
+below.
+
+- **SF1:** all 14 match DuckDB's CPU answers, and every 1-GPU run is still correct.
+- **SF1000:** all 14 match the 1-GPU answers.
+- **Still refused:** the remaining 8 fail on the operators predicted for them:
+  - CTE: Q2, Q15, Q17, Q20, Q22
+  - NESTED_LOOP_JOIN: Q11
+  - DENSE_COUNT_JOIN: Q13
+  - COUNT(DISTINCT): Q16
+- **F4 shows up at SF1:** Q7 took 242 s and Q21 122 s at SF1, each waiting out 120 s Bloom-merge
+  timeouts. At SF1000 neither timed out.
+
+SF1000, one run per process (the first, so it includes reading the data). Not a benchmark:
+
+| Query | 1 GPU | 2 GPUs | | Query | 1 GPU | 2 GPUs |
+|---|---|---|---|---|---|---|
+| Q1 | 7.7 s | 5.6 s | | Q10 | 8.1 s | 7.0 s |
+| Q3 | 25.5 s | 3.5 s | | Q12 | 4.8 s | 3.5 s |
+| Q4 | 4.1 s | 3.7 s | | Q14 | 4.5 s | 3.1 s |
+| Q5 | 3.8 s | 3.7 s | | Q18 | 12.5 s | 5.6 s |
+| Q6 | 2.5 s | 2.7 s | | Q19 | 6.6 s | 4.4 s |
+| Q7 | 5.5 s | 4.4 s | | Q21 | 9.5 s | **19.6 s** |
+| Q8 | 4.8 s | 4.2 s | | | | |
+| Q9 | 10.2 s | 7.6 s | | | | |
+
+- **Q21 is slower on 2 GPUs.** It runs the CTE plan from F3; the 1-GPU run uses the delim-join
+  plan. Its rank-0 log has 33 lines about spilling or downgrading, against 7 on 1 GPU. F9 is the
+  fix.
+- **Q3's 25.5 s on 1 GPU is unexplained.** It needs a repeat run before anyone reads anything
+  into it.
+
+## Before the fixes
+
+| Status | Queries | Count |
+|---|---|---|
+| Correct on 2 GPUs | Q1, Q5, Q7, Q8, Q9, Q12 | 6 |
+| Correct with `SET delim_join_as_cte = true` (no code change) | Q4 | 1 |
+| Small fixes (F1-F3) | Q3, Q6, Q10, Q14, Q18, Q19, Q21 | 7 |
+| Medium fixes (F5-F8) | Q2, Q11, Q13, Q15, Q16, Q17, Q20, Q22 | 8 |
+
+- Q7 is correct, but at SF1 it once took 241 s instead of ~2 s: two Bloom merges waited out their
+  120 s timeouts (F4). At SF1000 it took 4.6 s.
+- Every 1-GPU run was correct, so all the failures below are in distributed planning or execution.
+- Each failing query was only checked up to its **first** refused operator. The full operator list
+  (from the 1-GPU plans) says which fixes it needs, but a query can still fail later in ways the
+  first error hides. The sweep below re-checks each one as fixes land.
+
+## Results
+
+SF1, 2 ranks, before any fix:
+
+| Query | 2 GPUs | First blocker | Needs |
+|---|---|---|---|
+| Q1 | ok | | |
+| Q2 | refused | MERGE_TOP_N | F2, F3, F8 |
+| Q3 | refused | MERGE_TOP_N | F1, F2 |
+| Q4 | refused | LEFT_DELIM_JOIN | F3 (verified: ok) |
+| Q5 | ok | | |
+| Q6 | **wrong**: 2 rows, not 1 | MERGE_AGGREGATE runs per batch | F1 |
+| Q7 | ok, 241 s | Bloom merge waits | F4 (performance only) |
+| Q8 | ok | | |
+| Q9 | ok | | |
+| Q10 | refused | MERGE_TOP_N | F1, F2 |
+| Q11 | refused | NESTED_LOOP_JOIN | F1, F7 |
+| Q12 | ok | | |
+| Q13 | refused | DENSE_COUNT_JOIN | F5 |
+| Q14 | **wrong**: 2 rows, not 1 | MERGE_AGGREGATE runs per batch | F1 |
+| Q15 | refused | CTE | F1, F7, F8 |
+| Q16 | refused | COUNT(DISTINCT) partials | F6 |
+| Q17 | refused | RIGHT_DELIM_JOIN | F1, F3, F8 |
+| Q18 | refused | MERGE_TOP_N | F1, F2 |
+| Q19 | **wrong**: 2 rows, not 1 | MERGE_AGGREGATE runs per batch | F1 |
+| Q20 | refused | RIGHT_DELIM_JOIN | F3, F8 |
+| Q21 | refused | MERGE_TOP_N, then LEFT_DELIM_JOIN | F1, F2, F3 |
+| Q22 | refused | LEFT_DELIM_JOIN | F1, F3, F7, F8 |
+
+The wrong answers are the dangerous ones: Q6, Q14 and Q19 return one partial result per rank with
+no error.
+
+SF1000, the queries that already run (first run in each process; not a benchmark):
+
+| Query | 1 GPU | 2 GPUs | Answer |
+|---|---|---|---|
+| Q1 | 7.8 s | 5.6 s | same as 1 GPU |
+| Q7 | 5.6 s | 4.6 s | same as 1 GPU |
+| Q8 | 6.6 s | 4.1 s | same as 1 GPU |
+| Q9 | 10.8 s | 7.6 s | same as 1 GPU |
+
+Q5 and Q12 were verified at SF1000 earlier (see the dist-sirius-scripts notes).
+
+## Fixes, cheapest first
+
+### F1. A merge must wait for its whole input after an exchange (small) -> Q6, Q14, Q19
+
+- **Bug:** `MERGE_AGGREGATE` and `MERGE_TOP_N` rely on their child being a sink, which ends the
+  upstream pipeline. On one GPU the child is `UNGROUPED_AGGREGATE` / `TOP_N`. The rewriter puts an
+  `EXCHANGE_SOURCE` there, which is not a sink, so the merge is pipelined behind it
+  (`Pipeline #2: EXCHANGE_SOURCE -> MERGE_AGGREGATE`) and merges whatever has landed each time
+  a task runs.
+- **Evidence:** Q6 on 2 ranks printed 40,897,074.43 and 82,244,003.80. Their sum,
+  123,141,078.23, is the right answer.
+- **Fix:** give the merge a full-input barrier when its child is an `EXCHANGE_SOURCE`: either the
+  merge's `build_pipelines` starts a new pipeline, or the exchange source ends one as `PARTITION`
+  does. Check `MERGE_TOP_N`'s `fuse_into_parent` path the same way.
+- **Test:** an operator test with 2 senders and one batch each, plus Q6 on 2 ranks.
+
+### F2. Distributed TOP_N (small) -> Q3, Q10, Q18; Q2 and Q21 with F3/F8
+
+- `MERGE_TOP_N -> TOP_N` has the same shape as `MERGE_AGGREGATE -> UNGROUPED_AGGREGATE`: each rank
+  keeps its top N, those are gathered to rank 0, and rank 0's merge picks the final N.
+- **Fix:** a `MERGE_TOP_N` case in `distributed_plan.cpp` that gathers below the merge, like the
+  `MERGE_AGGREGATE` case. Needs F1.
+- At most N rows per rank cross the network, so the gather costs nothing.
+
+### F3. Plan correlated subqueries as CTEs in distributed mode (no code / small) -> Q4; Q21 with F2
+
+- Sirius forces `delim_join_as_cte = false` (`default_to_explicit_delim_joins` in
+  `src/sirius_extension.cpp`), so correlated subqueries reach the GPU as `LEFT/RIGHT_DELIM_JOIN`,
+  which distributed mode refuses.
+- DuckDB v2's default (`true`) decorrelates them into ordinary joins, or into a materialized CTE.
+  With `SET delim_join_as_cte = true`:
+  - Q4 ran correctly on 2 ranks (a RIGHT_SEMI join, already supported).
+  - Q21 then needs only F2.
+  - Q2, Q17, Q20 and Q22 become CTE plans (F8).
+- **Fix:** set it in distributed sessions, in `run_ranks.sh` first, then in Sirius when exchange
+  peers are configured.
+- **Cost:** the comment there measured the CTE shapes 1.2-3.5x slower on one GPU at SF1000 for
+  Q20, Q21 and Q22. Coverage first; F9 recovers the speed.
+
+### F4. Bloom merges that wait on each other (medium; Q7 performance only)
+
+- **What happened at SF1:** rank 0 waited 120 s in the all-gather for one join's filter, a 2-row
+  build (`filters not merged across ranks ... 1 of 2 ranks in 120000 ms`). Rank 1 logged nothing
+  until rank 0 gave up, then published a different join's filter at once. This happened twice:
+  241 s in total.
+- The answer stays correct, because a timed-out merge drops the filter. At SF1000 the same query
+  took 4.6 s, so this depends on timing.
+- **Likely cause:** `merge_across_ranks` blocks a worker thread inside `exchange::all_gather`. If
+  two ranks reach their joins' merges in different orders, each blocks on the merge the other has
+  not reached yet. This is not yet confirmed: the next step is a stack dump of both ranks during
+  the stall.
+- **Fix direction:** do not block a worker on a peer. Post the contribution and finish the
+  publication when every rank's piece has landed, or run every rank's merges in plan order on a
+  dedicated thread.
+
+### F5. DENSE_COUNT_JOIN (small-medium) -> Q13
+
+- Q13's `LEFT JOIN ... count(o_orderkey)` is planned as a fused count join over partitioned inputs
+  (`sirius_physical_dense_count_join`, a partition consumer like `HASH_JOIN`).
+- **Fix:** a rewriter case that hash-exchanges both inputs on the join key, as for `HASH_JOIN`.
+  Each rank then counts only its own customers.
+- **Check:** customers with zero orders must come out exactly once, on the rank that owns them,
+  not from a key-range ("dense") pass on every rank.
+
+### F6. COUNT(DISTINCT) (small-medium) -> Q16
+
+- Partial results of `COUNT(DISTINCT)` cannot be merged by summing. **Fix:** for an aggregate with
+  `has_count_distinct`, hash-exchange the raw rows on the group keys *below* the aggregate, then
+  run the whole aggregate locally. No partial merge is needed.
+- Q16's `NOT IN` is a MARK join. It is correct here because `s_suppkey` is never NULL; the general
+  NULL case is still open (see "Not covered").
+
+### F7. Scalar subquery results feeding a join (medium) -> Q11, Q15, Q22
+
+- Q11 and Q22 compare against a scalar (`> (select sum(...) * 0.0001)`, `> (select avg(...))`)
+  through `NESTED_LOOP_JOIN`. Q15 joins on `= (select max(...))`.
+- The scalar's `MERGE_AGGREGATE` lands on rank 0, and the rewriter refuses "a join over a
+  gathered input".
+- **Fix:**
+  - Hash join: let `hash_below` exchange a rank-0 input too. Rank 0 sends its rows by key and the
+    other ranks send nothing.
+  - Nested-loop join: broadcast the small side to every rank. `exchange_spec::mode::broadcast`
+    already exists in the sink; the rewriter needs a "replicated" placement and a
+    `NESTED_LOOP_JOIN` case for spread × replicated.
+
+### F8. Materialized CTEs (medium) -> Q15, Q17, Q20; Q2 with F2; Q22 with F7
+
+- Q15 is a CTE in its text; with F3, Q2, Q17, Q20 and Q22 become CTE plans too.
+- **Fix:** a `CTE` case. Each rank materializes its share (the materialization's placement, spread
+  for TPC-H), and the CTE scans under the consumer side return that placement.
+- The joins over them already exchange by key, so no new exchange kind is needed. Exchanges
+  inside the materialization get stream ids like any other subtree.
+
+### F9. Later, for speed: distributed delim joins (large)
+
+Only needed to get back the faster single-GPU delim-join plans for Q20-Q22. One option is to
+hash-exchange the outer side on the correlated columns, so each rank's DISTINCT and inner side are
+local to its keys. Another is to broadcast the DISTINCT set to every rank. Not needed for coverage.
+
+## Order of work
+
+1. **F1 + F2 + F3: 7 -> 14 queries.**
+   - Small and independent of each other, except that F2 needs F1.
+   - F1 also removes the only silent wrong answers.
+2. **F5, F6: Q13 and Q16, 16 queries.** Each is a self-contained rewriter case.
+3. **F7 + F8: the last 6, 22 queries.** F8 first, since Q17 and Q20 need only F8 (plus F1).
+4. **F4.** It doesn't block correctness, but it has to be fixed before any timing is published.
+   Run it with a stack dump to confirm the cause first.
+5. **Scale-up.** Rerun all 22 at SF1000 on 2 GPUs, then SF3000 with spilling, using the
+   dist-sirius-scripts benchmark.
+
+Each step ends with the sweep at SF1 against DuckDB's CPU answers, and at SF1000 against the 1-GPU
+answers.
+
+## Not covered by TPC-H, still open
+
+- `NOT IN` with NULL build keys (MARK joins are hash-exchanged like inner joins).
+- S3 / DuckDB-native table scans are not split across ranks, but the plan treats them as split.
+- An OOM before a Bloom merge makes the peers wait out the 120 s timeout.
+
+## Reproducing
+
+The sweep lives in `/home/ubuntu/sirius-notes/exchange-q12/tpch22/` (not in this repo):
+
+```bash
+./sweep.sh 1                                              # all 22 at SF1, 1 GPU and 2 ranks
+PRE_SQL="SET delim_join_as_cte = true;" ./sweep.sh 1 q04  # with session settings
+GPU_COUNTS=2 ./sweep.sh 1000 q01 q07                      # one SF, chosen queries
+```
+
+- It writes `runs/sf<SF>-<time>/results.csv` with the first error per run. Results are `ok`,
+  `ORDER` (same rows in a different order), `WRONG(<n> rows vs <m>)`, `ERROR` or `MISSING`.
+- Expected answers are computed once by the same DuckDB shell without Sirius, in `expected/`.
