@@ -199,6 +199,8 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
   return counts;
 }
 
+void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -872,16 +874,21 @@ void dynamic_filter_publication_session::observe_whole_build(
     auto* space = source.get_data() ? source.get_memory_space() : nullptr;
     if (!space || source.get_current_tier() != cucascade::memory::Tier::GPU ||
         !operation.plan.has_replica_on_device(space->get_device_id())) {
+      {
+        std::scoped_lock lock(operation.mutex);
+        if (operation.stats) {
+          operation.stats->publications_skipped_source_not_resident.fetch_add(
+            1, std::memory_order_relaxed);
+        }
+        // Reopened, the session merges from finish_input(), which then sees it open.
+        if (!operation.input_closed) {
+          operation.current = state::phase::OPEN;
+          return;
+        }
+      }
+      merge_without_filters(operation.plan);
       std::scoped_lock lock(operation.mutex);
-      if (operation.stats) {
-        operation.stats->publications_skipped_source_not_resident.fetch_add(
-          1, std::memory_order_relaxed);
-      }
-      if (operation.input_closed) {
-        operation.complete(operation.cancelled ? completion::CANCELLED : completion::SKIPPED);
-      } else {
-        operation.current = state::phase::OPEN;
-      }
+      operation.complete(operation.cancelled ? completion::CANCELLED : completion::SKIPPED);
       return;
     }
 
@@ -1058,8 +1065,24 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
   }
 }
 
-}  // namespace
+/// Distributed: this rank's share of every key's merge when it publishes nothing, so the other
+/// ranks drop each key's filter at once instead of at the merge timeout.
+void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept
+{
+  auto const* d = plan.distributed();
+  if (d == nullptr) { return; }
+  try {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{d->gpu->get_device_id()}};
+    auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*d->gpu);
+    std::vector<key_filters> none(plan.admitted_keys().size());
+    merge_across_ranks(*d, none, stream_lease.get());
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[publish_dynamic_filters] taking part in the merge without filters: {}",
+                    e.what());
+  }
+}
 
+}  // namespace
 
 // 4. Whole-build publication: build the filters from one complete build, publish them to the
 // probe targets, and record the outcome.
@@ -1078,7 +1101,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   }
   dynamic_filter_publication_outcome outcome;
 
-  if (build_view.num_rows() == 0) {
+  // Distributed, neither shortcut applies: the other ranks wait on this rank's share of the merge.
+  // An empty build contributes an empty Bloom, and this rank still publishes the others' keys.
+  if (build_view.num_rows() == 0 && plan.distributed() == nullptr) {
     SIRIUS_LOG_DEBUG("[publish_dynamic_filters] Skipping dynamic filter push: empty build table.");
     return outcome;
   }
@@ -1088,10 +1113,12 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   };
   auto const& probe_targets = plan.probe_targets();
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
-    SIRIUS_LOG_DEBUG(
-      "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
     outcome.publications_skipped_targets_drained = 1;
-    return outcome;
+    if (plan.distributed() == nullptr) {
+      SIRIUS_LOG_DEBUG(
+        "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
+      return outcome;
+    }
   }
 
   auto const& admitted_keys = plan.admitted_keys();
@@ -1371,17 +1398,30 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
 void dynamic_filter_publication_session::finish_input() noexcept
 {
   auto& operation = *_state;
+  bool merge      = false;
   {
     std::scoped_lock lock(operation.mutex);
     operation.seal();
     operation.input_closed = true;
     if (operation.current == state::phase::OPEN) {
-      operation.complete(completion::SKIPPED);
+      merge = operation.plan.enabled() && operation.plan.distributed() != nullptr;
+      if (merge) {
+        operation.current = state::phase::PUBLISHING;
+      } else {
+        operation.complete(completion::SKIPPED);
+      }
     } else if (operation.current == state::phase::COLLECTING && !operation.accumulation_result) {
       operation.end_attempt(completion::SKIPPED,
                             &dynamic_filter_stats_snapshot::accumulations_incomplete);
     }
     operation.abandon_pending_publication();
+  }
+  if (merge) {
+    // Every other rank waits on this rank's share of each key's merge. This rank never saw a whole
+    // build, so it may hold keys: it sends no filter, never an empty one.
+    merge_without_filters(operation.plan);
+    std::scoped_lock lock(operation.mutex);
+    operation.complete(completion::SKIPPED);
   }
   operation.settle();
 }
