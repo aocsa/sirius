@@ -1067,12 +1067,15 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
 
 /// Distributed: this rank's share of every key's merge when it publishes nothing, so the other
 /// ranks drop each key's filter at once instead of at the merge timeout.
+///
+/// Without waiting for the other ranks, since this rank keeps nothing from the merge: the caller
+/// finalizes a pipeline, and may be the exchange's engine thread delivering an end of stream, which
+/// a waiting merge would itself need to move its messages.
 void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept
 {
   auto const* d = plan.distributed();
   if (d == nullptr) { return; }
   try {
-    // A rank without a filter ignores the merged ones, so it sends its end and does not wait.
     for (std::size_t k = 0; k < plan.admitted_keys().size(); ++k) {
       exchange::leave_all_gather(*d->service, d->first_stream + k);
     }
