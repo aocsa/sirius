@@ -98,6 +98,9 @@ set(SIRIUS_LINK_LIBRARIES
 if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
+if(SIRIUS_WITH_NIXL)
+  list(APPEND SIRIUS_LINK_LIBRARIES ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY})
+endif()
 
 foreach(_target sirius_objects sirius_core sirius_extension
                 sirius_loadable_extension sirius_shared)

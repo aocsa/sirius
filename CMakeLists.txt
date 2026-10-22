@@ -29,6 +29,14 @@ option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
+# The exchange's NIXL fabric (src/exchange/nixl_fabric.cpp) links an out-of-tree
+# NIXL install, e.g. SIRIUS_NIXL_PREFIX=~/tools/nvda_nixl; scripts/nixl_env.sh
+# sets up its runtime paths.
+option(SIRIUS_WITH_NIXL "Build the exchange's NIXL fabric" OFF)
+set(SIRIUS_NIXL_PREFIX
+    "$ENV{NIXL_PREFIX}"
+    CACHE PATH "NIXL install prefix")
+
 # The [s3] integration tests launch MinIO via a patched build of upstream
 # testcontainers-native, fetched + patched at configure time and built as a Go
 # c-archive — so it needs a Go toolchain and network at configure/build time. ON
