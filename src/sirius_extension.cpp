@@ -2591,6 +2591,11 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
     if (comma > at) { peers.push_back(list.substr(at, comma - at)); }
     at = comma + 1;
   }
+  // Distributed plans refuse delim joins, so correlated subqueries are planned the DuckDB v2 way
+  // (see default_to_explicit_delim_joins). A later `SET delim_join_as_cte` still overrides this.
+  if (!peers.empty()) {
+    Settings::Set<DelimJoinAsCteSetting>(context, scope, Value::BOOLEAN(true));
+  }
   get_operator_params(context, scope)->exchange_peers = std::move(peers);
 }
 
