@@ -67,6 +67,7 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -161,6 +162,25 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
+//! Distributed: every rank binds every file of a table, and scans files rank, rank + world, ...
+std::vector<std::string> stripe_for_rank(std::vector<std::string> files,
+                                         const sirius::operator_params& op_params)
+{
+  auto const world = op_params.exchange_peers.size();
+  if (world <= 1) { return files; }
+  if (files.size() < world) {
+    throw sirius::not_implemented_exception(
+      "distributed execution: a table of {} files across {} ranks; each rank needs one",
+      files.size(),
+      world);
+  }
+  std::vector<std::string> mine;
+  for (std::size_t i = op_params.exchange_rank; i < files.size(); i += world) {
+    mine.push_back(std::move(files[i]));
+  }
+  return mine;
+}
+
 //! Build a `parquet_ingestible_table_info` from a TABLE_SCAN. Destructive: `table_filters`
 //! is moved out of the scan.
 //! Fill the parquet bind data from a TABLE_SCAN. Split out from
@@ -206,7 +226,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    info->resolved_file_paths = std::move(resolved_file_paths);
+    info->resolved_file_paths = stripe_for_rank(std::move(resolved_file_paths), op_params);
     auto const& bind_data     = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
     // Legacy options use ordinary schema positions; normalize them here.
@@ -1256,6 +1276,11 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
+  if (sirius_ctx && !op_params.exchange_peers.empty()) {
+    auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+    sirius::planner::distribute_plan(
+      plan, sirius_ctx->get_exchange_service(), *gpu, sirius_ctx->next_distributed_query());
+  }
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

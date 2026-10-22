@@ -139,6 +139,12 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// equal keys would land in different partitions and the consuming join would miss matches.
   [[nodiscard]] std::vector<int> const& partition_keys() const noexcept { return _partition_keys; }
 
+  /// Per partition key, the type it is cast to before hashing; EMPTY hashes it as-is.
+  [[nodiscard]] std::vector<cudf::data_type> const& partition_key_cast_types() const noexcept
+  {
+    return _partition_key_cast_types;
+  }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
