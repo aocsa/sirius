@@ -17,6 +17,8 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "exchange/all_gather.hpp"
+#include "exchange/exchange_service.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
@@ -30,6 +32,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -41,6 +44,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <exception>
@@ -160,6 +164,18 @@ void dynamic_filter_publication_session::restrict_replicas_to(
   }
   _state->plan.restrict_replicas_to(admitted_gpu_ids);
   if (!_state->plan.enabled()) { _state->complete(sirius_dynamic_filter_set::completion::SKIPPED); }
+}
+
+void dynamic_filter_publication_session::set_distributed(
+  dynamic_filter_publish_plan::distributed_merge merge)
+{
+  std::scoped_lock lock(_state->mutex);
+  if (_state->sealed) {
+    throw std::logic_error(
+      "[dynamic_filter_publication_session::set_distributed] the plan cannot change during "
+      "execution");
+  }
+  _state->plan.set_distributed(std::move(merge));
 }
 
 void dynamic_filter_publication_session::seal_plan() noexcept
@@ -337,6 +353,90 @@ std::unique_ptr<cudf::scalar> restore_scalar(cudf::scalar const& bound,
 }
 }  // namespace
 
+namespace {
+
+/**
+ * @brief Distributed: ORs every rank's Bloom for each admitted key into this rank's, so it holds
+ * every rank's build keys, or drops the key's filter unless every rank sent one of the same size
+ * and key domain. Every rank calls it for every admitted key, in order, filter or not, since the
+ * others wait for it.
+ */
+void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
+                        std::vector<std::shared_ptr<sirius_dynamic_filter>>& membership,
+                        ::cuda::stream_ref stream)
+{
+  // A rank's contribution: rep | family | scale | storage bytes | the Bloom's words, as UINT32.
+  constexpr std::size_t header = 4;
+  auto const mr                = d.gpu->get_default_allocator();
+  for (std::size_t k = 0; k < membership.size(); ++k) {
+    auto* bloom = dynamic_cast<sirius_dynamic_bloom_filter*>(membership[k].get());
+    std::array<std::uint32_t, header> head{};
+    std::shared_ptr<cucascade::data_batch> mine;
+    if (bloom) {
+      auto const bytes = bloom->storage_bytes();
+      head             = {static_cast<std::uint32_t>(bloom->domain().rep),
+                          static_cast<std::uint32_t>(bloom->domain().family),
+                          static_cast<std::uint32_t>(bloom->domain().scale),
+                          static_cast<std::uint32_t>(bytes)};
+      auto column      = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT32},
+                                              static_cast<cudf::size_type>(header + bytes / 4),
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              mr);
+      auto* words      = column->mutable_view().data<std::uint32_t>();
+      RMM_CUDA_TRY(
+        cudaMemcpyAsync(words, head.data(), sizeof(head), cudaMemcpyHostToDevice, stream.get()));
+      RMM_CUDA_TRY(cudaMemcpyAsync(
+        words + header, bloom->storage(), bytes, cudaMemcpyDeviceToDevice, stream.get()));
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(std::move(column));
+      mine = sirius::make_data_batch(
+        std::make_unique<cudf::table>(std::move(columns)), *d.gpu, stream, {});
+    }
+    std::vector<std::shared_ptr<cucascade::data_batch>> all;
+    try {
+      all = exchange::all_gather(
+        *d.service, d.first_stream + k, std::move(mine), *d.gpu, stream.get(), d.timeout);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[publish_dynamic_filters] key {}: filters not merged across ranks: {}", k, e.what());
+      membership[k].reset();
+      continue;
+    }
+    if (!bloom) { continue; }
+    std::vector<std::uint32_t const*> others;
+    bool mergeable = true;
+    for (exchange::rank_t r = 0; r < all.size() && mergeable; ++r) {
+      if (!all[r]) {
+        mergeable = false;
+        break;
+      }
+      auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
+      std::array<std::uint32_t, header> their_head{};
+      RMM_CUDA_TRY(cudaMemcpyAsync(
+        their_head.data(), theirs, sizeof(their_head), cudaMemcpyDeviceToHost, stream.get()));
+      stream.sync();
+      mergeable = their_head == head;
+      if (r != d.service->rank()) { others.push_back(theirs + header); }
+    }
+    if (!mergeable) {
+      SIRIUS_LOG_DEBUG(
+        "[publish_dynamic_filters] key {}: a rank sent no filter or another kind; "
+        "nothing published for it.",
+        k);
+      membership[k].reset();
+      continue;
+    }
+    for (auto const* words : others) {
+      bloom->merge_from(words, bloom->storage_bytes(), stream);
+    }
+    // The gathered filters are freed with `all`, after the merges have read them.
+    stream.sync();
+  }
+}
+
+}  // namespace
+
 dynamic_filter_publication_outcome publish_dynamic_filters(
   dynamic_filter_publish_plan const& plan,
   cudf::table_view const& build_view,
@@ -497,7 +597,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       // carrier the build arrived at and then restored to the recorded type: two scalars, not the
       // whole column, so a narrowed build publishes the same zone map a native one does.
       per_key_zone_map_type[admitted_key_index] = admitted_key.storage_type;
-      if (plan.emit_zone_map_filters() &&
+      if (plan.emit_zone_map_filters() && plan.distributed() == nullptr &&
           sirius::op::sirius_dynamic_zone_map_filter::supports(admitted_key.storage_type)) {
         nvtx_scoped_range vr{"dynfilter::build_zone_map"};
         auto min_s = cudf::reduce(col,
@@ -545,17 +645,23 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
           admitted_key_index);
       }
 
-      auto const chosen = choose_membership_filter(
-        {.build_rows               = valid_rows,
-         .l2_cache_bytes           = l2_bytes,
-         .estimated_hash_set_bytes = set_bytes,
-         .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
-         .supports_small_in_list =
-           fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
-         .supports_hash_in_list =
-           fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
-         .supports_bloom =
-           fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
+      // Distributed: a Bloom of the size every rank builds, so the ranks' filters can be merged.
+      auto const distributed_bloom = plan.distributed() != nullptr && fits_rep &&
+                                     sirius::op::sirius_dynamic_bloom_filter::supports(col.type());
+      auto const chosen =
+        plan.distributed() != nullptr
+          ? (distributed_bloom ? membership_filter_kind::bloom : membership_filter_kind::none)
+          : choose_membership_filter(
+              {.build_rows               = valid_rows,
+               .l2_cache_bytes           = l2_bytes,
+               .estimated_hash_set_bytes = set_bytes,
+               .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
+               .supports_small_in_list =
+                 fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
+               .supports_hash_in_list =
+                 fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
+               .supports_bloom =
+                 fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
 
       char const* choice = "none";
       switch (chosen) {
@@ -577,7 +683,11 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         case membership_filter_kind::bloom: {
           nvtx_scoped_range vr{"dynfilter::build_bloom"};
           per_key_membership[admitted_key_index] =
-            std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
+            std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+              col,
+              plan.distributed() ? plan.distributed()->bloom_keys : std::size_t{0},
+              stream,
+              allocator_ref);
           choice = "bloom";
           break;
         }
@@ -597,6 +707,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         l2_bytes,
         plan.inlist_max_l2_fraction(),
         choice);
+    }
+
+    if (auto const* distributed = plan.distributed()) {
+      merge_across_ranks(*distributed, per_key_membership, stream);
     }
 
     // Finish construction and replication before publishing to independent consumer streams.
