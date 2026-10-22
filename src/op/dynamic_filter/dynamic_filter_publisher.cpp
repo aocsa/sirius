@@ -1072,10 +1072,10 @@ void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept
   auto const* d = plan.distributed();
   if (d == nullptr) { return; }
   try {
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{d->gpu->get_device_id()}};
-    auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*d->gpu);
-    std::vector<key_filters> none(plan.admitted_keys().size());
-    merge_across_ranks(*d, none, stream_lease.get());
+    // A rank without a filter ignores the merged ones, so it sends its end and does not wait.
+    for (std::size_t k = 0; k < plan.admitted_keys().size(); ++k) {
+      exchange::leave_all_gather(*d->service, d->first_stream + k);
+    }
   } catch (std::exception const& e) {
     SIRIUS_LOG_WARN("[publish_dynamic_filters] taking part in the merge without filters: {}",
                     e.what());
