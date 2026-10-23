@@ -5,6 +5,78 @@ host. Every query ran in its own process, 1 GPU and 2 ranks, and its answer was 
 DuckDB's CPU answer at SF1 (numbers within 1e-9 relative). At SF1000 the 2-rank answer was compared
 to the 1-GPU answer.
 
+## Speed on 2 ranks: 106 s to 64 s
+
+Branch `dist-plan-opt`, measured at SF1000 on 2 ranks, one query per process, first run (the
+baseline protocol above). All 22 queries stay correct at SF1 against DuckDB and at SF1000
+against the 1-GPU answers.
+
+| Query | Baseline | + broadcast | + eager connect | + delim joins | warm (2nd run) |
+|---|---|---|---|---|---|
+| Q01 | 5.97 | 5.85 | 4.74 | 4.84 | 3.96 |
+| Q02 | 2.03 | 1.96 | 0.64 | 0.71 | 0.51 |
+| Q03 | 3.58 | 3.63 | 2.25 | 2.18 | 1.92 |
+| Q04 | 3.72 | 3.93 | 2.25 | 1.66 | 1.20 |
+| Q05 | 3.59 | 3.41 | 2.41 | 2.35 | 1.78 |
+| Q06 | 2.81 | 2.87 | 1.41 | 1.44 | 1.28 |
+| Q07 | 4.47 | 4.39 | 3.16 | 3.15 | 2.21 |
+| Q08 | 4.10 | 4.01 | 2.70 | 2.69 | 2.23 |
+| Q09 | 8.45 | 8.12 | 6.69 | 6.66 | 4.43 |
+| Q10 | 7.31 | 7.32 | 5.73 | 5.92 | 4.06 |
+| Q11 | 1.95 | 2.03 | 0.61 | 0.67 | 0.44 |
+| Q12 | 4.02 | 3.62 | 2.34 | 2.74 | 2.07 |
+| Q13 | 6.45 | 5.78 | 3.16 | 3.48 | 1.73 |
+| Q14 | 3.21 | 3.23 | 1.83 | 1.85 | 1.66 |
+| Q15 | 3.16 | 3.19 | 1.81 | 1.81 | 1.61 |
+| Q16 | 2.25 | 2.36 | 1.04 | 1.06 | 0.59 |
+| Q17 | 3.85 | 3.69 | 2.38 | 2.18 | 1.90 |
+| Q18 | 6.04 | 5.89 | 4.33 | 4.46 | 3.75 |
+| Q19 | 4.91 | 4.42 | 3.05 | 3.34 | 2.70 |
+| Q20 | 3.58 | 3.39 | 2.06 | 2.05 | 1.88 |
+| Q21 | 18.65 | 17.52 | 17.51 | 8.05 | 5.59 |
+| Q22 | 2.04 | 2.12 | 0.69 | 0.72 | 0.55 |
+| **Total** | **106.1** | **102.7** | **72.8** | **64.0** | **48.1** |
+
+What each change bought:
+
+- **Broadcast a small build side (-3%).** A hash join whose estimated build fits 1 GiB and
+  costs less to send to every rank than hashing both sides broadcasts the build and keeps the
+  probe local. Its Bloom filters then publish locally, with no merge. 19 of 22 queries use it,
+  but shuffling small builds was not where the time went.
+- **Connect to the peers at `SET sirius_exchange_rank` (-29%).** The first distributed query in
+  each process used to create the exchange: NIXL/UCX start-up, ring registration, and waiting
+  for the other process, 1.1-1.5 s per query. This moves a once-per-process cost into session
+  setup; a long-lived server pays it once.
+- **Delim joins on N ranks (-12%).** The CTE plans of F3 made Q21 scan lineitem whole twice
+  more, unfiltered: 59 GB shuffled and 70-80 GB spilled per rank. Hashing the delim input on its
+  delim columns before the fan-out makes each rank's DISTINCT disjoint, so DuckDB's delim plans
+  run as on one GPU. Q21 went from 17.5 s to 8.0 s.
+
+### Where the rest of the time goes
+
+The first-run total is 61-64 s, against **48.1 s warm**. Nearly all of that gap is spilling to
+host memory on first use: about 9 s on rank 0, mostly in Q21 (2.8 s), Q9 (2.5 s) and Q10 (1.7 s).
+
+- **Spill speed, not volume.** First and warm runs spill about the same bytes. The pinned host
+  pool starts at 256 MiB and grows as needed, and pinning runs at ~3.5 GB/s. Warm runs reuse the
+  pool.
+- **Preallocating it works but moves the cost.** `sirius.memory.host.{pool_size: 1024,
+  initial_number_pools: 24}` (24 GB per rank) cut Q21's first run by ~6 s, but adds 6-8 s to
+  every process's start. Worth it for a long-lived server, not for one query per process.
+- **The first scan wave over-reserves.** With no memory history, a fresh scan task reserves its
+  input × 8 (`kMaxNumericCarrierExpansion`): 5.3 GB for a lineitem split that peaks at 1.4 GB.
+  That forces the first spills. Lowering the factor to 3 made the total no better (73.9 s vs
+  72.8 s): Q9 and Q7 improved, while Q13 and Q18 got worse. A real fix needs the decoded size per
+  split from the Parquet metadata.
+- **Bloom filter size is not the limit.** The 256 MiB per-GPU Bloom cap only applies to
+  multi-partition accumulation, which distributed mode does not use. The time left is mostly
+  scan and decode.
+
+Still open:
+- RIGHT_SEMI and RIGHT_ANTI joins get no dynamic filters in distributed mode: their early
+  publication needs the multi-partition accumulator, which is off there.
+- Filtering a join's build side by its probe keys (semi-join reduction) is not supported.
+
 ## Status: all 22 correct on 2 ranks
 
 F1-F8 are on branch `exchange-operator-v3`, with two fixes cherry-picked from
