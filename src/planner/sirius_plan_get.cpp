@@ -49,7 +49,6 @@
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
-#include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -606,6 +605,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Resolved once for this plan against the connection being planned for, so the parquet
   // identity probe and the residency gate below cannot disagree about whether narrowing is on.
   bool const compressed_materialization_on = duckdb::compressed_materialization_enabled(context);
+  // Distributed: a rank pins only its share of a table, and narrowing picks each column's carrier
+  // from the values it pinned, so ranks can narrow the same column differently, or not at all
+  // when their share is empty. Every rank must plan the same types, so pinned scans plan their
+  // native types here; their narrowed chunks still save memory and widen as they are served.
+  bool const distributed =
+    sirius_state && duckdb::query_operator_options(context)->exchange_peers.size() > 1;
 
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
@@ -655,29 +660,22 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         serves_insert_deltas = true;
       }
     }
-  } else if (!marked_decline && sirius_state && compressed_materialization_on) {
-    auto files = resolve_parquet_scan_file_paths(
+  } else if (!marked_decline && sirius_state && compressed_materialization_on && !distributed) {
+    auto const files = resolve_parquet_scan_file_paths(
       op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
     if (!files.empty()) {
-      // The scan reads this rank's share of the files (populate_parquet_table_info), and only a
-      // pin of that same share serves it.
-      sirius::planner::rank_file_share share{.files = std::move(files)};
-      if (op.function.GetName() != "sirius_read_parquet") {
-        auto const op_params = duckdb::query_operator_options(context);
-        share                = sirius::planner::file_share_for_rank(
-          std::move(share.files), op_params->exchange_rank, op_params->exchange_peers.size());
-      }
-      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(
-        share.files, share.ranges);
+      pinned_owner =
+        sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files, {});
       pinned = pinned_owner.get();
     }
   }
 
-  auto physical_types = scan_physical_schema(op,
-                                             sirius_state.get(),
-                                             compressed_materialization_on,
-                                             column_ids,
-                                             serves_insert_deltas ? nullptr : pinned);
+  auto physical_types =
+    scan_physical_schema(op,
+                         sirius_state.get(),
+                         compressed_materialization_on,
+                         column_ids,
+                         serves_insert_deltas || distributed ? nullptr : pinned);
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");

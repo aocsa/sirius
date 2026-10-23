@@ -1191,6 +1191,10 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       if (file_paths.empty()) {
         throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
       }
+      // GlobFiles returns the directory's order, which some filesystems do not sort. read_parquet
+      // sorts its glob by path, and a rank's byte-range share depends on the order of the files,
+      // so sort the same way or the pin's share differs from its scans' and never serves them.
+      std::sort(file_paths.begin(), file_paths.end());
       // Distributed: each rank pins the share of the files its scans of them read, so the pin
       // serves those scans (cache_entry_info matches files and byte ranges) and the ranks
       // together hold the table once.

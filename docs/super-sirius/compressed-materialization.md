@@ -128,6 +128,13 @@ as a clean cache miss at serve time. This yields three residency states:
    when no column survives the whole sidecar is dropped. A native resident chunk is never narrowed
    at serve time as a recurring per-query cost.
 
+In distributed execution every pinned scan plans its native types, as if unpinned. Each rank pins
+only its share of a table, and the carriers come from the values it pinned, so two ranks can
+narrow the same column differently (or not at all, when a rank's share is empty). Every rank must
+plan the same types: different ones fail the plan-shape check, or meet in an exchange as batches
+that cannot be concatenated. The pins stay narrow in memory, and their chunks widen as they are
+served. `test/scripts/distributed_pin_narrowing.sh` covers this on two ranks.
+
 For duckdb-native entries one further condition applies: when rows exist beyond the pinned prefix
 (the same `GetTotalRows() > n_cache` check the MVCC guards make against the entry's snapshot
 metadata), the query serves those rows as insert-delta splits decoded fresh at native width, and
