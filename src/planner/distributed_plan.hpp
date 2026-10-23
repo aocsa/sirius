@@ -22,6 +22,8 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace cucascade::memory {
@@ -83,5 +85,26 @@ struct file_byte_range {
  */
 [[nodiscard]] std::vector<file_byte_range> byte_ranges_for_rank(
   std::span<std::uint64_t const> file_bytes, std::size_t rank, std::size_t world);
+
+/// The files a rank scans of a table and, parallel to them, the byte ranges it scans of each, in
+/// `parquet_ingestible_table_info::resolved_file_ranges` form: no ranges at all reads every file
+/// whole.
+struct rank_file_share {
+  std::vector<std::string> files;
+  std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges;
+};
+
+/**
+ * @brief Rank @p rank of @p world's share of @p files: what its scan of them reads, and what its
+ * pin of them holds, so the pin can serve the scan.
+ *
+ * One rank reads every file whole. Local files are split by byte range (@ref
+ * byte_ranges_for_rank); remote ones, which take no byte ranges, go whole: files rank,
+ * rank + world, ...
+ * @throws sirius::not_implemented_exception for fewer remote files than ranks.
+ */
+[[nodiscard]] rank_file_share file_share_for_rank(std::vector<std::string> files,
+                                                  std::size_t rank,
+                                                  std::size_t world);
 
 }  // namespace sirius::planner

@@ -270,23 +270,23 @@ TEST_CASE("cache_entry_info: matches_parquet_files is the shared parquet identit
   // Same set hits regardless of order.
   std::vector<std::string> const in_order{"a.parquet", "b.parquet"};
   std::vector<std::string> const reordered{"b.parquet", "a.parquet"};
-  REQUIRE(cache.matches_parquet_files(in_order));
-  REQUIRE(cache.matches_parquet_files(reordered));
+  REQUIRE(cache.matches_parquet_files(in_order, {}));
+  REQUIRE(cache.matches_parquet_files(reordered, {}));
 
   // Size mismatch misses.
   std::vector<std::string> const fewer{"a.parquet"};
-  REQUIRE_FALSE(cache.matches_parquet_files(fewer));
+  REQUIRE_FALSE(cache.matches_parquet_files(fewer, {}));
 
   // Different file misses.
   std::vector<std::string> const different{"a.parquet", "c.parquet"};
-  REQUIRE_FALSE(cache.matches_parquet_files(different));
+  REQUIRE_FALSE(cache.matches_parquet_files(different, {}));
 
   // A duckdb-identity entry (empty resolved_file_paths) never matches.
   auto duckdb_entry = duckdb_cache("db", "main", "t", {0});
-  REQUIRE_FALSE(duckdb_entry.matches_parquet_files(fewer));
+  REQUIRE_FALSE(duckdb_entry.matches_parquet_files(fewer, {}));
 
   // Empty input misses.
-  REQUIRE_FALSE(cache.matches_parquet_files(std::vector<std::string>{}));
+  REQUIRE_FALSE(cache.matches_parquet_files(std::vector<std::string>{}, {}));
 }
 
 TEST_CASE("cache_entry_info: matches_parquet_files canonicalizes the probe's spellings",
@@ -301,18 +301,18 @@ TEST_CASE("cache_entry_info: matches_parquet_files canonicalizes the probe's spe
   auto cache             = parquet_cache({base + "/a.parquet", base + "/sub/b.parquet"}, {0});
 
   std::vector<std::string> const dot_segment{base + "/./a.parquet", base + "/sub/b.parquet"};
-  REQUIRE(cache.matches_parquet_files(dot_segment));
+  REQUIRE(cache.matches_parquet_files(dot_segment, {}));
 
   std::vector<std::string> const parent_segment{base + "/a.parquet",
                                                 base + "/other/../sub/b.parquet"};
-  REQUIRE(cache.matches_parquet_files(parent_segment));
+  REQUIRE(cache.matches_parquet_files(parent_segment, {}));
 
   std::vector<std::string> const file_uri{"file://" + base + "/a.parquet", base + "/sub/b.parquet"};
-  REQUIRE(cache.matches_parquet_files(file_uri));
+  REQUIRE(cache.matches_parquet_files(file_uri, {}));
 
   // Canonicalization never conflates genuinely different paths.
   std::vector<std::string> const different{base + "/a.parquet", base + "/sub/../b.parquet"};
-  REQUIRE_FALSE(cache.matches_parquet_files(different));
+  REQUIRE_FALSE(cache.matches_parquet_files(different, {}));
 }
 
 TEST_CASE("cache_entry_info: column_projection_for misses on sentinel columns", "[scan][can_serve]")

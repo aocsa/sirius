@@ -49,6 +49,7 @@
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -655,11 +656,20 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       }
     }
   } else if (!marked_decline && sirius_state && compressed_materialization_on) {
-    auto const files = resolve_parquet_scan_file_paths(
+    auto files = resolve_parquet_scan_file_paths(
       op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
     if (!files.empty()) {
-      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
-      pinned       = pinned_owner.get();
+      // The scan reads this rank's share of the files (populate_parquet_table_info), and only a
+      // pin of that same share serves it.
+      sirius::planner::rank_file_share share{.files = std::move(files)};
+      if (op.function.GetName() != "sirius_read_parquet") {
+        auto const op_params = duckdb::query_operator_options(context);
+        share                = sirius::planner::file_share_for_rank(
+          std::move(share.files), op_params->exchange_rank, op_params->exchange_peers.size());
+      }
+      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(
+        share.files, share.ranges);
+      pinned = pinned_owner.get();
     }
   }
 

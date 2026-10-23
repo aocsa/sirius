@@ -41,6 +41,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -455,6 +456,41 @@ std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const>
     if (from < to) { mine.push_back({f, from - offset, to - from}); }
   }
   return mine;
+}
+
+rank_file_share file_share_for_rank(std::vector<std::string> files,
+                                    std::size_t rank,
+                                    std::size_t world)
+{
+  rank_file_share share;
+  if (world <= 1) {
+    share.files = std::move(files);
+    return share;
+  }
+  auto const remote = std::any_of(
+    files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
+  if (remote) {
+    if (files.size() < world) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: a remote table of {} files across {} ranks; each rank needs one",
+        files.size(),
+        world);
+    }
+    for (std::size_t i = rank; i < files.size(); i += world) {
+      share.files.push_back(std::move(files[i]));
+    }
+    return share;
+  }
+  std::vector<std::uint64_t> bytes;
+  bytes.reserve(files.size());
+  for (auto const& f : files) {
+    bytes.push_back(std::filesystem::file_size(f));
+  }
+  for (auto const& r : byte_ranges_for_rank(bytes, rank, world)) {
+    share.files.push_back(std::move(files[r.file]));
+    share.ranges.push_back({{r.start, r.length}});
+  }
+  return share;
 }
 
 }  // namespace sirius::planner

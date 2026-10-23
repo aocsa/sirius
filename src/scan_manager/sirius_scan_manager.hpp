@@ -118,16 +118,23 @@ namespace sirius::scan_manager {
 
 /// Lightweight descriptor of a pinned table's cache identity + column layout,
 /// stored on @ref pinned_entry in place of the read-side ingestible_table_info.
-/// Captures only what serving needs — the table's identity (parquet file set OR
-/// duckdb catalog/schema/table name), the cached columns (by primary/storage
+/// Captures only what serving needs — the table's identity (parquet file set and
+/// byte ranges OR duckdb catalog/schema/table name), the cached columns (by primary/storage
 /// index), and their names (aligned with @c column_ids) for the GPU gather — and
 /// owns the match logic that @ref sirius_scan_manager::try_match_cached_entry consults.
 class cache_entry_info {
  public:
+  /// Byte ranges `[start, start+length)` of one file; none, or a `(0,0)` among them, is the whole
+  /// file.
+  using byte_ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
   std::vector<std::string> resolved_file_paths;  ///< parquet identity (file set)
-  std::string catalog_name;                      ///< duckdb identity: catalog (attach alias)
-  std::string schema_name;                       ///< duckdb identity: schema
-  std::string table_name;                        ///< duckdb identity: table
+  /// Parquet identity: the byte ranges read of each file, parallel to @c resolved_file_paths
+  /// (empty: every file whole). A distributed rank pins and scans only its share of the files.
+  std::vector<byte_ranges> resolved_file_ranges;
+  std::string catalog_name;  ///< duckdb identity: catalog (attach alias)
+  std::string schema_name;   ///< duckdb identity: schema
+  std::string table_name;    ///< duckdb identity: table
   /// Catalog object id plus storage identity: DROP/CREATE changes the former;
   /// ALTER that rewrites values or column layout changes the latter.
   sirius::duckdb_table_identity table_identity;
@@ -140,7 +147,7 @@ class cache_entry_info {
   [[nodiscard]] static cache_entry_info from(const op::scan::ingestible_table_info& info);
 
   /// Gather projection (positions into @c column_ids) that lets this cached entry
-  /// serve @p other — matching identity (same parquet file set / same duckdb
+  /// serve @p other — matching identity (same parquet files and byte ranges / same duckdb
   /// catalog.schema.table) AND a superset of @p other's requested columns. The projection
   /// reproduces @p other's requested column order. Empty when this entry cannot
   /// serve @p other (different format, identity, or a missing column).
@@ -162,14 +169,18 @@ class cache_entry_info {
                                                std::string_view table) const;
 
   /// Whether both entries cache the same DuckDB table incarnation or parquet
-  /// file set. Identity-less entries never match.
+  /// files and byte ranges. Identity-less entries never match.
   [[nodiscard]] bool same_source_as(const cache_entry_info& other) const;
 
   /// Parquet-identity check shared by can_serve_with_columns and the plan-time
   /// residency gate — one matcher, so the probe and prepare can never disagree.
-  /// Same file set irrespective of order (both sides sorted, byte-exact compare).
+  /// Same file set irrespective of order (both sides sorted, byte-exact compare), reading
+  /// the same byte ranges of each file: @p ranges is parallel to @p files, as
+  /// @c resolved_file_ranges. A whole-file pin never serves a byte-range scan, nor
+  /// the reverse: one would read rows the other does not.
   /// False for duckdb entries (empty resolved_file_paths) and for an empty @p files.
-  [[nodiscard]] bool matches_parquet_files(std::span<std::string const> files) const;
+  [[nodiscard]] bool matches_parquet_files(std::span<std::string const> files,
+                                           std::span<byte_ranges const> ranges) const;
 
   /// Column-superset gather over @p requested_ids (requested order): for each
   /// requested column, its position within the cached @c column_ids. Empty
@@ -815,14 +826,14 @@ class sirius_scan_manager {
     std::string_view table_name,
     sirius::duckdb_table_identity const& table_identity) const;
 
-  /// The pinned entry whose parquet identity matches @p resolved_file_paths
-  /// (cache_entry_info::matches_parquet_files), or nullptr. OWNING: the returned
-  /// shared_ptr keeps the entry alive while the plan-time residency gate reads
-  /// it, even if another connection concurrently unpins it. First match wins if
-  /// one file set was pinned under two names.
-  /// Read by the plan-time compressed-materialization residency gate.
+  /// The pinned entry whose parquet identity matches @p resolved_file_paths and
+  /// @p resolved_file_ranges (cache_entry_info::matches_parquet_files), or nullptr. OWNING: the
+  /// returned shared_ptr keeps the entry alive while the plan-time residency gate reads it, even if
+  /// another connection concurrently unpins it. First match wins if one file set was pinned under
+  /// two names. Read by the plan-time compressed-materialization residency gate.
   [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
-    std::span<std::string const> resolved_file_paths) const;
+    std::span<std::string const> resolved_file_paths,
+    std::span<cache_entry_info::byte_ranges const> resolved_file_ranges) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
 

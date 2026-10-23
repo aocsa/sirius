@@ -76,6 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/unsupported_optimizers.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -793,22 +794,23 @@ std::vector<std::size_t> resolve_pin_kept_indices(
 // cache_entry_info::from derives the column_ids-aligned names the gather needs.
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_pin_info(
   sirius::scan_manager::sirius_scan_manager& scan_mgr,
-  std::vector<std::string> const& file_paths,
+  sirius::planner::rank_file_share share,
   std::optional<std::vector<std::string>> const& cols,
   std::size_t batch_size,
   vector<LogicalType>& pinned_column_types)
 {
   using sirius::op::scan::parquet_ingestible_table_info;
-  auto desc = scan_mgr.describe_parquet(file_paths.front());
+  auto desc = scan_mgr.describe_parquet(share.files.front());
   std::vector<std::string> schema_names(desc.names.begin(), desc.names.end());
   auto keep            = resolve_pin_kept_indices(schema_names, cols);
   bool const is_subset = cols && !cols->empty();
 
-  auto info                 = std::make_unique<parquet_ingestible_table_info>();
-  info->resolved_file_paths = file_paths;
-  info->bound_types         = desc.return_types;
-  info->returned_types      = sirius::from_duckdb_vec(desc.return_types);  // full schema
-  info->names               = desc.names;                                  // full schema
+  auto info                  = std::make_unique<parquet_ingestible_table_info>();
+  info->resolved_file_paths  = std::move(share.files);
+  info->resolved_file_ranges = std::move(share.ranges);
+  info->bound_types          = desc.return_types;
+  info->returned_types       = sirius::from_duckdb_vec(desc.return_types);  // full schema
+  info->names                = desc.names;                                  // full schema
   for (auto idx : keep) {
     info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(idx)));
     // Pin-time DuckDB type of each pinned column, in column_ids (batch-column)
@@ -1189,15 +1191,22 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       if (file_paths.empty()) {
         throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
       }
+      // Distributed: each rank pins the share of the files its scans of them read, so the pin
+      // serves those scans (cache_entry_info matches files and byte ranges) and the ranks
+      // together hold the table once.
+      auto const share_options = duckdb::query_operator_options(context);
+      auto share               = sirius::planner::file_share_for_rank(
+        std::move(file_paths), share_options->exchange_rank, share_options->exchange_peers.size());
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
       // it creates lives in the IO cache and the ordinary scan path finds it by
       // path and offset. Everything below this point is the decode-and-place
       // machinery the other two tiers need, so this returns rather than falls
-      // through it.
+      // through it. A rank pins every file it reads part of, whole: a file split
+      // between two ranks is pinned by both.
       if (data.args.tier == "parquet") {
-        scan_mgr.pin_parquet_ranges(data.args.name, file_paths, data.args.cols);
+        scan_mgr.pin_parquet_ranges(data.args.name, share.files, data.args.cols);
         window.finish();
         output.SetCardinality(1);
         output.SetValue(0, 0, Value::BOOLEAN(true));
@@ -1206,7 +1215,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       }
 
       auto info = build_parquet_pin_info(
-        scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
+        scan_mgr, std::move(share), data.args.cols, batch_size, pinned_column_types);
       ingestible = sirius::op::scan::make_ingestible(std::move(info));
     }
 

@@ -321,11 +321,15 @@ Each pinned table is a `pinned_entry` keyed by name in the scan manager. It hold
 narrowing marker. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk
 min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
 
-`cache_entry_info` captures format identity — the resolved parquet **file set**, or the DuckDB
+`cache_entry_info` captures format identity — the resolved parquet **file set and the byte ranges
+read of each file**, or the DuckDB
 **catalog.schema.table plus the table's catalog object id and row-group collection identity** — plus the cached columns (by storage
 index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry
 can serve a scan: same format, same identity, and a **column superset** of the scan's request. A
-Parquet pin never serves a DuckDB scan or vice versa. DuckDB cache serving additionally requires
+Parquet pin never serves a DuckDB scan or vice versa. A whole-file pin never serves a byte-range
+scan, nor the reverse. In distributed execution each rank pins its own share of the files
+(`planner::file_share_for_rank`, the split its scans of them read), so the ranks together hold the
+table once and each rank's pin serves that rank's scans. DuckDB cache serving additionally requires
 every projected column's current native cuDF mapping to equal the mapping recorded at pin time; a
 mismatch is a clean cache miss rather than a conversion of stale data under a new type.
 

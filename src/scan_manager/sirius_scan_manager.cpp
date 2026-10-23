@@ -2629,8 +2629,9 @@ cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& i
     // resolved) path.
     ci.resolved_file_paths = p->resolved_file_paths;
     op::scan::canonicalize_scan_file_paths(ci.resolved_file_paths);
-    ci.column_ids = p->column_ids;
-    ci.names      = aligned_column_names(p->names, p->column_ids);
+    ci.resolved_file_ranges = p->resolved_file_ranges;
+    ci.column_ids           = p->column_ids;
+    ci.names                = aligned_column_names(p->names, p->column_ids);
   } else if (auto const* d =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
     ci.catalog_name   = d->catalog_name;
@@ -2666,7 +2667,7 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     // Cached parquet batches have no per-row file provenance.
     if (p->has_requested_user_virtual_columns()) { return {}; }
-    if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
+    if (!matches_parquet_files(p->resolved_file_paths, p->resolved_file_ranges)) { return {}; }
     return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
@@ -2708,10 +2709,38 @@ bool cache_entry_info::same_source_as(const cache_entry_info& other) const
       other.catalog_name, other.schema_name, other.table_name, other.table_identity);
   }
   // Reuse the canonical parquet identity matcher. Empty file sets do not match.
-  return matches_parquet_files(other.resolved_file_paths);
+  return matches_parquet_files(other.resolved_file_paths, other.resolved_file_ranges);
 }
 
-bool cache_entry_info::matches_parquet_files(std::span<std::string const> files) const
+namespace {
+
+// One file of a parquet identity: its path and the byte ranges read of it, sorted, with a
+// whole-file read as no ranges.
+using file_read = std::pair<std::string, cache_entry_info::byte_ranges>;
+
+std::vector<file_read> file_reads(std::vector<std::string> files,
+                                  std::span<cache_entry_info::byte_ranges const> ranges)
+{
+  std::vector<file_read> reads;
+  reads.reserve(files.size());
+  for (std::size_t i = 0; i < files.size(); ++i) {
+    cache_entry_info::byte_ranges r;
+    if (i < ranges.size() &&
+        std::ranges::none_of(
+          ranges[i], [](auto const& range) { return range.first == 0 && range.second == 0; })) {
+      r = ranges[i];
+      std::ranges::sort(r);
+    }
+    reads.emplace_back(std::move(files[i]), std::move(r));
+  }
+  std::ranges::sort(reads);
+  return reads;
+}
+
+}  // namespace
+
+bool cache_entry_info::matches_parquet_files(std::span<std::string const> files,
+                                             std::span<byte_ranges const> ranges) const
 {
   if (files.empty() || resolved_file_paths.empty()) { return false; }
   if (files.size() != resolved_file_paths.size()) { return false; }
@@ -2720,12 +2749,10 @@ bool cache_entry_info::matches_parquet_files(std::span<std::string const> files)
   // canonicalize the comparison copy to match. Every parquet identity check —
   // the serve-time cache-hit match and the plan-time residency-gate probe —
   // routes through here, so both see the same identity.
-  auto these_files = resolved_file_paths;
   std::vector<std::string> those_files{files.begin(), files.end()};
   op::scan::canonicalize_scan_file_paths(those_files);
-  std::ranges::sort(these_files);
-  std::ranges::sort(those_files);
-  return these_files == those_files;
+  return file_reads(resolved_file_paths, resolved_file_ranges) ==
+         file_reads(std::move(those_files), ranges);
 }
 
 std::vector<std::size_t> cache_entry_info::column_projection_for(
@@ -3469,11 +3496,14 @@ std::optional<std::string> sirius_scan_manager::pinned_entry_name_for_superseded
 }
 
 std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_parquet_files(
-  std::span<std::string const> resolved_file_paths) const
+  std::span<std::string const> resolved_file_paths,
+  std::span<cache_entry_info::byte_ranges const> resolved_file_ranges) const
 {
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
-    if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { return entry; }
+    if (entry->cache_info.matches_parquet_files(resolved_file_paths, resolved_file_ranges)) {
+      return entry;
+    }
   }
   return nullptr;
 }
