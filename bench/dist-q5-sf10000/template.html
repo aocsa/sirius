@@ -1,0 +1,269 @@
+<title>Q5 Distributed Profile</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,600&display=swap">
+<style>
+/* Layout: one reading column. The plan figure and the two per-rank timelines carry the argument. */
+:root{
+  --bg:#f6f7f5; --panel:#ffffff; --fg:#1b2420; --muted:#5b6a63; --rule:#d9e0dc;
+  --accent:#2f7d5b; --accent-soft:#e3f1ea; --scan:#3f6fb0; --scan-soft:#e2ebf7; --orders:#6a8fc4;
+  --join:#2f7d5b; --dim:#9aa8a1; --tail:#a5640c; --wait:#a5640c; --wait-soft:#fbf0de; --on-bar:#ffffff;
+  --code-bg:#eef2f0;
+  --display:"Fraunces",Georgia,serif; --body:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#121816; --panel:#1a2220; --fg:#e3ebe7; --muted:#9aaba3; --rule:#2c3833;
+  --accent:#6cc79c; --accent-soft:#1c3329; --scan:#7aa7e6; --scan-soft:#1d2a3d; --orders:#adc6ea;
+  --join:#6cc79c; --dim:#71827a; --tail:#e3a54d; --wait:#e3a54d; --wait-soft:#382a16; --on-bar:#0f1714;
+  --code-bg:#202a27; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#121816; --panel:#1a2220; --fg:#e3ebe7; --muted:#9aaba3; --rule:#2c3833;
+  --accent:#6cc79c; --accent-soft:#1c3329; --scan:#7aa7e6; --scan-soft:#1d2a3d; --orders:#adc6ea;
+  --join:#6cc79c; --dim:#71827a; --tail:#e3a54d; --wait:#e3a54d; --wait-soft:#382a16; --on-bar:#0f1714;
+  --code-bg:#202a27; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:15px;line-height:1.6}
+.wrap{max-width:940px;margin:0 auto;padding-block:32px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:grid;gap:28px}
+h1{font-family:var(--display);font-size:2rem;line-height:1.15;margin:0;text-wrap:balance}
+h2{font-family:var(--display);font-size:1.35rem;margin:0 0 10px;text-wrap:balance}
+h3{font-size:1rem;margin:14px 0 6px}
+p,li{max-width:72ch}
+p{margin:0 0 10px}
+ul,ol{margin:0 0 10px;padding-left:22px}
+li{margin:4px 0}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.lede{color:var(--muted);font-size:1.02rem}
+code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+pre{font-family:var(--mono);font-size:.82rem;background:var(--code-bg);padding:12px 14px;border-radius:6px;overflow-x:auto;margin:6px 0 12px;line-height:1.5}
+section{min-width:0}
+.box{background:var(--panel);border:1px solid var(--rule);border-radius:8px;padding:16px 18px}
+.tablebox{overflow-x:auto;border:1px solid var(--rule);border-radius:8px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:.86rem;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-weight:600;color:var(--muted);font-size:.74rem;letter-spacing:.04em;text-transform:uppercase}
+tr:last-child td{border-bottom:none}
+td.num{text-align:right;font-family:var(--mono);white-space:nowrap}
+tr.best td{background:var(--accent-soft)}
+figure{margin:0;background:var(--panel);border:1px solid var(--rule);border-radius:8px;padding:14px 14px 10px}
+.svgbox{overflow-x:auto}
+figure svg{display:block;max-width:100%;height:auto;min-width:640px;color:var(--fg)}
+figcaption{color:var(--muted);font-size:.88rem;margin-top:8px}
+.frag{background:var(--panel);border:1px solid var(--rule);border-radius:8px;padding:14px 16px;display:grid;gap:8px;min-width:0}
+.frag h3{margin:0}
+.frag .sub{color:var(--muted);font-size:.86rem;margin:0}
+.pipe{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-family:var(--mono);font-size:.78rem}
+.pipe .pid{color:var(--muted);width:2.4rem;flex:none}
+.pipe .t{color:var(--muted);font-family:var(--body);font-size:.76rem}
+.op{padding:2px 8px;border-radius:5px;border:1px solid var(--rule);background:var(--bg);white-space:nowrap}
+.op.src{border-color:var(--scan);color:var(--scan)}
+.op.sink{border-color:var(--join);color:var(--join)}
+.op.hot{border-color:var(--wait);background:var(--wait-soft)}
+.pipe .arrow{color:var(--muted)}
+.note{font-family:var(--body);font-size:.78rem;color:var(--wait)}
+.overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.ov{border:1px solid var(--rule);border-radius:8px;padding:10px 12px;background:var(--panel);min-width:0}
+.ov b{display:block}
+.ov span{color:var(--muted);font-size:.85rem}
+.muted{color:var(--muted)}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">TPC-H q5 · SF10000 · 4 ranks, one GB200 each · dist-plan-opt 59d40bdc + affinity fix · 2026-10-23</div>
+  <h1>Where distributed Sirius spends q5's three seconds</h1>
+  <p class="lede">Four Sirius processes, one per GPU, each scan a quarter of the files and exchange batches over NIXL. With the data held in Sirius's pinned host cache, q5 runs in {{WARM_EXEC}} s. The lineitem scan, with its runtime filter and its shuffle on the order key, takes {{LI_SHARE}}% of that. The first run takes 109 s because it reads the data from one local NVMe drive.</p>
+</header>
+
+<section>
+  <h2>The run</h2>
+  <p>The same build ran the same query text three ways. Each run is one process per rank running the query three times: the first is cold, the best of the other two is warm.</p>
+  <div class="tablebox"><table>
+    <tr><th>Data served from</th><th>Settings</th><th>Cold</th><th>Warm</th></tr>
+    <tr><td>GPFS <code>/scratch</code>, O_DIRECT</td><td>cache none, 250 GiB host per rank</td><td class="num">136.3 s</td><td class="num">35.9 s</td></tr>
+    <tr><td>Linux page cache: local copy, read once with <code>cat</code></td><td>cache os, 120 GiB host per rank</td><td class="num">8.7 s</td><td class="num">7.1 s</td></tr>
+    <tr class="best"><td>Sirius pinned host cache: local copy, O_DIRECT from NVMe</td><td>cache sirius (LRU), 200 GiB host per rank</td><td class="num">108.9 s</td><td class="num">3.08 s</td></tr>
+  </table></div>
+  <ul>
+    <li><b>Data.</b> The local copy holds only the columns q5 reads: 502 GB, made with the CI generator's settings. The <code>/scratch</code> files store the join keys wider, so q5 reads 1.22 TB there.</li>
+    <li><b>Answer.</b> All three runs return the same 5 rows (RUSSIA first, 529,165,993,241.55), the same on every iteration.</li>
+    <li><b>This page</b> profiles the pinned-cache run: the Quent telemetry of its third iteration (warm, {{WARM_EXEC}} s executing) and of its first (cold).</li>
+  </ul>
+</section>
+
+<section>
+  <h2>The query</h2>
+  <pre>SELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue
+FROM orders, lineitem, supplier, nation, region, customer
+WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey
+  AND l_suppkey = s_suppkey AND c_nationkey = s_nationkey
+  AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey
+  AND r_name = 'EUROPE'
+  AND o_orderdate &gt;= date '1997-01-01' AND o_orderdate &lt; date '1998-01-01'
+GROUP BY n_name
+ORDER BY revenue DESC;</pre>
+  <p>At SF10000, lineitem has 60 billion rows and orders 15 billion. One year of orders is about a seventh of them, and EUROPE is one region in five.</p>
+</section>
+
+<section>
+  <h2>General view</h2>
+  <p>Every rank runs the same 47 pipelines on its own share of the files. The plan moves data between ranks in three ways, and DuckDB's join order puts lineitem last.</p>
+  <div class="overview">
+    <div class="ov"><b>Broadcast</b><span>A build side under 1 GiB goes to every rank, and the probe side stays where it was read: region, nation ⋈ region, and supplier.</span></div>
+    <div class="ov"><b>Hash shuffle</b><span>Larger joins hash both sides on the join key across the 4 ranks: customer and orders on the customer key, then the orders result and lineitem on the order key.</span></div>
+    <div class="ov"><b>Gather</b><span>Partial groups shuffle on <code>n_name</code>, a range exchange sorts them, and rank 0 collects the 5 rows.</span></div>
+  </div>
+  <h3>The plan</h3>
+  <figure>
+    <div class="svgbox">
+    <svg viewBox="0 0 950 500" role="img" aria-label="q5 plan: region and nation join, then customer, orders, lineitem and supplier join in a chain; then group by, sort and gather to rank 0.">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+      </defs>
+      <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="12">
+        <!-- scans -->
+        <g>
+          <rect x="10" y="16" width="200" height="44" rx="6" fill="var(--scan-soft)" stroke="var(--scan)"/>
+          <text x="22" y="34" font-weight="600" fill="currentColor">region</text>
+          <text x="22" y="51" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">r_name = 'EUROPE' · broadcast</text>
+          <rect x="10" y="76" width="200" height="44" rx="6" fill="var(--scan-soft)" stroke="var(--scan)"/>
+          <text x="22" y="94" font-weight="600" fill="currentColor">nation</text>
+          <text x="22" y="111" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">runtime filter ← J1</text>
+          <rect x="10" y="146" width="200" height="44" rx="6" fill="var(--scan-soft)" stroke="var(--scan)"/>
+          <text x="22" y="164" font-weight="600" fill="currentColor">customer</text>
+          <text x="22" y="181" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">runtime filter ← J2</text>
+          <rect x="10" y="216" width="200" height="44" rx="6" fill="var(--scan-soft)" stroke="var(--scan)"/>
+          <text x="22" y="234" font-weight="600" fill="currentColor">orders · 13 tasks per rank</text>
+          <text x="22" y="251" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">1997, Bloom · hash custkey</text>
+          <rect x="10" y="286" width="200" height="44" rx="6" fill="var(--wait-soft)" stroke="var(--wait)"/>
+          <text x="22" y="304" font-weight="600" fill="currentColor">lineitem · 88 tasks per rank</text>
+          <text x="22" y="321" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">Bloom ← J3 · hash orderkey</text>
+          <rect x="10" y="372" width="200" height="44" rx="6" fill="var(--scan-soft)" stroke="var(--scan)"/>
+          <text x="22" y="390" font-weight="600" fill="currentColor">supplier</text>
+          <text x="22" y="407" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">broadcast to every rank</text>
+        </g>
+        <!-- joins -->
+        <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+          <rect x="255" y="42" width="150" height="52" rx="6" fill="var(--accent-soft)" stroke="var(--join)"/>
+          <text x="265" y="59" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">J1 nation ⋈ region</text>
+          <text x="265" y="74">on n_regionkey</text>
+          <text x="265" y="88">out: broadcast</text>
+          <rect x="430" y="112" width="150" height="52" rx="6" fill="var(--accent-soft)" stroke="var(--join)"/>
+          <text x="440" y="129" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">J2 customer ⋈ J1</text>
+          <text x="440" y="144">on c_nationkey</text>
+          <text x="440" y="158">out: hash custkey</text>
+          <rect x="605" y="186" width="150" height="52" rx="6" fill="var(--accent-soft)" stroke="var(--join)"/>
+          <text x="615" y="203" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">J3 orders ⋈ J2</text>
+          <text x="615" y="218">on o_custkey</text>
+          <text x="615" y="232">out: hash orderkey</text>
+          <rect x="780" y="260" width="150" height="52" rx="6" fill="var(--accent-soft)" stroke="var(--join)"/>
+          <text x="790" y="277" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">J4 lineitem ⋈ J3</text>
+          <text x="790" y="292">on l_orderkey</text>
+          <text x="790" y="306">3 partitions per rank</text>
+          <rect x="780" y="368" width="150" height="52" rx="6" fill="var(--accent-soft)" stroke="var(--join)"/>
+          <text x="790" y="385" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">J5 J4 ⋈ supplier</text>
+          <text x="790" y="400">suppkey, nationkey</text>
+          <text x="790" y="414">+ partial GROUP BY</text>
+        </g>
+        <!-- final stage -->
+        <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+          <rect x="780" y="440" width="150" height="48" rx="6" fill="var(--panel)" stroke="currentColor"/>
+          <text x="790" y="459" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">MERGE_GROUP_BY</text>
+          <text x="790" y="477">after hash n_name</text>
+          <rect x="500" y="440" width="240" height="48" rx="6" fill="var(--panel)" stroke="currentColor"/>
+          <text x="510" y="459" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">ORDER BY revenue DESC</text>
+          <text x="510" y="477">sample, range exchange, merge</text>
+          <rect x="255" y="440" width="200" height="48" rx="6" fill="var(--panel)" stroke="currentColor"/>
+          <text x="265" y="459" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">Gather to rank 0</text>
+          <text x="265" y="477">RESULT_COLLECTOR · 5 rows</text>
+        </g>
+        <!-- edges -->
+        <g stroke="currentColor" stroke-width="1.4" fill="none">
+          <polyline points="210,38 228,38 228,58 253,58" marker-end="url(#ar)"/>
+          <polyline points="210,98 236,98 236,78 253,78" marker-end="url(#ar)"/>
+          <polyline points="405,68 414,68 414,128 428,128" marker-end="url(#ar)"/>
+          <polyline points="210,168 420,168 420,148 428,148" marker-end="url(#ar)"/>
+          <polyline points="580,138 590,138 590,202 603,202" marker-end="url(#ar)"/>
+          <polyline points="210,238 596,238 596,222 603,222" marker-end="url(#ar)"/>
+          <polyline points="755,212 765,212 765,276 778,276" marker-end="url(#ar)"/>
+          <polyline points="210,308 771,308 771,296 778,296" marker-end="url(#ar)"/>
+          <line x1="855" y1="312" x2="855" y2="366" marker-end="url(#ar)"/>
+          <line x1="210" y1="394" x2="778" y2="394" marker-end="url(#ar)"/>
+          <line x1="855" y1="420" x2="855" y2="438" marker-end="url(#ar)"/>
+          <line x1="780" y1="464" x2="742" y2="464" marker-end="url(#ar)"/>
+          <line x1="500" y1="464" x2="457" y2="464" marker-end="url(#ar)"/>
+        </g>
+      </g>
+    </svg>
+    </div>
+    <figcaption>Join order from DuckDB's EXPLAIN of the same query over the same files. The exchange on each edge is read from the pipelines Sirius built (pipelines P0 to P46 below). The shaded scan is the one that sets the warm time.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Pipelines, stage by stage</h2>
+  <ul>
+    <li><b>Timings</b> are rank 0's, in the warm iteration: first task created to last task finished, in seconds from the start of execution, with the number of tasks.</li>
+    <li><b>Shading</b> marks the pipelines that set the warm time.</li>
+    <li><b>Table names</b> come from DuckDB's join order. The telemetry labels pipelines by operator only.</li>
+  </ul>
+  <div style="display:grid;gap:14px">
+    <div class="frag">
+      <h3>Small tables · 0 to 0.12 s</h3>
+      <p class="sub">Supplier, region and the nation ⋈ region result are broadcast. Customer is read where it lies and filtered by the nation keys before it joins.</p>
+      {{STAGE_DIMS}}
+    </div>
+    <div class="frag">
+      <h3>Orders · 0.12 to 0.70 s ({{ORD_SHARE}}% of the query)</h3>
+      <p class="sub">Each rank reads its quarter of orders in 13 tasks, keeps 1997 and the customer keys J2 produced, and shuffles the rest on the customer key for J3.</p>
+      {{STAGE_ORDERS}}
+    </div>
+    <div class="frag">
+      <h3>Lineitem · 0.70 to 2.77 s ({{LI_SHARE}}% of the query)</h3>
+      <p class="sub">Each rank reads its quarter of lineitem, about 15 billion rows, in 88 tasks from the pinned cache. A Bloom filter built from J3's order keys drops most rows on the GPU, and the rest is shuffled on the order key. Each rank's exchange source takes in 352 batches.</p>
+      {{STAGE_LI}}
+    </div>
+    <div class="frag">
+      <h3>Joins, aggregate and result · 2.77 to 3.05 s</h3>
+      <p class="sub">J4 and J5 run partition by partition (3 per rank), then a partial GROUP BY. The groups shuffle on <code>n_name</code>, are merged, sorted by a range exchange, and gathered on rank 0.</p>
+      {{STAGE_TAIL}}
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Warm iteration, per rank</h2>
+  <figure>
+    <div class="svgbox">{{WARM_SVG}}</div>
+    <figcaption>From each rank's Quent telemetry, third iteration. Each bar runs from the first task of one stage to the first task of the next. Ranks 2 and 3 can't be told apart from the telemetry, so they are labelled a and b.</figcaption>
+  </figure>
+  <div style="margin-top:12px">{{WARM_TABLE}}</div>
+  <ul style="margin-top:12px">
+    <li><b>The ranks stay together.</b> Each stage starts within 0.08 s across ranks, and the four finish within 0.01 s. The byte-range split gives each rank the same amount of work.</li>
+    <li><b>The lineitem scan runs about 4 tasks at a time.</b> Its 88 tasks add up to 7.8 to 8.2 s of task time per rank, inside about 2 s.</li>
+    <li><b>The cache serves almost everything.</b> In each warm iteration a rank reads about 128,550 chunks from the cache and misses 0 or 1. The cache evicts nothing.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Cold iteration, per rank</h2>
+  <figure>
+    <div class="svgbox">{{COLD_SVG}}</div>
+    <figcaption>First iteration of the same run. All four ranks read their share from the same NVMe drive with O_DIRECT. Each chunk they read lands in the pinned cache.</figcaption>
+  </figure>
+  <div style="margin-top:12px">{{COLD_TABLE}}</div>
+  <ul style="margin-top:12px">
+    <li><b>The drive sets the cold time.</b> Orders (90 GB) takes 16 to 18 s and lineitem (448 GB) 84 to 89 s, about 5 GB/s for the four ranks together. Once the last lineitem batch arrives, the joins and the result take about 0.1 s.</li>
+    <li><b>The first rank to finish waits.</b> Lineitem scans end between 104.0 and 108.8 s, and J4 needs every rank's batches, so the rank that finishes first waits about 5 s.</li>
+    <li><b>Each rank caches about 128,450 chunks.</b> That is its quarter of the 502 GB copy, and it fits in the 200 GiB host pool without evictions.</li>
+  </ul>
+</section>
+
+<section class="box">
+  <h2>What to look at next</h2>
+  <ul>
+    <li><b>Lineitem's shuffle.</b> Every rank sends three quarters of its filtered lineitem to the other ranks so J4 can join on the order key. Broadcasting J3's result instead would keep lineitem local. Whether that is cheaper depends on the size of J3's output, which these runs did not record.</li>
+    <li><b>Scan concurrency.</b> About 4 lineitem tasks ran at once on each GPU. A run with more pipeline threads would show whether the scan is limited by threads or by the GPU.</li>
+    <li><b>Cold reads.</b> Cold runs read from one NVMe drive at about 5 GB/s. GPFS reached 34 to 36 GB/s on this build. Filling the pinned cache from GPFS instead is the next thing to measure.</li>
+  </ul>
+</section>
+
+<p class="muted">Sources: run <code>/tmp/aocsa/tpch22/dpo/sf10k-cached/q05_pinned_std</code> (config <code>pinned.yaml</code>), its four telemetry directories under <code>telemetry_data/01a168fb-*</code> from 13:38 UTC, the scan manager's cache summaries in its log, and the comparison runs <code>q05_std</code> (page cache) and <code>dpo/sf10k/run-fix-orig/q05</code> (GPFS). Build: <code>/tmp/aocsa/wt/dist-plan-opt</code> at 59d40bdc plus the thread-affinity fix (now commit 432a7c88).</p>
+</div>
