@@ -21,6 +21,7 @@
 #include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "op/sirius_physical_exchange_sink.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -295,8 +296,15 @@ std::unique_ptr<operator_data> sirius_physical_exchange_source::get_next_task_in
   }
   if (empty_on != nullptr) {
     rmm::cuda_set_device_raii const device{rmm::cuda_device_id{empty_on->get_device_id()}};
-    auto empty = has_physical_overrides() ? make_empty_table(get_physical_types())
-                                          : make_empty_table(get_types());
+    // Shaped like what this rank's own sink on the stream was given, which can differ from the
+    // declared types; the types only when that sink saw nothing.
+    auto const* sink =
+      children.empty() ? nullptr : dynamic_cast<sirius_physical_exchange_sink*>(children[0].get());
+    auto empty = sink != nullptr ? sink->empty_like_input() : nullptr;
+    if (!empty) {
+      empty = has_physical_overrides() ? make_empty_table(get_physical_types())
+                                       : make_empty_table(get_types());
+    }
     batches.push_back(
       make_data_batch(std::move(empty), *empty_on, cudf::get_default_stream(), batch_telemetry()));
   }
