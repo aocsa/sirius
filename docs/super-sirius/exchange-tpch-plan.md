@@ -68,13 +68,13 @@ host memory on first use: about 9 s on rank 0, mostly in Q21 (2.8 s), Q9 (2.5 s)
   That forces the first spills. Lowering the factor to 3 made the total no better (73.9 s vs
   72.8 s): Q9 and Q7 improved, while Q13 and Q18 got worse. A real fix needs the decoded size per
   split from the Parquet metadata.
-- **Bloom filter size is not the limit.** The 256 MiB per-GPU Bloom cap only applies to
-  multi-partition accumulation, which distributed mode does not use. The time left is mostly
+- **Bloom filter size is not the limit.** The 256 MiB per-GPU Bloom cap only applied to
+  multi-partition accumulation, which distributed mode did not use then. The time left is mostly
   scan and decode.
 
 Still open:
 - RIGHT_SEMI and RIGHT_ANTI joins get no dynamic filters in distributed mode: their early
-  publication needs the multi-partition accumulator, which is off there.
+  publication needs a BUILD_FILTER stage, which distributed mode does not plan.
 - Filtering a join's build side by its probe keys (semi-join reduction) is not supported.
 
 ## Status: all 22 correct on 2 ranks
