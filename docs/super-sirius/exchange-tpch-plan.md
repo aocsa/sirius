@@ -5,40 +5,44 @@ host. Every query ran in its own process, 1 GPU and 2 ranks, and its answer was 
 DuckDB's CPU answer at SF1 (numbers within 1e-9 relative). At SF1000 the 2-rank answer was compared
 to the 1-GPU answer.
 
-## Status: F1-F4 done, 14 of 22
+## Status: all 22 correct on 2 ranks
 
-F1-F4 are on branch `exchange-operator-v3`. With them, 14 queries are correct on 2 ranks:
-Q1, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q12, Q14, Q18, Q19, Q21. That is exactly the set predicted
-below.
+F1-F8 are on branch `exchange-operator-v3`, with two fixes cherry-picked from
+`exchange-operator-v2` (`d325fb6e`, `1dc8fc35`) and one more found at SF1000 (below).
 
-- **SF1:** all 14 match DuckDB's CPU answers, and every 1-GPU run is still correct.
-- **SF1000:** all 14 match the 1-GPU answers.
-- **Still refused:** the remaining 8 fail on the operators predicted for them:
-  - CTE: Q2, Q15, Q17, Q20, Q22
-  - NESTED_LOOP_JOIN: Q11
-  - DENSE_COUNT_JOIN: Q13
-  - COUNT(DISTINCT): Q16
-- **F4 (Bloom-merge stall) is fixed.** At SF1, Q7 went from 242 s to 1.6 s and Q21 from 122 s
-  to 1.7 s. No merge timed out at SF1 or SF1000, and the filters are still merged and pushed.
+- **SF1:** all 22 match DuckDB's CPU answers on 2 ranks, and every 1-GPU run is still correct.
+- **SF1000:** all 22 on 2 ranks match the 1-GPU answers.
+- **No Bloom merge timed out** at either scale.
+- **Found at SF1000:** a rank whose stream brought nothing handed nothing on, while local
+  producers always hand on at least an empty batch.
+  - Q15 hung 600 s: its one result row hashed to rank 0, so rank 1's last join got no probe
+    batch and never released its build.
+  - Q11 failed: no rank had rows, so the range exchange had no boundaries.
+  - Fixed: an exchange source with senders now hands on one empty batch, and the sink skips
+    batches with no rows.
 
-SF1000, one run per process (the first, so it includes reading the data). Not a benchmark:
+SF1000, one run per process (the first, so it includes reading the data). Not a benchmark.
+Totals: **1 GPU 138.8 s, 2 GPUs 104.5 s**.
 
 | Query | 1 GPU | 2 GPUs | | Query | 1 GPU | 2 GPUs |
 |---|---|---|---|---|---|---|
-| Q1 | 7.7 s | 5.6 s | | Q10 | 8.1 s | 7.0 s |
-| Q3 | 25.5 s | 3.5 s | | Q12 | 4.8 s | 3.5 s |
-| Q4 | 4.1 s | 3.7 s | | Q14 | 4.5 s | 3.1 s |
-| Q5 | 3.8 s | 3.7 s | | Q18 | 12.5 s | 5.6 s |
-| Q6 | 2.5 s | 2.7 s | | Q19 | 6.6 s | 4.4 s |
-| Q7 | 5.5 s | 4.4 s | | Q21 | 9.5 s | **19.6 s** |
-| Q8 | 4.8 s | 4.2 s | | | | |
-| Q9 | 10.2 s | 7.6 s | | | | |
+| Q1 | 7.6 s | 6.3 s | | Q12 | 4.8 s | 4.0 s |
+| Q2 | 1.0 s | 2.1 s | | Q13 | 8.6 s | 5.0 s |
+| Q3 | 26.1 s | 3.6 s | | Q14 | 4.5 s | 3.2 s |
+| Q4 | 4.2 s | 3.8 s | | Q15 | 3.1 s | 3.2 s |
+| Q5 | 4.5 s | 3.6 s | | Q16 | 1.4 s | 2.4 s |
+| Q6 | 3.0 s | 2.8 s | | Q17 | 3.9 s | 3.9 s |
+| Q7 | 5.5 s | 4.5 s | | Q18 | 13.0 s | 5.7 s |
+| Q8 | 5.5 s | 4.1 s | | Q19 | 6.6 s | 4.8 s |
+| Q9 | 10.6 s | 8.4 s | | Q20 | 3.6 s | 3.5 s |
+| Q10 | 8.8 s | 7.5 s | | Q21 | 10.1 s | 18.0 s |
+| Q11 | 1.1 s | 1.9 s | | Q22 | 1.4 s | 2.0 s |
 
 - **Q21 is slower on 2 GPUs.** It runs the CTE plan from F3; the 1-GPU run uses the delim-join
-  plan. Its rank-0 log has 33 lines about spilling or downgrading, against 7 on 1 GPU. F9 is the
-  fix.
-- **Q3's 25.5 s on 1 GPU is unexplained.** It needs a repeat run before anyone reads anything
-  into it.
+  plan. F9 is the fix.
+- **Q2, Q6, Q11, Q16 and Q22 are slower on 2 GPUs.** They take 1-3 s, and the exchange setup
+  and extra pipelines cost more than the work they split.
+- **Q3 takes 26 s on 1 GPU in both runs, against 3.6 s on 2.** This is not yet explained.
 
 ## Before the fixes
 
