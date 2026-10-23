@@ -97,6 +97,8 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> slices;
   std::vector<std::size_t> ranks;
   for (std::size_t b = 0; b < handles.size(); ++b) {
+    // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
+    if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
     auto routed = route(batches[b], handles[b], stream);
     for (exchange::rank_t r = 0; r < routed.size(); ++r) {
       if (!routed[r] || get_cudf_table_view(*routed[r]).num_rows() == 0) { continue; }
