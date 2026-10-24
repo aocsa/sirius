@@ -1253,16 +1253,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         host_space_by_gpu[gpu_id] = picked;
       }
     }
-    // Experimental (SIRIUS_EXP_SORTED_PIN_FILES=1): GlobFiles returns local files in directory
-    // order, and pinned chunks pack several files each, so a table stored sorted across numbered
-    // files (part.0, part.1, ...) pins into chunks whose rows are not in order. A natural sort,
-    // comparing digit runs numerically, keeps such tables sorted within and across chunks.
-    if (char const* sorted_env = std::getenv("SIRIUS_EXP_SORTED_PIN_FILES");
-        sorted_env != nullptr && std::string_view{sorted_env} == "1") {
-      std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
-        return sirius::natural_less(lhs, rhs);
-      });
-    }
 
     auto& scan_mgr               = sirius_ctx->get_scan_manager();
     std::size_t const batch_size = duckdb::query_operator_options(context)->scan_task_batch_size;
@@ -2998,9 +2988,7 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
 
 static void SetEnableProbeAccumulate(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                       = lock_operator_params_slot(context);
+  auto* params                    = get_operator_params(context, scope);
   params->enable_probe_accumulate = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_PROBE_ACCUMULATE to {}", params->enable_probe_accumulate);
 }
