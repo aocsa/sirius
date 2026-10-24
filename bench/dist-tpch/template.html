@@ -77,12 +77,12 @@ figcaption{color:var(--muted);font-size:.88rem;margin-top:8px}
   <p>The same build ran the same query text three ways. Each run is one process per rank running the query three times: the first is cold, the best of the other two is warm.</p>
   <div class="tablebox"><table>
     <tr><th>Data served from</th><th>Settings</th><th>Cold</th><th>Warm</th></tr>
-    <tr><td>GPFS <code>/scratch</code>, O_DIRECT</td><td>cache none, 250 GiB host per rank</td><td class="num">136.3 s</td><td class="num">35.9 s</td></tr>
+    <tr><td>The full dataset on GPFS, O_DIRECT</td><td>cache none, 250 GiB host per rank</td><td class="num">136.3 s</td><td class="num">35.9 s</td></tr>
     <tr><td>Linux page cache: local copy, read once with <code>cat</code></td><td>cache os, 120 GiB host per rank</td><td class="num">8.7 s</td><td class="num">7.1 s</td></tr>
     <tr class="best"><td>Sirius pinned host cache: local copy, O_DIRECT from NVMe</td><td>cache sirius (LRU), 200 GiB host per rank</td><td class="num">108.9 s</td><td class="num">3.08 s</td></tr>
   </table></div>
   <ul>
-    <li><b>Data.</b> The local copy holds only the columns q5 reads: 502 GB, made with the CI generator's settings. The <code>/scratch</code> files store the join keys wider, so q5 reads 1.22 TB there.</li>
+    <li><b>Data.</b> The local copy holds only the columns q5 reads: 502 GB, made with the CI generator's settings. The full dataset stores the join keys wider, so q5 reads 1.22 TB there.</li>
     <li><b>Answer.</b> All three runs return the same 5 rows (RUSSIA first, 529,165,993,241.55), the same on every iteration.</li>
     <li><b>This page</b> profiles the pinned-cache run: the Quent telemetry of its third iteration (warm, {{WARM_EXEC}} s executing) and of its first (cold).</li>
   </ul>
@@ -265,5 +265,5 @@ ORDER BY revenue DESC;</pre>
   </ul>
 </section>
 
-<p class="muted">Sources: run <code>/tmp/aocsa/tpch22/dpo/sf10k-cached/q05_pinned_std</code> (config <code>pinned.yaml</code>), its four telemetry directories under <code>telemetry_data/01a168fb-*</code> from 13:38 UTC, the scan manager's cache summaries in its log, and the comparison runs <code>q05_std</code> (page cache) and <code>dpo/sf10k/run-fix-orig/q05</code> (GPFS). Build: <code>/tmp/aocsa/wt/dist-plan-opt</code> at 59d40bdc plus the thread-affinity fix (now commit 432a7c88).</p>
+<p class="muted">Sources: each rank's Quent telemetry and output log, and the scan manager's cache summaries in the Sirius log, from the reference run in <code>bench/dist-tpch/README.md</code>.</p>
 </div>

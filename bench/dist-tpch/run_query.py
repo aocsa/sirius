@@ -2,22 +2,25 @@
 """Run one TPC-H query distributed on N ranks (one per GPU) and check its answer.
 
 usage: run_query.py Q --out DIR --config YAML (--data DIR | --table T=DIR[,DIR...] ...)
-                    [--std] [--iters 3] [--ranks 4] [--ref RANK0_LOG] [--pin-tier host|gpu|parquet]
+                    [--sf 10000] [--sql FILE] [--iters 3] [--ranks 4] [--host-pool 200Gi]
+                    [--ref RANK0_LOG] [--pin-tier host|gpu|parquet] [--tag NAME]
 
-- Creates views only for the tables query Q reads, over DIR/<table>/*.parquet.
+- Query Q's text is test/tpch_performance/queries.py's at --sf, or --sql FILE's.
+- Creates views only for the tables the query reads, over DIR/<table>/*.parquet.
 - Runs the query --iters times in one process per rank: the first run is cold, the best of the
   others is warm.
 - Answer checks: every iteration against the first, and against --ref (rank 0's log of an earlier
-  run of the same query text, e.g. from GPFS) when given.
+  run of the same query text, e.g. from the full dataset) when given.
 - Quent telemetry lands in DIR/telemetry_data (one directory per rank); see extract.py.
 - --pin-tier pins every table with pin_table before the runs (needs a build with rank-aware
-  pin_table; untested at the time of writing).
-Run it through pixi from the repo root: pixi run python bench/dist-q5-sf10000/run_query.py ...
+  pin_table). The result records each pin's time and how many scans were served from a pin.
+Run it through pixi from the repo root: pixi run python bench/dist-tpch/run_query.py ...
 """
 import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -54,9 +57,11 @@ def main():
         help="TABLE=DIR[,DIR...] (overrides --data)",
     )
     ap.add_argument(
-        "--std",
-        action="store_true",
-        help="Q5: the queries.py text, not q5_subquery.sql",
+        "--sf", type=int, default=10000, help="scale factor of the query text"
+    )
+    ap.add_argument("--sql", help="file with the query text to run instead of TPC-H Q")
+    ap.add_argument(
+        "--host-pool", help="override the config's host capacity_bytes, e.g. 200Gi"
     )
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--ranks", type=int, default=4)
@@ -67,6 +72,16 @@ def main():
         "--spill-dir", default=f"/tmp/{os.environ.get('USER', 'sirius')}/sirius-disk"
     )
     ap.add_argument("--pin-tier", choices=["host", "gpu", "parquet"])
+    ap.add_argument(
+        "--pin-plans",
+        help="Simpatico plan directory (<table>.txt): pin with compression; tables without a "
+        "plan pin uncompressed",
+    )
+    ap.add_argument(
+        "--pin-skip",
+        default="",
+        help="tables not to pin, e.g. nation,region",
+    )
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
@@ -74,7 +89,7 @@ def main():
         sys.exit(
             "a duckdb process is running: wait for it, or stop it, before benchmarking"
         )
-    tables = cols(a.q, a.std)
+    tables = cols(a.q, a.sf, a.sql)
     dirs = {t: a.data for t in tables} if a.data else {}
     dirs.update(dict(x.split("=", 1) for x in a.table))
     missing = [t for t in tables if not dirs.get(t)]
@@ -83,12 +98,18 @@ def main():
 
     os.makedirs(a.out, exist_ok=True)
     a.out = os.path.abspath(a.out)
-    name = f"q{a.q:02d}{'_std' if a.std else ''}{a.tag}"
+    stem = f"_{os.path.splitext(os.path.basename(a.sql))[0]}" if a.sql else ""
+    name = f"q{a.q:02d}{stem}{a.tag}"
     qout = f"{a.out}/{name}"
     os.makedirs(qout, exist_ok=True)
     os.makedirs(a.spill_dir, exist_ok=True)
     cfg = f"{qout}/sirius.yaml"
-    open(cfg, "w").write(open(a.config).read().replace("@SPILL_DIR@", a.spill_dir))
+    yaml = open(a.config).read().replace("@SPILL_DIR@", a.spill_dir)
+    if a.host_pool:
+        yaml = re.sub(
+            r"(host: \{ capacity_bytes: )[^ }]+", rf"\g<1>{a.host_pool}", yaml
+        )
+    open(cfg, "w").write(yaml)
 
     def globs(t):
         g = [f"'{d}/{t}/*.parquet'" for d in dirs[t].split(",")]
@@ -97,18 +118,27 @@ def main():
     lines = [
         f"create view {t} as select * from read_parquet({globs(t)});" for t in tables
     ]
+    if a.pin_tier and a.pin_plans:
+        # Before the timer, so parse() sees only the pins and the queries.
+        lines.append(
+            f"SET pin_table_input_compression_plan_dir = '{os.path.abspath(a.pin_plans)}';"
+        )
+    lines += [".mode csv", ".timer on"]
+    pin_tables = {}
     if a.pin_tier:
-        lines.append(".output /dev/null")
-        for t, cs in tables.items():
+        skip = set(a.pin_skip.split(",")) if a.pin_skip else set()
+        pin_tables = {t: cs for t, cs in tables.items() if t not in skip}
+        # Timed like the queries: parse() returns the pins first, one statement per table.
+        for t, cs in pin_tables.items():
             if "," in dirs[t]:
                 sys.exit(f"--pin-tier needs one directory per table; {t} has {dirs[t]}")
             col_list = ", ".join(f"'{c}'" for c in cs)
             lines.append(
                 f"CALL pin_table('{dirs[t]}/{t}/*.parquet', name = '{t}', "
-                f"tier = '{a.pin_tier}', cols = [{col_list}]);"
+                f"tier = '{a.pin_tier}', cols = [{col_list}]"
+                + (", compression = true);" if a.pin_plans else ");")
             )
-        lines.append(".output")
-    lines += [".mode csv", ".timer on"] + [text(a.q, a.std) + ";"] * a.iters
+    lines += [text(a.q, a.sf, a.sql) + ";"] * a.iters
     sqlf = f"{a.out}/{name}.sql"
     open(sqlf, "w").write("\n".join(lines) + "\n")
 
@@ -147,7 +177,15 @@ def main():
 
     log = f"{qout}/exchange_rank_0.log"
     runs = parse(open(log, errors="replace").read()) if os.path.exists(log) else []
+    npins = len(pin_tables)
+    pin_s = [r[2] for r in runs[:npins]]
+    runs = runs[npins:]
     times = [r[2] for r in runs]
+    # One line per scan served from a pinned table, from every rank.
+    pin_hits = sum(
+        open(f, errors="replace").read().count("assigned pinned entry")
+        for f in glob.glob(f"{qout}/logs/*.log")
+    )
     same = [check(r[0], runs[0][0]) for r in runs]
     ref = parse(open(a.ref, errors="replace").read()) if a.ref else []
     vs_ref = (
@@ -155,7 +193,9 @@ def main():
     )
     res = dict(
         query=a.q,
-        std=a.std,
+        name=name,
+        sf=a.sf,
+        sql=a.sql,
         tag=a.tag,
         rc=p.returncode,
         wall_s=round(wall, 1),
@@ -166,8 +206,13 @@ def main():
         same_as_first=same,
         vs_ref=vs_ref,
         spill_bytes=spill,
-        config=a.config,
+        config=os.path.basename(a.config),
+        host_pool=a.host_pool,
         pin_tier=a.pin_tier,
+        pinned_tables=list(pin_tables),
+        pin_plans=a.pin_plans,
+        pin_s=pin_s,
+        pin_hits=pin_hits,
     )
     json.dump(res, open(f"{qout}/result.json", "w"), indent=1)
     with open(f"{a.out}/results.jsonl", "a") as f:

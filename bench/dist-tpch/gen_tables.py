@@ -24,10 +24,10 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-# The CI generator checkout: tpchgen-rs with its scripts/generate_tpch.py and a built tpchgen-cli.
-CI = os.environ.get(
-    "CI_TPCHGEN", "/opt/sirius-ci/workspace/sirius/test_datasets/tpchgen-rs"
-)
+# A tpchgen-rs checkout (github.com/sirius-db/tpchgen-rs) with tpchgen-cli built. Its
+# scripts/generate_tpch.py holds the CI dataset's settings.
+REPO = Path(__file__).resolve().parents[2]
+CI = os.environ.get("CI_TPCHGEN", str(REPO / "test_datasets" / "tpchgen-rs"))
 spec = importlib.util.spec_from_file_location("gen", f"{CI}/scripts/generate_tpch.py")
 gen = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gen)
@@ -146,7 +146,9 @@ def main():
     jobs = int(sys.argv[4]) if len(sys.argv) > 4 else 24
     threads = int(sys.argv[5]) if len(sys.argv) > 5 else 6
     stage = Path(
-        sys.argv[6] if len(sys.argv) > 6 else f"/dev/shm/aocsa-tpchgen-sf{scale}"
+        sys.argv[6]
+        if len(sys.argv) > 6
+        else f"/dev/shm/{os.environ.get('USER', 'sirius')}-tpchgen-sf{scale}"
     )
     stage.mkdir(parents=True, exist_ok=True)
     work = []

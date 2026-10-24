@@ -1,163 +1,146 @@
-# Distributed Sirius: TPC-H Q5 at SF10000 on 4 GB200s
+# Distributed TPC-H benchmark
 
-Q5 runs on 4 GPUs as 4 Sirius processes (ranks), one per GPU. Each rank scans its byte-range
-share of the files, and the ranks exchange batches over NIXL/UCX (`cuda_ipc`). This folder holds
-the notes and scripts to rebuild, test, rerun and profile the 2026-10-23 measurements: Q5
-served from GPFS, from the Linux page cache, and from Sirius's pinned host cache.
+These scripts build Sirius and run the 22 TPC-H queries on every GPU of one host, with one Sirius process (rank) per GPU. Each rank scans its share of the files, and the ranks exchange batches over NIXL/UCX.
 
-## Results (2026-10-23)
+Each query runs in up to three cases:
 
-Host: 4x GB200 (189 GB each), 144 Grace cores, 2 NUMA nodes, 1.7 TB RAM.
+| Case | Data | Read path |
+|---|---|---|
+| `direct` | the full dataset | O_DIRECT, no cache. This run's answer is the reference for the other two. |
+| `page` | a copy of only the query's columns | the Linux page cache |
+| `pinned` | the same copy | Sirius's pinned host cache, filled by the first iteration |
 
-Build: `dist-plan-opt` at 59d40bdc plus the thread-affinity fix, which is now commit 432a7c88.
-The binary did not include 4dcfd5f5, the Bloom cap change.
+## Requirements
 
-| Data served from | Config | Cold | Warm |
-|---|---|---|---|
-| GPFS, O_DIRECT, full SF10000 dataset | `gpfs.yaml` | 136.3 s | 35.9 s |
-| Linux page cache, Q5 copy read once with `cat` | `page-cache.yaml` | 8.7 s | 7.1 s |
-| Sirius pinned host cache, Q5 copy, O_DIRECT from one NVMe | `pinned-cache.yaml` | 108.9 s | 3.08 s |
+- **Host:** Linux with N NVIDIA GPUs.
+- **Software:** [pixi](https://pixi.sh), Rust (`cargo`), and NIXL with UCX.
+- **`direct` case:** the full TPC-H Parquet dataset, one directory per table.
+- **`page` and `pinned` cases:** a local disk (`COPY_ROOT`) with room for the largest copy you run. At SF10000, copies range from 21 GB (Q16) to 817 GB (Q9), and `columns.py --sf SF` prints them all. The `pinned` case needs a filesystem that supports O_DIRECT, which tmpfs does not.
+- **RAM for `page`:** the copy plus N × the host pool.
+- **RAM for `pinned`:** each rank's share of the copy (copy size / N) must fit under 80% of its host pool, or the cache evicts. Set the pool size with `HOST_POOL_PINNED`.
+- **RAM for `hostpin`:** N × the host pool must fit in CPU memory, with room to spare. Each pool holds that query's pinned columns plus the query's own host memory.
+- **Count CPU memory only:** on hosts whose GPU memory shows up as NUMA nodes (GB200, for example), `free` and `MemTotal` include the GPUs' memory. Sum the nodes that have CPUs (`/sys/devices/system/node/node*/meminfo`).
 
-- **Query:** queries.py Q5, 3 iterations in one process per rank. Cold is the first iteration; warm is the best of the other two.
-- **Answers:** all runs return the same 5 rows (RUSSIA first, 529,165,993,241.55) on every iteration.
-- **The subquery variant** (`q5_subquery.sql`, region ASIA, 1994) takes 7.5 s warm from the page cache and 3.13 s from the pinned cache. Its answer matches the same text run from GPFS.
-- **Where the time goes (pinned cache, warm, 3.05 s executing):**
-  - The lineitem scan, its Bloom filter and its shuffle on the order key take 68%.
-  - The orders scan and its join take 19%.
-  - The ranks finish within 0.01 s of each other.
-  - Each rank serves about 128,550 chunks from the cache, with 0–1 misses and no evictions.
-- **Cold, pinned cache:** all four ranks read the 502 GB copy from one NVMe drive at about 5 GB/s in total.
-- **The GPFS data is the full dataset,** with wider join keys. Q5 reads 1.22 TB there, against 502 GB from the copy.
+## Steps
+
+All commands run from the repo root.
+
+```bash
+# 1. Build with NIXL (long the first time: log it)
+NIXL_PREFIX=/path/to/nixl UCX_PREFIX=/path/to/ucx bash bench/dist-tpch/build.sh > build.log 2>&1
+
+# 2. The TPC-H generator CI uses, for the per-query copies
+git clone https://github.com/sirius-db/tpchgen-rs.git test_datasets/tpchgen-rs
+(cd test_datasets/tpchgen-rs && cargo build --release -p tpchgen-cli)
+
+# 3. Unit tests, on an idle GPU
+CUDA_VISIBLE_DEVICES=0 bash bench/dist-tpch/test.sh
+
+# 4. Benchmark (the GPUs must be idle; it refuses to start while a duckdb process runs)
+SF=10000 FULL_DATA=/path/to/tpch_sf10000 COPY_ROOT=/local/disk/tpch-copies OUT=/tmp/$USER/tpch-runs \
+  pixi run bash bench/dist-tpch/run_tpch.sh
+```
+
+`run_tpch.sh` takes its settings from environment variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `QUERIES` | `1 … 22` | Queries to run, e.g. `"5 9 18"`. |
+| `CASES` | `direct page pinned` | Cases to run. |
+| `SF` | `10000` | Scale factor of the data and the query texts. |
+| `ITERS` | `3` | Runs per query, in one process per rank. The first is cold; the best of the rest is warm. |
+| `RANKS` | every GPU | Number of ranks. |
+| `KEEP_COPIES` | `0` | `1` keeps each query's copy instead of deleting it after the query. |
+| `HOST_POOL_DIRECT`, `HOST_POOL_PAGE`, `HOST_POOL_PINNED` | from the configs | Host pool per rank for each case, e.g. `300Gi`. |
+| `JOBS`, `THREADS`, `STAGE` | `24`, `6`, `/dev/shm/$USER-tpchgen` | Generator parallelism and scratch directory. |
+| `SPILL_RESERVE` | 150 GB | Space left free in `COPY_ROOT`. |
+
+For each query, `run_tpch.sh` does the following:
+1. Runs the `direct` case.
+2. Generates a copy of the query's columns in `COPY_ROOT`, using the CI generator's exact settings, so files, row groups and column chunks match the CI dataset. A copy that doesn't fit is skipped and recorded.
+3. For `page`, reads the copy once into the page cache.
+4. Runs `page` and `pinned`, and checks each answer against `direct`.
+5. Deletes the copy.
+
+Rows with equal values that come out in another order count as the same answer.
+
+## Output
+
+| Path | What it holds |
+|---|---|
+| `OUT/summary.md` | Cold, warm and the answer check per query and case, with totals. `summarize.py OUT` rebuilds it. |
+| `OUT/results.jsonl` | One line per run: every iteration's time, the answer checks, and spill bytes. |
+| `OUT/copies.jsonl` | Each copy's size and generation time. |
+| `OUT/q<NN>_<case>/` | Each rank's output (`exchange_rank_<i>.log`; rank 0 holds the result), the Sirius log, and the config used. |
+| `OUT/telemetry_data/` | Quent telemetry, one directory per rank and run. |
+
+## Profiling a query
+
+`profile_q5.sh OUT` turns the last run's telemetry into a page showing:
+- Q5's plan;
+- every pipeline's timing, grouped by stage;
+- per-rank timelines of the cold and warm iterations.
+
+Run Q5 last to profile it, e.g. `QUERIES=5 CASES=pinned run_tpch.sh`. `extract.py` works for any query; the page layout in `build_page.py` and `template.html` is Q5's.
+
+## Reference results
+
+Measured 2026-10-23 on 4× GB200 (189 GB each, 144 Grace cores, 956 GiB CPU memory). Build: commit 432a7c88 without 4dcfd5f5.
+
+The `direct` case read the full SF10000 dataset from GPFS: all 22 queries, 2 iterations each, every answer the same on both. Total: **1,990 s cold, 680 s warm.**
+
+| Q | Cold | Warm | Q | Cold | Warm | Q | Cold | Warm |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 31.9 | 18.9 | 9 | 121.0 | 45.6 | 17 | 92.4 | 36.8 |
+| 2 | 33.3 | 13.6 | 10 | 108.7 | 38.2 | 18 | 117.4 | 48.1 |
+| 3 | 127.8 | 34.5 | 11 | 30.6 | 11.5 | 19 | 118.1 | 39.2 |
+| 4 | 91.5 | 27.2 | 12 | 138.1 | 33.0 | 20 | 80.9 | 22.0 |
+| 5 | 136.3 | 35.9 | 13 | 24.9 | 15.0 | 21 | 180.3 | 81.5 |
+| 6 | 76.2 | 27.2 | 14 | 102.3 | 29.8 | 22 | 13.2 | 7.2 |
+| 7 | 147.1 | 44.9 | 15 | 120.9 | 29.7 | | | |
+| 8 | 77.1 | 33.7 | 16 | 19.9 | 6.6 | | | |
+
+So far only Q5 has run in the `page` and `pinned` cases. Its copy is 502 GB.
+
+| Q5 | Cold | Warm |
+|---|---|---|
+| `direct` | 136.3 s | 35.9 s |
+| `page` | 8.7 s | 7.1 s |
+| `pinned` | 108.9 s | 3.08 s |
+
+- **Warm, pinned:** 68% of Q5's time is the lineitem scan with its Bloom filter and its shuffle on the order key.
+- **Cold, pinned:** limited by the one NVMe drive that held the copy, about 5 GB/s.
+
+### Pinned once, SF3000
+
+Measured 2026-10-24 on the same host. `run_suite.py` pinned every table once on the host (210Gi pools, 47-57 s per rank), with lineitem and orders compressed, o_comment left out, and nation, region and supplier replicated, then ran all 22 queries against the pins:
+
+```bash
+pixi run python bench/dist-tpch/run_suite.py --out OUT --config bench/dist-tpch/host-pin.yaml \
+  --host-pool 210Gi --data /path/to/tpch_sf3000 --sf 3000 --pin-tier host \
+  --pin-plans src/compression/simpatico_codegen/plans/tpch_sf1000 --pin-exclude o_comment \
+  --pin-replicate nation,region,supplier --ref-dir DIRECT_RUN_OUT
+```
+
+Every answer matched the `direct` run's. The 22 queries took 23.2 s warm in total, against 207.6 s for `direct`: from 2.5x (Q11) to 18x (Q6) faster, except Q13 (1.1x), which reads o_comment from disk.
 
 ## Files
 
-| File | What it does |
+| File | Purpose |
 |---|---|
-| `build.sh` | Configures the release build with NIXL (`-DSIRIUS_WITH_NIXL=ON`) and builds it. |
-| `test.sh` | Unit tests for pinned-cache matching (`[can_serve]`) and the per-rank byte-range split (`[byte_range]`). |
-| `run_q5.sh` | End to end: generate the Q5 copy, run Q5 from GPFS, the page cache and the pinned cache, then build the profile page. |
-| `run_query.py` | Runs any TPC-H query on N ranks. Creates views only for the tables it reads, checks answers, keeps the telemetry. |
-| `gen_tables.py` | Generates TPC-H tables with the CI generator's settings, keeping only the listed columns. |
-| `columns.py` | The columns each query reads, and the size of a copy of them at SF10000 (uses `colsizes.json`). |
-| `results.py` | Parses rank 0's output and compares answers. Rows with equal values may come out in another order. |
-| `extract.py` | Turns each rank's Quent telemetry into per-pipeline timings (JSON). |
-| `build_page.py`, `template.html` | The profile page: plan, pipelines by stage, per-rank timelines. |
-| `page-cache.yaml`, `pinned-cache.yaml`, `gpfs.yaml` | Sirius configs. `@SPILL_DIR@` is filled in by `run_query.py`. |
-| `q5_subquery.sql` | Q5 with partial aggregates after the lineitem and supplier joins, and nation joined last. |
-
-## 1. Build
-
-```bash
-git checkout dist-plan-opt-rank-pin
-NIXL_PREFIX=$HOME/tools/nvda_nixl bash bench/dist-q5-sf10000/build.sh > build.log 2>&1
-```
-
-- **Submodules:** `build.sh` runs `git submodule update --init --recursive`. Worktrees don't initialize submodules on their own.
-- **NIXL and UCX:** `scripts/nixl_env.sh` sets their runtime paths. Its defaults are `~/tools/nvda_nixl` and `~/tools/ucx-install`.
-- **Build time:** a first build takes a long time, so run it in the background. After that, `pixi run make` rebuilds only what changed.
-
-## 2. Test
-
-```bash
-CUDA_VISIBLE_DEVICES=3 bash bench/dist-q5-sf10000/test.sh
-```
-
-- **Pick an idle GPU.** The test binary reserves a large GPU memory pool at start, and fails with `out_of_memory` on a GPU another job is using.
-- **Answer checks** are done by the benchmark itself (step 3), not by these tests.
-
-## 3. Benchmark
-
-```bash
-DATA=/tmp/$USER/tpch/q5/sf10000 OUT=/tmp/$USER/q5-runs \
-  GPFS_DATA=/scratch/sirius/datasets/tpch_sf10000 \
-  pixi run bash bench/dist-q5-sf10000/run_q5.sh
-```
-
-Steps: `gen gpfs page pinned profile`. Pass a subset to run only those, for example `run_q5.sh page pinned`.
-
-- **gen** writes the Q5 copy to `DATA`.
-  - Size: 502 GB, of which lineitem is 417 GiB and orders 84 GiB.
-  - Time: about 12 minutes with `JOBS=24 THREADS=6` on 144 cores.
-  - Columns: `l_orderkey, l_suppkey, l_extendedprice, l_discount`; `o_orderkey, o_custkey, o_orderdate`; `c_custkey, c_nationkey`; `s_suppkey, s_nationkey`; nation and region whole.
-  - Format: every part is generated with the CI generator's exact `tpchgen-cli` flags, then rewritten row group by row group with only those columns. Files, row groups and column chunks match the full CI dataset. `CI_TPCHGEN` points at the generator checkout.
-- **gpfs** runs queries.py Q5 from `GPFS_DATA` with `gpfs.yaml`: 250 GiB host per rank, O_DIRECT. Later runs of the same text check their answer against it.
-- **page** reads `DATA` once with parallel `cat` (about 1.5 minutes), then runs both Q5 texts with `page-cache.yaml`: buffered reads, 120 GiB host per rank.
-- **pinned** runs both Q5 texts with `pinned-cache.yaml`. Reads use O_DIRECT into Sirius's pinned prefetching cache: LRU eviction, 200 GiB host per rank.
-  - The first iteration fills the cache from disk; the later ones read pinned memory.
-  - A rank's share of the copy (about 125 GB) must fit under the eviction threshold, 80% of the host pool.
-- **profile** builds `OUT/q5-profile.html` from the newest run's telemetry. `extract.py --auto` orders the ranks:
-  - Rank 0 collects the result.
-  - Rank 1 shares its NUMA node.
-  - The telemetry does not say which of the other two is rank 2, so the page labels them `2/3 a` and `2/3 b`.
-  - The page's prose (`template.html`) describes the 2026-10-23 run: edit it for a new one.
-
-Each query run writes to `OUT/<name>/`:
-- `exchange_rank_<i>.log`: each rank's output; rank 0's holds the result.
-- `logs/`: the Sirius log.
-- `sirius.yaml`: the config used.
-- `result.json`: times and answer checks.
-
-It also appends a line to `OUT/results.jsonl`.
-
-### Running one query
-
-```bash
-pixi run python bench/dist-q5-sf10000/run_query.py 5 --std --out /tmp/$USER/q5-runs \
-  --config bench/dist-q5-sf10000/pinned-cache.yaml --data /tmp/$USER/tpch/q5/sf10000 \
-  --ref /path/to/earlier/run/exchange_rank_0.log
-```
-
-- `--table T=DIR1,DIR2` reads a table from several directories, for copies split between tmpfs and local disk.
-- `--ref` compares the answer with rank 0's log of an earlier run of the same text.
-
-## Other queries
-
-`python bench/dist-q5-sf10000/columns.py` prints each query's columns and copy size at SF10000. For example:
-
-| Query | Copy size |
-|---|---|
-| Q18 | 211 GB |
-| Q21 | 419 GB |
-| Q10 | 444 GB |
-| Q7 | 606 GB |
-| Q8 | 784 GB |
-| Q9 | 817 GB |
-
-To build a copy for query Q:
-
-```bash
-python bench/dist-q5-sf10000/columns.py --keep Q > keep.json
-python bench/dist-q5-sf10000/gen_tables.py 10000 DIR keep.json [jobs] [threads] [stage_dir]
-```
-
-`keep.json` also takes `"_split": {"lineitem": [[dir, n_parts], ...]}` to spread a table's files across directories.
-
-Where a copy can live, on this host:
-- **tmpfs:** `/dev/shm` is 479 GiB. It works with `cache: os`, but not with `cache: sirius`: tmpfs rejects O_DIRECT.
-- **Local disk:** about 150 GB free.
-- **GPFS:** Q8 and Q9 don't fit anywhere locally. `cache: os` fails on GPFS with "Input/output error", and GPFS files aren't page-cached anyway.
-
-## Rank-aware pin_table
-
-The branch's only code change is commit 8adaa024. The results above were measured without it.
-
-- **Before:** in distributed runs, `pin_table` pinned every file on every rank. A pin matched a scan on the file set alone, so no rank's scan ever used its pin.
-- **After:** each rank pins its own share of the files and byte ranges (`planner::file_share_for_rank`), the same split its scans read. A pin serves a scan only when both read the same files and byte ranges.
-
-To try it, pin every table before the runs:
-
-```bash
-pixi run python bench/dist-q5-sf10000/run_query.py 5 --std --pin-tier host --out ... --config ... --data ...
-```
-
-- **Not yet tested on 4 ranks.**
-- **Size:** decoded columns are much larger than the Parquet bytes. Q5's would take about 310 GB per rank at SF10000, even narrowed, so try it at SF1000 first.
-- **`--pin-tier parquet`:** pins Parquet bytes instead, and needs `cache: sirius`.
+| `build.sh`, `test.sh`, `run_tpch.sh` | Steps 1, 3 and 4. |
+| `run_query.py` | Runs one query on N ranks and checks its answer. Any query, scale factor or SQL file (`--help`). |
+| `run_suite.py` | Pins tables once, then runs every query against the pins in one process per rank (`--help`). |
+| `summarize.py` | Builds `summary.md` from `results.jsonl`. |
+| `gen_tables.py`, `columns.py`, `colsizes.json` | Generate a copy of only the columns a query reads. `colsizes.json` holds the column sizes at SF10000. |
+| `results.py` | Parses rank 0's output and compares answers. |
+| `profile_q5.sh`, `extract.py`, `build_page.py`, `template.html` | Telemetry to the profile page. |
+| `direct-io.yaml`, `page-cache.yaml`, `pinned-cache.yaml`, `host-pin.yaml` | Sirius configs for the `direct`, `page`, `pinned` and `hostpin` cases. |
+| `q5_subquery.sql` | Q5 with partial aggregates after the lineitem and supplier joins. Run it with `run_query.py 5 --sql`. |
 
 ## Notes
 
-- **Shared machine:** run nothing while another job uses the GPUs. `run_query.py` refuses to start while any `duckdb` process runs.
-- **Telemetry location:** telemetry goes to `telemetry_data/` in the working directory, so runs start in `OUT`, never inside the repo.
-- **DuckDB agent mode:** `run_query.py` drops `AI_AGENT`, `CLAUDECODE` and `CLAUDE_CODE` from the environment, so DuckDB prints its normal output.
-- **Disk space:** keep large data and build trees off an NFS `$HOME` with a quota.
-- **Batch byte counts:** the telemetry's DataBatch byte counts look like allocation sizes, so the profile page doesn't use them.
+- **Pins across ranks:** each rank pins only its own share of a table's files, and the ranks agree on the result: a pin that fails on one rank fails on all of them. `replicate = true` pins a small table whole on every rank, so joins build from it without exchanging it. A pin fails rather than fill more than `pin_table_memory_limit` (default 0.9) of the memory it pins into, or of its CPU NUMA node.
+- **Telemetry location:** telemetry is written to the working directory, so the scripts run queries from `OUT`. Don't run them inside the repo.
+- **Parallel filesystems:** `cache: os` may fail on them with "Input/output error". Use a local copy instead.
+- **Rank labels in the telemetry:** it identifies rank 0, and the NUMA node of each rank. Two other ranks on the same node can't be told apart, so the profile page labels them `a` and `b`.

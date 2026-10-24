@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build Sirius with the NIXL exchange fabric, which multi-rank runs need.
-# usage: NIXL_PREFIX=/path/to/nixl bash bench/dist-q5-sf10000/build.sh [> build.log 2>&1]
+# usage: NIXL_PREFIX=/path/to/nixl bash bench/dist-tpch/build.sh [> build.log 2>&1]
 # A first build takes a long time: run it in the background and log it.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

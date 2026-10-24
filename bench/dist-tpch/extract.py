@@ -7,7 +7,7 @@ usage: extract.py OUT.json DIR...         one telemetry directory per rank, in r
 
 Each rank writes its own directory under telemetry_data/. Rank 0 is the one whose
 RESULT_COLLECTOR pipeline ran tasks; the host memory space's device_id is the rank's NUMA node
-(on a 4-GPU GB200 host, ranks 0-1 sit on node 0 and ranks 2-3 on node 1). Nothing in the
+(with two GPUs per node, ranks 0-1 share one node and ranks 2-3 the other). Nothing in the
 telemetry tells two ranks on the same node apart beyond that.
 """
 import collections, glob, json, sys
