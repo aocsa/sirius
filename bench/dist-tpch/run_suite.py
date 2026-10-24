@@ -10,6 +10,8 @@ usage: run_suite.py --out DIR --config YAML --data DIR [--sf 10000] [--queries 1
 
 - Pins, per table, the union of the columns the chosen queries read, minus --pin-exclude.
   A query that reads an excluded column reads that table from disk instead.
+- Pins the smallest tables first, so one that does not fit under pin_table_memory_limit is the
+  largest; queries then read it from disk.
 - --pin-replicate pins those tables whole on every rank (small ones, such as nation, region and
   supplier), so joins build from them without exchanging them.
 - Runs each query --iters times: the first is cold (the pins are already resident), the best
@@ -103,6 +105,11 @@ def main():
         for t, cs in union.items()
         if t not in skip and (not a.pin_only or t in a.pin_only.split(","))
     }
+    # Smallest first: a pin past pin_table_memory_limit fails, and the queries then read that
+    # table from disk, so let it be the largest.
+    pins = dict(
+        sorted(pins.items(), key=lambda kv: sum(SIZES[kv[0]][c] for c in kv[1]))
+    )
 
     os.makedirs(a.out, exist_ok=True)
     a.out = os.path.abspath(a.out)

@@ -122,6 +122,8 @@ pixi run python bench/dist-tpch/run_suite.py --out OUT --config bench/dist-tpch/
   --pin-replicate nation,region,supplier --ref-dir DIRECT_RUN_OUT
 ```
 
+[pinned-results.md](pinned-results.md) has the full SF3000 and SF10000 results with pinned tables, and the configs to reproduce them.
+
 Every answer matched the `direct` run's. The 22 queries took 23.2 s warm in total, against 207.6 s for `direct`: from 2.5x (Q11) to 18x (Q6) faster, except Q13 (1.1x), which reads o_comment from disk.
 
 ## Files
