@@ -1,1 +1,4 @@
 __pycache__/
+# The repository root ignores these; this folder ships them as reference data and run provenance.
+!*result.csv
+!runs/

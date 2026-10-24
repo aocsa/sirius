@@ -1,0 +1,64 @@
+{
+  "checks": [
+    {
+      "query": 17,
+      "path": "/home/ubuntu/repro-results/1gpu-sf10k-cold-q4-9-17-21/cold/sf10000/compression-on/measured/repeat1/q17",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 1,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 21,
+      "path": "/home/ubuntu/repro-results/1gpu-sf10k-cold-q4-9-17-21/cold/sf10000/compression-on/measured/repeat1/q21",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 100,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 4,
+      "path": "/home/ubuntu/repro-results/1gpu-sf10k-cold-q4-9-17-21/cold/sf10000/compression-on/measured/repeat1/q4",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 5,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 9,
+      "path": "/home/ubuntu/repro-results/1gpu-sf10k-cold-q4-9-17-21/cold/sf10000/compression-on/measured/repeat1/q9",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 175,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    }
+  ],
+  "compared": 4,
+  "complete": true,
+  "reference": "Saved large-scale GPU outputs, with proved SQL cutoff ties; no independent large-scale CPU oracle",
+  "suite_checks": {
+    "suites_found": 1,
+    "all_suites_complete": true,
+    "expected_records": 4,
+    "expected_queries": [
+      4,
+      9,
+      17,
+      21
+    ],
+    "seen_queries": [
+      4,
+      9,
+      17,
+      21
+    ]
+  }
+}

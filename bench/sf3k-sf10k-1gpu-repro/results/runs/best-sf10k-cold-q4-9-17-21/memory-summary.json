@@ -1,0 +1,9 @@
+{
+  "physical_mem_total_bytes": 1073248284672,
+  "host_budget_bytes": 240000000000,
+  "unmanaged_headroom_bytes": 833248284672,
+  "sampling_interval_s": 1,
+  "peak_process_rss_bytes": 242475708416,
+  "peak_process_hwm_bytes": 242480037888,
+  "min_system_mem_available_bytes": 810064248832
+}

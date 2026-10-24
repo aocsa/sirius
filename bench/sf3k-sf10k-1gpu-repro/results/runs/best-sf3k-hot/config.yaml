@@ -1,0 +1,51 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.908
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.9
+      downgrade_stop_fraction: 0.85
+    host:
+      capacity_bytes: 240000000000
+      block_size: 1048576
+      pool_size: 128
+      initial_number_pools: 1788
+    disk:
+      disk_id: 0
+      capacity_bytes: 1000000000000
+      downgrade_root_dirs: /opt/dlami/nvme/joost-spill/spill/hot-host240000000000B-cache48-gpu1-reactors16-sf3000-compression-on-c27da255a3
+  executor:
+    scan_manager:
+      memory_prefetcher:
+        enable: true
+        num_threads: 4
+      num_threads: 16
+      backend: sirius
+      rest_n_reactors: 16
+      max_readahead_bytes: 4GB
+      cache:
+        mode: sirius
+        eviction: lru
+        eviction_threshold_fraction: 0.2
+      rest:
+        upkeep_interval_ms: 15000
+        n_max_concurrent_scans: 48
+    pipeline:
+      num_threads: 16
+    downgrade:
+      num_threads: 2
+    task_creator:
+      num_threads: 2
+  operator_params:
+    scan_task_batch_size: 4GB
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 12GB
+    concat_batch_bytes: 2GB
+    max_build_hash_table_bytes: 12GB
+    enable_probe_accumulate: true
+  compression:
+    enable_spill_compression: true
+  telemetry:
+    enable_quent: false

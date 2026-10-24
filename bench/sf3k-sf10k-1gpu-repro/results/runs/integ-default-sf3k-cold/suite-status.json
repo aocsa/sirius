@@ -1,0 +1,25 @@
+{
+  "mode": "cold",
+  "host_bytes": 214748364800,
+  "host_label": "200GiB",
+  "host_fraction": 0.9,
+  "num_gpus": 1,
+  "reactors": 16,
+  "cache_gb": 20,
+  "engine": "compression-on",
+  "queries_finished": 22,
+  "expected": 22,
+  "gpu_completion_log_entries": 22,
+  "exit_code": 0,
+  "complete": true,
+  "credential_expiration": null,
+  "memory": {
+    "physical_mem_total_bytes": 1073248284672,
+    "host_budget_bytes": 214748364800,
+    "unmanaged_headroom_bytes": 858499919872,
+    "sampling_interval_s": 1,
+    "peak_process_rss_bytes": 74518810624,
+    "peak_process_hwm_bytes": 74518810624,
+    "min_system_mem_available_bytes": 982118096896
+  }
+}
