@@ -1,0 +1,9 @@
+{
+  "mode": "cold",
+  "ranks": 4,
+  "queries_finished": 13,
+  "expected": 22,
+  "stopped_after": 13,
+  "total_query_s": 460.336,
+  "complete": false
+}

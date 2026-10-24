@@ -1,0 +1,31 @@
+{
+  "mode": "cold",
+  "ranks": 4,
+  "queries_finished": 22,
+  "expected": 22,
+  "rank_exit_codes": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "gpu_completion_log_entries": {
+    "0": 22,
+    "1": 22,
+    "2": 22,
+    "3": 22
+  },
+  "pin_tables": [],
+  "pin_s": {},
+  "pin_hits": 0,
+  "wall_s": 852.6,
+  "total_query_s": 757.433,
+  "complete": true,
+  "rank_exit_codes_raw": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "describe_refusals_only": true
+}

@@ -1,0 +1,291 @@
+{
+  "checks": [
+    {
+      "query": 1,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q1",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 4,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 10,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q10",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 20,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 11,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q11",
+      "agree": true,
+      "digest_match": true,
+      "rows": 9365098,
+      "detail": null,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 12,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q12",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 2,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 13,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q13",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 10,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 14,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q14",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 1,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 15,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q15",
+      "agree": false,
+      "detail": "row count differs",
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 16,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q16",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 27840,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 17,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q17",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 1,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 18,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q18",
+      "agree": true,
+      "ordered_match": false,
+      "legal_sql_limit_tie": true,
+      "rows": 100,
+      "expanded_reference_rows": 200,
+      "boundary_key": [
+        "586579.84",
+        "1996-06-20"
+      ],
+      "detail": "ORDER BY keys, all non-boundary rows and every selected cutoff-row value verified against expanded GPU result; no independent CPU oracle.",
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 19,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q19",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 1,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 2,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q2",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 100,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 20,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q20",
+      "agree": false,
+      "digest_match": false,
+      "rows": 0,
+      "detail": "digest differs: rows 0 vs 380400, sha256 e3b0c44298fc vs 0b3fa0a7bcc0",
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 21,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q21",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 100,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 22,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q22",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 7,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 3,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q3",
+      "agree": true,
+      "ordered_match": false,
+      "legal_sql_limit_tie": true,
+      "rows": 10,
+      "expanded_reference_rows": 20,
+      "detail": "Boundary row values verified against expanded GPU result; ORDER BY keys and all non-boundary rows agree. No independent CPU oracle implied.",
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 4,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q4",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 5,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 5,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q5",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 5,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 6,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q6",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 1,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 7,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q7",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 4,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 8,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q8",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 2,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    },
+    {
+      "query": 9,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/2gpu-sf10k-cold/q9",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 175,
+      "native_status": "ok",
+      "native_exit_code": 1,
+      "accepted": false
+    }
+  ],
+  "compared": 22,
+  "reference": "Saved campaign GPU outputs (Q11/Q20 as exact row digests), with proved Q3/Q18 LIMIT ties; not an independent CPU oracle",
+  "suite_checks": {
+    "suites_found": 1,
+    "all_suites_complete": false,
+    "expected_records": 22,
+    "expected_queries": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22
+    ],
+    "seen_queries": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22
+    ]
+  },
+  "complete": false
+}

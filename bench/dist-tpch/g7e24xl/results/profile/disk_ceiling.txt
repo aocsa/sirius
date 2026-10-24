@@ -1,0 +1,9 @@
+01:55:06 lock held, GPUs idle, 984 GiB available: bash /home/ubuntu/sirius-dist-runs/scripts/disk_ceiling.sh
+0, 0 MiB, 0 %
+1, 0 MiB, 0 %
+2, 0 MiB, 0 %
+3, 0 MiB, 0 %
+readers=4 bytes=11.9GB time=0.9s rate=13.50GB/s
+readers=16 bytes=47.8GB time=3.5s rate=13.74GB/s
+readers=48 bytes=143.4GB time=10.9s rate=13.20GB/s
+01:55:22 step exit 0: bash /home/ubuntu/sirius-dist-runs/scripts/disk_ceiling.sh

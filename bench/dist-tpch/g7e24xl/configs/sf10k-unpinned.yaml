@@ -1,0 +1,58 @@
+# SF10000, UNPINNED: the integ 1-GPU best SF10K config (configs/sf10k-1gpu.yaml: the SF3K one plus a
+# 4 GiB Bloom cap), # per rank (one GPU each) for the distributed TPC-H SF3000 runs on 4x RTX PRO 6000.
+# Source: bench/sf3k-sf10k-1gpu-repro/configs/sf3k-1gpu.yaml (integ/sf3k-joost-2201-2204). Changes:
+# - downgrade_root_dirs: @SPILL_DIR@ (the runners substitute --spill-dir: /opt/dlami/nvme/sirius-spill-dist).
+# - Dropped scan_manager.max_readahead_bytes and compression.enable_spill_compression: their commits
+#   (PR 2155, spill compression) are not on dist-rank-pin-sf3k-integ, which rejects unknown keys.
+# - The host pool is in block form, so --host-pool does not change it: 240 GB (223.5 GiB) per rank.
+# - Disk tier 600 GB per rank instead of 1 TB: 4 ranks x 1 TB could fill the 3.1 TB free on the NVMe array.
+# Same as integ otherwise, including the 240 GB pool pinned at startup (initial_number_pools: 1788).
+sirius:
+      topology:
+          num_gpus: 1
+      memory:
+          gpu:
+              usage_limit_fraction: 0.908
+              reservation_limit_fraction: 0.9
+              downgrade_trigger_fraction: 0.9
+              downgrade_stop_fraction: 0.85
+          host:
+              capacity_bytes: 240000000000      # 240 GB pinned host tier
+              block_size: 1048576               # 1 MiB blocks
+              pool_size: 128                    # 128 blocks per pool = 128 MiB
+              initial_number_pools: 1788        # all 240 GB pinned at startup (~48 s)
+          disk:
+              disk_id: 0
+              capacity_bytes: 600000000000      # 600 GB per rank (see above)
+              downgrade_root_dirs: "@SPILL_DIR@"
+      executor:
+          scan_manager:
+              memory_prefetcher:
+                  enable: true
+                  num_threads: 4
+              num_threads: 16
+              backend: sirius                   # REST reactors for s3:// URLs
+              rest_n_reactors: 16
+              cache:
+                  mode: sirius
+                  eviction: lru
+                  eviction_threshold_fraction: 0.2
+              rest:
+                  upkeep_interval_ms: 15000
+                  n_max_concurrent_scans: 48
+          pipeline:
+              num_threads: 16
+          downgrade:
+              num_threads: 2
+          task_creator:
+              num_threads: 2
+      operator_params:
+          scan_task_batch_size: 4GB
+          max_sort_partition_bytes: 0           # auto
+          hash_partition_bytes: 12GB
+          concat_batch_bytes: 2GB
+          max_build_hash_table_bytes: 12GB
+          max_dynamic_filter_bloom_bytes_per_gpu: 4096MiB
+          enable_probe_accumulate: true
+      telemetry:
+          enable_quent: false

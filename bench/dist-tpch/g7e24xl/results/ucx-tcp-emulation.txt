@@ -1,0 +1,5 @@
+# UCX protocol selection, GPUs 0,2, UCX_TLS=cuda_copy,cuda_ipc,tcp,self, UCX_PROTO_INFO=y (before host staging)
+# The GPU-to-GPU put between GPUs without peer access is software-emulated over TCP.
+[1792809347.838992] [brev-6ovagejr1:641829:2]   | sirius-exchange-0 intra-node cfg#2 | remote memory write by ucp_put*(multi) from cuda/GPU0 to cuda    |
+[1792809347.838993] [brev-6ovagejr1:641829:2]   +------------------------------------+--------------------------------------------------------+---------+
+[1792809347.838993] [brev-6ovagejr1:641829:2]   |                             0..inf | software emulation                                     | tcp/wt0 |

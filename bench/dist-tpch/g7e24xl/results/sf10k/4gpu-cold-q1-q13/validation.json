@@ -1,0 +1,176 @@
+{
+  "checks": [
+    {
+      "query": 1,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q1",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 4,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 10,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q10",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 20,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 11,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q11",
+      "agree": true,
+      "digest_match": true,
+      "rows": 9365098,
+      "detail": null,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 12,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q12",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 2,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 13,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q13",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 10,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 2,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q2",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 100,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 3,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q3",
+      "agree": true,
+      "ordered_match": false,
+      "legal_sql_limit_tie": true,
+      "rows": 10,
+      "expanded_reference_rows": 20,
+      "detail": "Boundary row values verified against expanded GPU result; ORDER BY keys and all non-boundary rows agree. No independent CPU oracle implied.",
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 4,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q4",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 5,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 5,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q5",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 5,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 6,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q6",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 1,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 7,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q7",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 4,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 8,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q8",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 2,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    },
+    {
+      "query": 9,
+      "path": "/home/ubuntu/sirius-dist-runs/sf10k/4gpu-sf10k-cold/q9",
+      "agree": true,
+      "ordered_match": true,
+      "rows": 175,
+      "native_status": "ok",
+      "native_exit_code": 0,
+      "accepted": true
+    }
+  ],
+  "compared": 13,
+  "reference": "Saved campaign GPU outputs (Q11/Q20 as exact row digests), with proved Q3/Q18 LIMIT ties; not an independent CPU oracle",
+  "suite_checks": {
+    "suites_found": 1,
+    "all_suites_complete": false,
+    "expected_records": 22,
+    "expected_queries": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "seen_queries": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ]
+  },
+  "complete": false
+}
