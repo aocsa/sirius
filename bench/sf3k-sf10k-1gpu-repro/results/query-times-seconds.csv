@@ -1,0 +1,335 @@
+run,build,config,scale,mode,phase,repeat,query,seconds,status,validated
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,1,13.198,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,2,2.468,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,3,36.321,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,4,12.472,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,5,20.770,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,6,12.326,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,7,24.190,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,8,26.896,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,9,48.660,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,10,29.507,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,11,4.272,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,12,12.551,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,13,13.566,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,14,21.628,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,15,20.976,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,16,2.098,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,17,33.824,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,18,20.520,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,19,18.550,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,20,24.243,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,21,85.266,ok,True
+baseline-sf3k-cold,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,22,2.696,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,1,11.775,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,2,2.301,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,3,29.968,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,4,12.333,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,5,20.650,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,6,12.204,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,7,24.034,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,8,27.040,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,9,49.041,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,10,27.944,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,11,4.364,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,12,12.682,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,13,13.466,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,14,21.497,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,15,20.811,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,16,1.726,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,17,33.746,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,18,18.860,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,19,18.445,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,20,22.538,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,21,85.254,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,warmup,1,22,3.043,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,1,11.464,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,2,1.290,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,3,26.193,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,4,12.161,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,5,20.271,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,6,12.573,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,7,24.148,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,8,27.282,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,9,49.235,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,10,23.567,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,11,2.871,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,12,12.663,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,13,13.554,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,14,21.500,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,15,20.793,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,16,1.423,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,17,34.010,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,18,18.528,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,19,18.146,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,20,23.285,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,21,66.589,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,1,22,2.497,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,1,11.198,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,2,1.234,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,3,26.713,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,4,12.132,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,5,20.247,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,6,12.318,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,7,24.068,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,8,27.720,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,9,47.508,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,10,23.010,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,11,2.792,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,12,12.671,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,13,13.439,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,14,21.843,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,15,20.934,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,16,1.433,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,17,34.103,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,18,18.021,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,19,18.636,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,20,22.121,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,21,65.693,ok,True
+baseline-sf3k-hot,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,hot,measured,2,22,2.453,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,1,11.960,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,2,2.439,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,3,30.717,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,4,12.121,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,5,20.645,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,6,12.162,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,7,24.372,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,8,27.290,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,9,48.857,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,10,27.799,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,11,4.178,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,12,12.635,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,13,13.454,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,14,22.048,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,15,20.522,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,16,1.658,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,17,34.306,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,18,18.740,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,19,18.375,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,20,24.450,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,21,85.233,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,warmup,1,22,2.797,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,1,11.634,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,2,2.259,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,3,26.509,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,4,12.089,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,5,20.601,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,6,12.208,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,7,24.448,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,8,27.685,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,9,48.300,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,10,23.201,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,11,3.803,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,12,12.694,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,13,13.077,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,14,21.694,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,15,20.261,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,16,1.614,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,17,33.807,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,18,19.116,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,19,18.347,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,20,22.954,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,21,66.394,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,1,22,2.689,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,1,11.172,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,2,2.349,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,3,25.832,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,4,12.182,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,5,20.663,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,6,12.124,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,7,24.592,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,8,27.160,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,9,49.002,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,10,23.205,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,11,3.732,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,12,12.640,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,13,12.959,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,14,21.646,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,15,20.940,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,16,1.595,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,17,33.780,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,18,18.206,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,19,18.128,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,20,22.981,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,21,64.993,ok,True
+baseline-sf3k-lukewarm,a16fb23b,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,lukewarm,measured,2,22,2.893,ok,True
+best-sf10k-cold-q4-9-17-21,cb172fca,configs/sf10k-1gpu.yaml,10000,cold,measured,1,4,20.445,ok,True
+best-sf10k-cold-q4-9-17-21,cb172fca,configs/sf10k-1gpu.yaml,10000,cold,measured,1,9,137.179,ok,True
+best-sf10k-cold-q4-9-17-21,cb172fca,configs/sf10k-1gpu.yaml,10000,cold,measured,1,17,59.177,ok,True
+best-sf10k-cold-q4-9-17-21,cb172fca,configs/sf10k-1gpu.yaml,10000,cold,measured,1,21,91.345,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,1,12.122,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,2,2.223,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,3,11.179,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,4,6.458,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,5,12.783,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,6,8.593,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,7,15.214,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,8,18.220,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,9,28.968,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,10,22.823,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,11,3.467,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,12,8.681,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,13,8.620,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,14,13.286,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,15,12.823,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,16,1.800,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,17,15.841,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,18,22.610,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,19,12.596,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,20,14.807,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,21,21.160,ok,True
+best-sf3k-cold,cb172fca,configs/sf3k-1gpu.yaml,3000,cold,measured,1,22,2.923,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,1,12.035,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,2,2.376,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,3,11.309,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,4,6.338,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,5,12.655,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,6,7.724,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,7,14.226,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,8,17.319,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,9,27.445,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,10,23.153,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,11,3.644,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,12,8.685,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,13,8.632,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,14,13.664,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,15,11.637,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,16,1.904,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,17,16.064,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,18,15.857,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,19,12.460,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,20,14.181,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,21,20.601,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,warmup,1,22,3.091,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,1,10.349,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,2,1.513,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,3,10.526,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,4,5.496,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,5,11.593,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,6,6.973,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,7,14.385,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,8,17.270,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,9,27.679,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,10,22.911,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,11,2.543,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,12,7.722,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,13,6.854,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,14,11.664,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,15,11.228,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,16,1.613,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,17,13.949,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,18,15.363,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,19,11.589,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,20,13.221,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,21,19.339,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,1,22,2.306,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,1,10.542,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,2,1.549,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,3,10.894,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,4,5.564,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,5,11.463,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,6,7.053,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,7,14.048,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,8,17.457,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,9,27.221,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,10,22.381,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,11,2.518,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,12,7.718,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,13,6.700,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,14,12.454,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,15,11.100,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,16,1.404,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,17,14.107,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,18,15.159,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,19,11.931,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,20,13.259,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,21,19.480,ok,True
+best-sf3k-hot,cb172fca,configs/sf3k-1gpu.yaml,3000,hot,measured,2,22,1.809,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,1,11.807,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,2,2.357,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,3,11.147,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,4,6.489,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,5,12.728,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,6,7.997,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,7,13.898,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,8,17.596,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,9,27.974,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,10,23.502,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,11,3.714,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,12,8.876,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,13,8.710,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,14,13.682,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,15,12.586,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,16,1.791,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,17,15.742,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,18,16.120,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,19,12.627,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,20,14.229,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,21,20.669,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,warmup,1,22,3.152,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,1,11.627,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,2,2.362,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,3,11.353,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,4,6.652,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,5,12.781,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,6,7.904,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,7,14.220,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,8,17.568,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,9,28.076,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,10,23.288,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,11,3.654,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,12,8.903,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,13,8.758,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,14,13.598,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,15,11.872,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,16,1.867,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,17,15.618,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,18,16.049,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,19,12.544,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,20,14.276,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,21,20.297,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,1,22,3.073,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,1,11.247,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,2,2.420,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,3,11.482,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,4,6.433,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,5,12.853,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,6,7.942,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,7,14.147,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,8,17.743,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,9,27.910,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,10,23.134,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,11,3.448,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,12,8.724,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,13,8.540,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,14,13.824,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,15,12.552,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,16,1.714,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,17,16.139,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,18,15.998,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,19,12.484,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,20,14.379,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,21,20.246,ok,True
+best-sf3k-lukewarm,cb172fca,configs/sf3k-1gpu.yaml,3000,lukewarm,measured,2,22,3.164,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,1,11.791,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,2,2.119,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,3,30.710,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,4,9.139,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,5,20.583,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,6,12.360,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,7,24.769,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,8,27.663,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,9,31.500,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,10,25.480,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,11,3.895,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,12,12.607,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,13,12.580,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,14,21.903,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,15,20.922,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,16,1.686,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,17,28.290,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,18,18.879,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,19,18.084,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,20,23.952,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,21,45.533,ok,True
+integ-default-sf3k-cold,cb172fca,sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings),3000,cold,measured,1,22,2.656,ok,True

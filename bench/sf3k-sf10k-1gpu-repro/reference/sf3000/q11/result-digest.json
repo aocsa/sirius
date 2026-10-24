@@ -1,0 +1,12 @@
+{
+  "headers": [
+    "ps_partkey",
+    "value"
+  ],
+  "types": [
+    "INTEGER",
+    "DECIMAL(38,2)"
+  ],
+  "rows": 2824743,
+  "sha256": "4c123ddf57657b9b31d15311bbae9ff8c571657ac3f827024378109f7bc47d7f"
+}

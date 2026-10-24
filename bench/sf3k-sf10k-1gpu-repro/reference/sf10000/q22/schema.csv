@@ -1,0 +1,4 @@
+column_name,column_type,null,key,default,extra
+cntrycode,VARCHAR,YES,NULL,NULL,NULL
+numcust,BIGINT,YES,NULL,NULL,NULL
+totacctbal,"DECIMAL(38,2)",YES,NULL,NULL,NULL

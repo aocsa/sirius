@@ -1,0 +1,122 @@
+[
+  {
+    "run": "baseline-sf3k-cold",
+    "build": "a16fb23b (tree 68fee848: main 38fe9ba2 + PR2204 head 10727ae9 + PR2155 head 4d83cd03)",
+    "config": "sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings)",
+    "mode": "cold",
+    "repeat": 1,
+    "queries": 22,
+    "seconds": 486.998,
+    "validated": true
+  },
+  {
+    "run": "baseline-sf3k-lukewarm",
+    "build": "a16fb23b (tree 68fee848: main 38fe9ba2 + PR2204 head 10727ae9 + PR2155 head 4d83cd03)",
+    "config": "sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings)",
+    "mode": "lukewarm",
+    "repeat": 1,
+    "queries": 22,
+    "seconds": 445.384,
+    "validated": true
+  },
+  {
+    "run": "baseline-sf3k-lukewarm",
+    "build": "a16fb23b (tree 68fee848: main 38fe9ba2 + PR2204 head 10727ae9 + PR2155 head 4d83cd03)",
+    "config": "sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings)",
+    "mode": "lukewarm",
+    "repeat": 2,
+    "queries": 22,
+    "seconds": 442.774,
+    "validated": true
+  },
+  {
+    "run": "baseline-sf3k-hot",
+    "build": "a16fb23b (tree 68fee848: main 38fe9ba2 + PR2204 head 10727ae9 + PR2155 head 4d83cd03)",
+    "config": "sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings)",
+    "mode": "hot",
+    "repeat": 1,
+    "queries": 22,
+    "seconds": 444.043,
+    "validated": true
+  },
+  {
+    "run": "baseline-sf3k-hot",
+    "build": "a16fb23b (tree 68fee848: main 38fe9ba2 + PR2204 head 10727ae9 + PR2155 head 4d83cd03)",
+    "config": "sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings)",
+    "mode": "hot",
+    "repeat": 2,
+    "queries": 22,
+    "seconds": 440.287,
+    "validated": true
+  },
+  {
+    "run": "integ-default-sf3k-cold",
+    "build": "cb172fca (aocsa/sirius integ/sf3k-joost-2201-2204)",
+    "config": "sirius-spill-reproducer 8xl-sf3k profile (archived campaign settings)",
+    "mode": "cold",
+    "repeat": 1,
+    "queries": 22,
+    "seconds": 407.101,
+    "validated": true
+  },
+  {
+    "run": "best-sf3k-cold",
+    "build": "cb172fca (aocsa/sirius integ/sf3k-joost-2201-2204)",
+    "config": "configs/sf3k-1gpu.yaml",
+    "mode": "cold",
+    "repeat": 1,
+    "queries": 22,
+    "seconds": 277.197,
+    "validated": true
+  },
+  {
+    "run": "best-sf3k-lukewarm",
+    "build": "cb172fca (aocsa/sirius integ/sf3k-joost-2201-2204)",
+    "config": "configs/sf3k-1gpu.yaml",
+    "mode": "lukewarm",
+    "repeat": 1,
+    "queries": 22,
+    "seconds": 266.34,
+    "validated": true
+  },
+  {
+    "run": "best-sf3k-lukewarm",
+    "build": "cb172fca (aocsa/sirius integ/sf3k-joost-2201-2204)",
+    "config": "configs/sf3k-1gpu.yaml",
+    "mode": "lukewarm",
+    "repeat": 2,
+    "queries": 22,
+    "seconds": 266.523,
+    "validated": true
+  },
+  {
+    "run": "best-sf3k-hot",
+    "build": "cb172fca (aocsa/sirius integ/sf3k-joost-2201-2204)",
+    "config": "configs/sf3k-1gpu.yaml",
+    "mode": "hot",
+    "repeat": 1,
+    "queries": 22,
+    "seconds": 246.086,
+    "validated": true
+  },
+  {
+    "run": "best-sf3k-hot",
+    "build": "cb172fca (aocsa/sirius integ/sf3k-joost-2201-2204)",
+    "config": "configs/sf3k-1gpu.yaml",
+    "mode": "hot",
+    "repeat": 2,
+    "queries": 22,
+    "seconds": 245.811,
+    "validated": true
+  },
+  {
+    "run": "best-sf10k-cold-q4-9-17-21",
+    "build": "cb172fca (aocsa/sirius integ/sf3k-joost-2201-2204)",
+    "config": "configs/sf10k-1gpu.yaml",
+    "mode": "cold",
+    "repeat": 1,
+    "queries": 4,
+    "seconds": 308.146,
+    "validated": true
+  }
+]

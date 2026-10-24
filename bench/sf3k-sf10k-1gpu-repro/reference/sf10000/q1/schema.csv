@@ -1,0 +1,11 @@
+column_name,column_type,null,key,default,extra
+l_returnflag,VARCHAR,YES,NULL,NULL,NULL
+l_linestatus,VARCHAR,YES,NULL,NULL,NULL
+sum_qty,"DECIMAL(38,2)",YES,NULL,NULL,NULL
+sum_base_price,"DECIMAL(38,2)",YES,NULL,NULL,NULL
+sum_disc_price,"DECIMAL(38,4)",YES,NULL,NULL,NULL
+sum_charge,"DECIMAL(38,6)",YES,NULL,NULL,NULL
+avg_qty,DOUBLE,YES,NULL,NULL,NULL
+avg_price,DOUBLE,YES,NULL,NULL,NULL
+avg_disc,DOUBLE,YES,NULL,NULL,NULL
+count_order,BIGINT,YES,NULL,NULL,NULL

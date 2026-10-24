@@ -1,0 +1,52 @@
+# Best 1-GPU SF3K config for bench/sf3k-sf10k-1gpu-repro. run.py replaces downgrade_root_dirs with a per-run directory.
+sirius:
+      topology:
+          num_gpus: 1
+      memory:
+          gpu:
+              usage_limit_fraction: 0.908
+              reservation_limit_fraction: 0.9
+              downgrade_trigger_fraction: 0.9
+              downgrade_stop_fraction: 0.85
+          host:
+              capacity_bytes: 240000000000      # 240 GB pinned host tier
+              block_size: 1048576               # 1 MiB blocks
+              pool_size: 128                    # 128 blocks per pool = 128 MiB
+              initial_number_pools: 1788        # all 240 GB pinned at startup (~48 s)
+          disk:
+              disk_id: 0
+              capacity_bytes: 1000000000000     # 1 TB on the 1.7 TB NVMe
+              downgrade_root_dirs: "/mnt/datasets/sirius_spill"
+      executor:
+          scan_manager:
+              memory_prefetcher:
+                  enable: true
+                  num_threads: 4
+              num_threads: 16
+              backend: sirius                   # REST reactors for s3:// URLs
+              rest_n_reactors: 16
+              max_readahead_bytes: 4GB
+              cache:
+                  mode: sirius
+                  eviction: lru
+                  eviction_threshold_fraction: 0.2
+              rest:
+                  upkeep_interval_ms: 15000
+                  n_max_concurrent_scans: 48
+          pipeline:
+              num_threads: 16
+          downgrade:
+              num_threads: 2
+          task_creator:
+              num_threads: 2
+      operator_params:
+          scan_task_batch_size: 4GB
+          max_sort_partition_bytes: 0           # auto
+          hash_partition_bytes: 12GB
+          concat_batch_bytes: 2GB
+          max_build_hash_table_bytes: 12GB
+          enable_probe_accumulate: true
+      compression:
+          enable_spill_compression: true        # false for the plain arm E runs
+      telemetry:
+          enable_quent: false

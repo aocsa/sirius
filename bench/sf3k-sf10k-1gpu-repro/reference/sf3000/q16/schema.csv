@@ -1,0 +1,5 @@
+column_name,column_type,null,key,default,extra
+p_brand,VARCHAR,YES,NULL,NULL,NULL
+p_type,VARCHAR,YES,NULL,NULL,NULL
+p_size,INTEGER,YES,NULL,NULL,NULL
+supplier_cnt,BIGINT,YES,NULL,NULL,NULL

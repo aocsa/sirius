@@ -1,0 +1,9 @@
+column_name,column_type,null,key,default,extra
+c_custkey,INTEGER,YES,NULL,NULL,NULL
+c_name,VARCHAR,YES,NULL,NULL,NULL
+revenue,"DECIMAL(38,4)",YES,NULL,NULL,NULL
+c_acctbal,"DECIMAL(15,2)",YES,NULL,NULL,NULL
+n_name,VARCHAR,YES,NULL,NULL,NULL
+c_address,VARCHAR,YES,NULL,NULL,NULL
+c_phone,VARCHAR,YES,NULL,NULL,NULL
+c_comment,VARCHAR,YES,NULL,NULL,NULL

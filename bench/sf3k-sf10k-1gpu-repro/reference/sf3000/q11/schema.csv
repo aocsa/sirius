@@ -1,0 +1,3 @@
+column_name,column_type,null,key,default,extra
+ps_partkey,INTEGER,YES,NULL,NULL,NULL
+value,"DECIMAL(38,2)",YES,NULL,NULL,NULL

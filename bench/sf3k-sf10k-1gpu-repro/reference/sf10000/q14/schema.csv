@@ -1,0 +1,2 @@
+column_name,column_type,null,key,default,extra
+promo_revenue,DOUBLE,YES,NULL,NULL,NULL

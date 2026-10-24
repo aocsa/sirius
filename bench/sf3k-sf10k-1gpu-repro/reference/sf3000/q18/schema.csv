@@ -1,0 +1,7 @@
+column_name,column_type,null,key,default,extra
+c_name,VARCHAR,YES,NULL,NULL,NULL
+c_custkey,INTEGER,YES,NULL,NULL,NULL
+o_orderkey,BIGINT,YES,NULL,NULL,NULL
+o_orderdate,DATE,YES,NULL,NULL,NULL
+o_totalprice,"DECIMAL(15,2)",YES,NULL,NULL,NULL
+sum(l.l_quantity),"DECIMAL(38,2)",YES,NULL,NULL,NULL
