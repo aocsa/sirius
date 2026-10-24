@@ -1,0 +1,3 @@
+column_name,column_type,null,key,default,extra
+o_year,BIGINT,YES,NULL,NULL,NULL
+mkt_share,DOUBLE,YES,NULL,NULL,NULL

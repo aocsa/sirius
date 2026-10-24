@@ -1,0 +1,2 @@
+column_name,column_type,null,key,default,extra
+revenue,"DECIMAL(38,4)",YES,NULL,NULL,NULL

@@ -1,0 +1,3 @@
+column_name,column_type,null,key,default,extra
+n_name,VARCHAR,YES,NULL,NULL,NULL
+revenue,"DECIMAL(38,4)",YES,NULL,NULL,NULL

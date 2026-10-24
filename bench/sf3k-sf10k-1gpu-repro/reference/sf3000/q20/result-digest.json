@@ -1,0 +1,12 @@
+{
+  "headers": [
+    "s_name",
+    "s_address"
+  ],
+  "types": [
+    "VARCHAR",
+    "VARCHAR"
+  ],
+  "rows": 224872,
+  "sha256": "0abefb3f6b9ce6c5b12aac64aa045c24b2e3bdbd878bb54613d8128caea0f452"
+}

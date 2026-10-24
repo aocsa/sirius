@@ -1,0 +1,4 @@
+column_name,column_type,null,key,default,extra
+nation,VARCHAR,YES,NULL,NULL,NULL
+o_year,BIGINT,YES,NULL,NULL,NULL
+sum_profit,"DECIMAL(38,4)",YES,NULL,NULL,NULL
