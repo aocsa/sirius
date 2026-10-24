@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace sirius::exchange {
@@ -58,6 +59,9 @@ struct exchange_spec {
   std::vector<cudf::null_order> null_precedence;
   /// gather: the receiving rank.
   exchange::rank_t target = 0;
+  /// The only rank that sends, when every rank holds the same rows (a replicated table): the
+  /// other ranks' input is a copy, and sending it too would duplicate every row.
+  std::optional<exchange::rank_t> sender;
 };
 
 /**
@@ -86,6 +90,8 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
 
   [[nodiscard]] exchange::stream_id stream() const noexcept { return _stream; }
   [[nodiscard]] exchange_spec const& spec() const noexcept { return _spec; }
+  /// False on every rank but the spec's sender, when it names one.
+  [[nodiscard]] bool sends() const;
 
   /// range: the world size - 1 boundary rows, over key_columns only, ascending in the spec's
   /// order; rank i gets rows from boundary i - 1 (inclusive) to boundary i (exclusive).

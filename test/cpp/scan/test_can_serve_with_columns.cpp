@@ -315,6 +315,31 @@ TEST_CASE("cache_entry_info: matches_parquet_files canonicalizes the probe's spe
   REQUIRE_FALSE(cache.matches_parquet_files(different, {}));
 }
 
+TEST_CASE("cache_entry_info: matches_parquet_files compares byte ranges", "[scan][can_serve]")
+{
+  // A distributed rank's pin: part of a.parquet, all of b.parquet by range.
+  auto cache                 = parquet_cache({"a.parquet", "b.parquet"}, {0});
+  cache.resolved_file_ranges = {{{500, 100}, {0, 200}}, {{0, 300}}};
+  std::vector<std::string> const files{"a.parquet", "b.parquet"};
+  using ranges = std::vector<cache_entry_info::byte_ranges>;
+
+  // The same reads hit, whatever the order of the files or of a file's ranges.
+  REQUIRE(cache.matches_parquet_files(files, ranges{{{500, 100}, {0, 200}}, {{0, 300}}}));
+  REQUIRE(cache.matches_parquet_files(files, ranges{{{0, 200}, {500, 100}}, {{0, 300}}}));
+  std::vector<std::string> const reordered{"b.parquet", "a.parquet"};
+  REQUIRE(cache.matches_parquet_files(reordered, ranges{{{0, 300}}, {{0, 200}, {500, 100}}}));
+
+  // Another rank's share, or the whole files, misses: either would read other rows.
+  REQUIRE_FALSE(cache.matches_parquet_files(files, ranges{{{200, 300}}, {{0, 300}}}));
+  REQUIRE_FALSE(cache.matches_parquet_files(files, {}));
+
+  // A whole-file pin (a replicated one) serves only whole-file scans; (0,0) also reads it whole.
+  auto whole = parquet_cache({"a.parquet", "b.parquet"}, {0});
+  REQUIRE(whole.matches_parquet_files(files, {}));
+  REQUIRE(whole.matches_parquet_files(files, ranges{{{0, 0}}, {}}));
+  REQUIRE_FALSE(whole.matches_parquet_files(files, ranges{{{0, 600}}, {{0, 300}}}));
+}
+
 TEST_CASE("cache_entry_info: column_projection_for misses on sentinel columns", "[scan][can_serve]")
 {
   auto cache = duckdb_cache("db", "main", "t", {0, 1, 2});

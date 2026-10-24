@@ -49,6 +49,7 @@
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -605,10 +606,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Resolved once for this plan against the connection being planned for, so the parquet
   // identity probe and the residency gate below cannot disagree about whether narrowing is on.
   bool const compressed_materialization_on = duckdb::compressed_materialization_enabled(context);
-  // Distributed: a rank pins only its share of a table, and narrowing picks each column's carrier
-  // from the values it pinned, so ranks can narrow the same column differently, or not at all
-  // when their share is empty. Every rank must plan the same types, so pinned scans plan their
-  // native types here; their narrowed chunks still save memory and widen as they are served.
+  // Distributed: a rank pins only its share of a table, or all of it when it is replicated, and
+  // narrowing picks each column's carrier from the values it pinned, so ranks can narrow the same
+  // column differently. Every rank must plan the same types, so a pinned scan plans the carriers
+  // the ranks agreed on when they pinned (pinned_entry::rank_agreed_carriers), and its chunks
+  // narrower than those widen as they are served.
   bool const distributed =
     sirius_state && duckdb::query_operator_options(context)->exchange_peers.size() > 1;
 
@@ -660,22 +662,31 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         serves_insert_deltas = true;
       }
     }
-  } else if (!marked_decline && sirius_state && compressed_materialization_on && !distributed) {
+  } else if (!marked_decline && sirius_state && compressed_materialization_on) {
     auto const files = resolve_parquet_scan_file_paths(
       op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
     if (!files.empty()) {
-      pinned_owner =
-        sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files, {});
+      auto& scan_manager = sirius_state->get_scan_manager();
+      if (!distributed) {
+        pinned_owner = scan_manager.find_pinned_entry_for_parquet_files(files, {});
+      } else if (pinned_owner = scan_manager.find_replicated_parquet_pin(files, column_ids);
+                 !pinned_owner) {
+        // The files and byte ranges this rank's scan reads (assign_files_to_rank).
+        auto const options = duckdb::query_operator_options(context);
+        auto const share   = sirius::planner::file_share_for_rank(
+          files, options->exchange_rank, options->exchange_peers.size());
+        pinned_owner = scan_manager.find_pinned_entry_for_parquet_files(share.files, share.ranges);
+      }
       pinned = pinned_owner.get();
     }
   }
 
-  auto physical_types =
-    scan_physical_schema(op,
-                         sirius_state.get(),
-                         compressed_materialization_on,
-                         column_ids,
-                         serves_insert_deltas || distributed ? nullptr : pinned);
+  bool const unagreed = distributed && (pinned == nullptr || !pinned->rank_agreed_carriers);
+  auto physical_types = scan_physical_schema(op,
+                                             sirius_state.get(),
+                                             compressed_materialization_on,
+                                             column_ids,
+                                             serves_insert_deltas || unagreed ? nullptr : pinned);
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");

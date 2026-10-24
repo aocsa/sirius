@@ -119,6 +119,10 @@ constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
 /// pipeline can hold one per thread.
 constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
 
+/// Share of a memory space's capacity that pin_table may fill, counting what is already there,
+/// so queries keep room to run beside the pins.
+constexpr double DEFAULT_PIN_TABLE_MEMORY_LIMIT = 0.9;
+
 /// Budget when GPU tier capacity cannot be read at planning time.
 constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
@@ -235,6 +239,10 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// pin_table fails, on every rank, rather than fill more than this share of the memory space it
+  /// pins into (host pool or GPU), or of the free memory of the host pool's NUMA node.
+  double pin_table_memory_limit = config::DEFAULT_PIN_TABLE_MEMORY_LIMIT;
 
   /// Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default:
   /// opt-in because the driver-only support probe returns true on GPUs (e.g. Turing/T4) whose

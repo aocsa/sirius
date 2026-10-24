@@ -216,11 +216,19 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 }
 
 //! Distributed: every rank binds every file of a table and scans its share of them
-//! (`file_share_for_rank`).
+//! (`file_share_for_rank`), or all of them, whole, when every rank holds a pin of the whole table
+//! that serves the scan.
 void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
                           std::vector<std::string> files,
-                          const sirius::operator_params& op_params)
+                          const sirius::operator_params& op_params,
+                          duckdb::SiriusContext* sirius_ctx)
 {
+  if (sirius_ctx && op_params.exchange_peers.size() > 1 &&
+      sirius_ctx->get_scan_manager().find_replicated_parquet_pin(files, info.column_ids)) {
+    info.resolved_file_paths = std::move(files);
+    info.replicated          = true;
+    return;
+  }
   auto share = sirius::planner::file_share_for_rank(
     std::move(files), op_params.exchange_rank, op_params.exchange_peers.size());
   info.resolved_file_paths  = std::move(share.files);
@@ -347,7 +355,10 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    assign_files_to_rank(*info, std::move(resolved_file_paths), op_params);
+    auto sirius_ctx = context.registered_state
+                        ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                        : nullptr;
+    assign_files_to_rank(*info, std::move(resolved_file_paths), op_params, sirius_ctx.get());
   }
 
   info->approximate_batch_size = op_params.scan_task_batch_size;

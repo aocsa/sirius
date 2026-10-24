@@ -90,6 +90,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// once across scan instances. One file keeps one entry even when this scan owns several of
   /// its ranges: the bound read view requires one entry per bound file.
   std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> resolved_file_ranges;
+  /// Distributed: every rank reads every file whole, from a pin each rank holds of the whole
+  /// table (`pin_table(..., replicate = true)`), so every rank has all the scan's rows.
+  bool replicated = false;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;

@@ -128,12 +128,16 @@ as a clean cache miss at serve time. This yields three residency states:
    when no column survives the whole sidecar is dropped. A native resident chunk is never narrowed
    at serve time as a recurring per-query cost.
 
-In distributed execution every pinned scan plans its native types, as if unpinned. Each rank pins
-only its share of a table, and the carriers come from the values it pinned, so two ranks can
-narrow the same column differently (or not at all, when a rank's share is empty). Every rank must
-plan the same types: different ones fail the plan-shape check, or meet in an exchange as batches
-that cannot be concatenated. The pins stay narrow in memory, and their chunks widen as they are
-served. `test/scripts/distributed_pin_narrowing.sh` covers this on two ranks.
+In distributed execution each rank pins only its share of a table, and the carriers come from
+the values it pinned, so two ranks can narrow the same column differently (or hold no rows of it).
+Every rank must plan the same types: different ones fail the plan-shape check, or meet in an
+exchange as batches that cannot be concatenated. So the ranks agree when they pin
+(`agree_on_pin`): each sends the widest carrier its chunks narrowed each column to, and every rank
+records, in `pinned_entry::rank_agreed_carriers`, the widest of those for each column that every
+rank holding rows narrowed. Its scans plan those carriers, and its chunks narrower than them widen
+as they are served. A column some rank kept native is planned native. The same exchange fails the
+pin on every rank when it failed on any. `test/scripts/distributed_pin_narrowing.sh` covers this
+on two ranks.
 
 For duckdb-native entries one further condition applies: when rows exist beyond the pinned prefix
 (the same `GetTotalRows() > n_cache` check the MVCC guards make against the entry's snapshot

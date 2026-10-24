@@ -164,7 +164,16 @@ CALL unpin_table('lineitem');
 ```
 
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
-pinned host memory instead, for tables larger than GPU memory.
+pinned host memory instead, for tables larger than GPU memory. A pin fails rather than fill more
+than `pin_table_memory_limit` (default 0.9) of that memory, leaving the rest to queries.
+
+In distributed execution (one process per GPU), run the same `pin_table` calls on every rank: each
+rank pins the share of the table its scans read. Add `replicate = true` to pin a small table whole
+on every rank instead. Joins then build from it without sending it between ranks:
+
+```sql
+CALL pin_table('/path/to/nation/*.parquet', name = 'nation', tier = 'gpu', replicate = true);
+```
 
 Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
 `MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is

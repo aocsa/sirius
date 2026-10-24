@@ -199,6 +199,8 @@ struct pinned_entry_metadata {
   std::optional<duckdb_mvcc_metadata> mvcc;
   // Proofs describe incoming data. Merges apply them only to columns actually stored.
   std::vector<std::string> proven_unique_columns;
+  /// Distributed pins: see @ref pinned_entry::rank_agreed_carriers.
+  std::optional<std::map<std::string, cudf::data_type>> rank_agreed_carriers;
 };
 
 /**
@@ -286,6 +288,12 @@ struct pinned_entry {
   /// path appends columns and a positional attach would then describe the wrong
   /// ones.
   std::vector<bool> proven_unique_columns;
+  /// Set on a distributed pin, which every rank takes together (pin_table): by column name, the
+  /// carrier every rank's scans of the table plan, the widest any rank narrowed the column to. A
+  /// column missing from it is planned native, because some rank could not narrow it. Each rank
+  /// narrows the values it pinned, so its own chunks alone would not plan the same types as the
+  /// other ranks' chunks.
+  std::optional<std::map<std::string, cudf::data_type>> rank_agreed_carriers;
   /// Generation-checked handle for late materialization. It points weakly back
   /// to this exact entry, so an unpin/replacement hides it from new queries
   /// without revoking a query that already co-owns it. Null unless the late-mat
@@ -384,7 +392,9 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
  * Reads only @p entry's column-storage metadata. Returns no target unless @p entry_position is
  * covered by the cached-column identity and every chunk marks the column narrowed, records
  * @p native_type as its pin-time native type, and records a strict same-family narrowing of that
- * type. Chunks narrower than the returned target widen when served.
+ * type. Chunks narrower than the returned target widen when served. A distributed pin answers
+ * with the carrier its ranks agreed on instead (@ref pinned_entry::rank_agreed_carriers), so
+ * every rank plans the same type.
  *
  * Call only while @p entry is protected from concurrent pin or unpin; this function does not
  * retain it.
@@ -834,6 +844,13 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths,
     std::span<cache_entry_info::byte_ranges const> resolved_file_ranges) const;
+
+  /// Distributed: the pin every rank holds of all of @p resolved_file_paths, whole
+  /// (`pin_table(..., replicate = true)`), when it holds every column of @p column_ids; nullptr
+  /// otherwise. A scan it serves reads the whole table on every rank.
+  [[nodiscard]] std::shared_ptr<const pinned_entry> find_replicated_parquet_pin(
+    std::span<std::string const> resolved_file_paths,
+    duckdb::vector<duckdb::ColumnIndex> const& column_ids) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
 

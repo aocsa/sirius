@@ -50,6 +50,8 @@ namespace sirius::planner {
  * - an ungrouped aggregate: partial results gathered to rank 0, before the merge;
  * - an ORDER BY: rows range-exchanged after SORT_SAMPLE, whose boundaries every rank agrees on;
  * - the result: gathered to rank 0, ordered by rank after an ORDER BY.
+ * A scan every rank reads whole, from a pin each rank holds of the whole table, needs none: a join
+ * builds from it where it is, and what is computed from such scans alone stays on every rank.
  * Rank 0's result is the query's; the other ranks' are empty, or meaningless after a gather.
  *
  * Every rank must plan the same query: the plan's shape is compared across ranks, and a

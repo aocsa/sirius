@@ -19,7 +19,10 @@
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
+#include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
@@ -62,6 +65,11 @@ enum class placement {
   spread,  ///< Across ranks, each rank holding some.
   ranged,  ///< Across ranks, rank i holding the i-th range of a sort order.
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
+  /// On every rank, all of them, as on one GPU: a scan of a pin every rank holds whole
+  /// (`pin_table(..., replicate = true)`), and what is computed from such scans alone. Any rank's
+  /// rows are the subtree's result, so it needs no exchange; one that spreads them sends only rank
+  /// 0's copy.
+  replicated,
 };
 
 /// A join's Bloom filters are sized for its estimated build rows, within these bounds: the same
@@ -106,6 +114,8 @@ struct rewriter {
   std::uint32_t next_stream{1};
   /// The plan's shape, compared across ranks.
   std::string shape;
+  std::size_t exchanges        = 0;
+  std::size_t replicated_scans = 0;
   /// Each CTE_SCAN's rows are where its CTE's materialization put them.
   std::map<op::sirius_physical_operator const*, placement> cte_scans;
 
@@ -127,17 +137,18 @@ struct rewriter {
                                             exchange_spec spec,
                                             bool ordered)
   {
-    auto child       = std::move(slot);
-    auto const id    = stream();
+    auto child    = std::move(slot);
+    auto const id = stream();
+    ++exchanges;
     auto const types = child->types;
     auto const rows  = child->estimated_cardinality;
     std::set<exchange::rank_t> senders;
     if (spec.routing != exchange_spec::mode::gather || service->rank() == spec.target) {
       for (exchange::rank_t r = 0; r < service->world_size(); ++r) {
-        senders.insert(r);
+        if (!spec.sender || r == *spec.sender) { senders.insert(r); }
       }
     }
-    shape += "X" + std::to_string(static_cast<int>(spec.routing)) + "/";
+    shape += "X" + std::to_string(static_cast<int>(spec.routing)) + (spec.sender ? "S" : "") + "/";
     for (auto const key : spec.key_columns) {
       shape += std::to_string(key) + ",";
     }
@@ -158,16 +169,23 @@ struct rewriter {
     return sink_ref;
   }
 
-  /// A hash exchange on @p partition's keys, between it and its input. An input on rank 0 alone
-  /// (a gathered aggregate) is spread from there; the other ranks' copies of it hold no rows.
-  placement hash_below(op::sirius_physical_operator& partition_node)
+  /// A hash exchange on @p partition's keys, between it and its input, which is at @p input. An
+  /// input on rank 0 alone (a gathered aggregate) is spread from there; the other ranks' copies of
+  /// it hold no rows. A replicated input is spread from rank 0's copy.
+  void hash_exchange(op::sirius_physical_operator& partition_node, placement input)
   {
     auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
-    visit(partition.children[0]);
     exchange_spec spec;
     spec.key_columns    = partition.partition_keys();
     spec.key_cast_types = partition.specification().key_cast_types;
+    if (input == placement::replicated) { spec.sender = 0; }
     insert(partition.children[0], std::move(spec), false);
+  }
+
+  /// Visits @p partition's input and hash-exchanges it (@ref hash_exchange).
+  placement hash_below(op::sirius_physical_operator& partition_node)
+  {
+    hash_exchange(partition_node, visit(expect(partition_node, T::PARTITION).children[0]));
     return placement::spread;
   }
 
@@ -201,7 +219,18 @@ struct rewriter {
       return p;
     };
     switch (node.type) {
-      case T::GPU_SCAN: return done(placement::spread);
+      case T::GPU_SCAN: {
+        auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&node);
+        auto const* info = scan ? dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+                                    &scan->get_ingestible().table_info())
+                                : nullptr;
+        if (info != nullptr && info->replicated) {
+          shape += "R";
+          ++replicated_scans;
+          return done(placement::replicated);
+        }
+        return done(placement::spread);
+      }
       case T::FILTER:
       case T::PROJECTION:
       // A join-edge dynamic filter: its filter holds every rank's keys (see HASH_JOIN).
@@ -216,22 +245,31 @@ struct rewriter {
         auto& build       = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
         auto const world  = static_cast<std::uint64_t>(service->world_size());
         auto const bbytes = estimated_bytes(*build.children[0]);
+        auto const probe_at = visit(probe.children[0]);
+        auto const build_at = visit(build.children[0]);
+        // A probe row's output with a whole build is the same on any rank holding the row.
+        auto const with_whole_build = probe_at == placement::ranged ? placement::spread : probe_at;
+        if (build_at == placement::replicated &&
+            (probe_at == placement::replicated ||
+             emits_build_rows_only_with_probe(join.join_type))) {
+          // Every rank already holds the whole build: a broadcast join without the broadcast.
+          shape += "L";
+          return done(with_whole_build);
+        }
         if (emits_build_rows_only_with_probe(join.join_type) &&
             bbytes <= max_broadcast_build_bytes &&
             bbytes <= estimated_bytes(*probe.children[0]) / std::max<std::uint64_t>(world - 1, 1)) {
           // Every rank gets the whole build and keeps its probe rows. Its build being whole, its
           // Bloom filters hold every key, as on one GPU: nothing to merge.
           shape += "B";
-          auto const probe_rows = visit(probe.children[0]);
-          visit(build.children[0]);
           insert(
             build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-          return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+          return done(with_whole_build);
         }
         merge_filters_across_ranks(join);
         // Each side's rows meet their matches once both are exchanged on the join keys.
-        hash_below(probe);
-        hash_below(build);
+        hash_exchange(probe, probe_at);
+        hash_exchange(build, build_at);
         return done(placement::spread);
       }
 
@@ -260,10 +298,11 @@ struct rewriter {
           throw sirius::not_implemented_exception(
             "distributed execution: a delim join whose join keys are not its delim columns");
         }
-        visit(node.children[0]);
+        auto const input = visit(node.children[0]);
         exchange_spec spec;
         spec.key_columns    = keys;
         spec.key_cast_types = fanned.specification().key_cast_types;
+        if (input == placement::replicated) { spec.sender = 0; }
         insert(node.children[0], std::move(spec), false);
         merge_filters_across_ranks(join);
         hash_below(other);
@@ -287,16 +326,28 @@ struct rewriter {
         auto& probe = expect(*expect(*node.children[0], T::CONCAT).children[0], T::PARTITION);
         auto& build = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
         auto const probe_rows = visit(probe.children[0]);
-        visit(build.children[0]);
-        insert(build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-        return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+        if (visit(build.children[0]) == placement::replicated) {
+          shape += "L";
+        } else {
+          insert(
+            build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
+        }
+        return done(probe_rows == placement::ranged ? placement::spread : probe_rows);
       }
 
       case T::DENSE_COUNT_JOIN: {
         // DENSE_COUNT_JOIN → PARTITION → input, both sides: exchanged on the join key, a rank
-        // counts the preserved keys it holds, every match of which is on it too.
+        // counts the preserved keys it holds, every match of which is on it too. Two replicated
+        // sides need no exchange.
+        std::vector<placement> sides;
         for (auto& side : node.children) {
-          hash_below(*side);
+          sides.push_back(visit(expect(*side, T::PARTITION).children[0]));
+        }
+        if (std::ranges::all_of(sides, [](auto p) { return p == placement::replicated; })) {
+          return done(placement::replicated);
+        }
+        for (std::size_t i = 0; i < node.children.size(); ++i) {
+          hash_exchange(*node.children[i], sides[i]);
         }
         return done(placement::spread);
       }
@@ -325,19 +376,26 @@ struct rewriter {
             throw sirius::not_implemented_exception(
               "distributed execution: COUNT(DISTINCT) with grouping sets");
           }
-          visit(grouped.children[0]);
+          if (visit(grouped.children[0]) == placement::replicated) {
+            return done(placement::replicated);
+          }
           exchange_spec spec;
           spec.key_columns = grouped.group_idx;
           insert(grouped.children[0], std::move(spec), false);
           return done(placement::spread);
         }
-        return done(hash_below(partition));
+        // Replicated partials already hold every group whole, on every rank.
+        auto const input = visit(expect(partition, T::PARTITION).children[0]);
+        if (input == placement::replicated) { return done(placement::replicated); }
+        hash_exchange(partition, input);
+        return done(placement::spread);
       }
 
       case T::MERGE_AGGREGATE: {
         // MERGE_AGGREGATE → UNGROUPED_AGGREGATE: partial results gathered to rank 0.
-        auto& partial = expect(*node.children[0], T::UNGROUPED_AGGREGATE);
-        if (visit(partial.children[0]) == placement::rank0) { return done(placement::rank0); }
+        auto& partial    = expect(*node.children[0], T::UNGROUPED_AGGREGATE);
+        auto const input = visit(partial.children[0]);
+        if (input == placement::rank0 || input == placement::replicated) { return done(input); }
         insert(node.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
         return done(placement::rank0);
       }
@@ -345,8 +403,9 @@ struct rewriter {
       case T::MERGE_TOP_N: {
         // MERGE_TOP_N → TOP_N: each rank's top rows gathered to rank 0, whose merge keeps the
         // overall top. A row outside its rank's top N is outside the overall top N too.
-        auto& partial = expect(*node.children[0], T::TOP_N);
-        if (visit(partial.children[0]) == placement::rank0) { return done(placement::rank0); }
+        auto& partial    = expect(*node.children[0], T::TOP_N);
+        auto const input = visit(partial.children[0]);
+        if (input == placement::rank0 || input == placement::replicated) { return done(input); }
         insert(node.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
         return done(placement::rank0);
       }
@@ -357,8 +416,9 @@ struct rewriter {
         auto& partition = expect(*node.children[0], T::SORT_PARTITION);
         auto& sample =
           expect(*partition.children[0], T::SORT_SAMPLE).Cast<op::sirius_physical_sort_sample>();
-        auto& order = expect(*sample.children[0], T::ORDER_BY);
-        if (visit(order.children[0]) == placement::rank0) { return done(placement::rank0); }
+        auto& order      = expect(*sample.children[0], T::ORDER_BY);
+        auto const input = visit(order.children[0]);
+        if (input == placement::rank0 || input == placement::replicated) { return done(input); }
         exchange_spec spec;
         spec.routing = exchange_spec::mode::range;
         for (auto const& o : sample.orders) {
@@ -426,12 +486,17 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
 {
   rewriter r{std::move(service), &gpu, query, &lifecycle};
   auto const where = r.visit(plan);
-  if (where != placement::rank0) {
+  // Rank 0's rows are the result: already, when they are on rank 0 alone or on every rank.
+  if (where != placement::rank0 && where != placement::replicated) {
     r.insert(plan,
              exchange_spec{.routing = exchange_spec::mode::gather},
              /*ordered=*/where == placement::ranged);
   }
   require_same_shape(r);
+  SIRIUS_LOG_INFO("[distributed plan] query {}: {} exchanges, {} scans of replicated pins",
+                  query,
+                  r.exchanges,
+                  r.replicated_scans);
 }
 
 std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const> file_bytes,

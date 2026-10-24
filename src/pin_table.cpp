@@ -30,6 +30,7 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/table/table.hpp>
@@ -51,11 +52,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
+#include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -208,13 +213,43 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
   return {std::make_unique<cudf::table>(std::move(columns)), std::move(narrowed_columns)};
 }
 
+/// Batches a pin decodes at once. A decode reads its batch's column chunks, so this many reads
+/// overlap the other batches' decodes.
+constexpr std::size_t pin_decodes_in_flight = 8;
+/// Files whose footers a pin reads at once, ahead of the batches it decodes.
+constexpr std::size_t pin_footers_in_flight = 16;
+
+/// Bytes of NUMA node @p node: its total, and what is free or reclaimable page cache. Nullopt
+/// when the kernel does not report the node.
+struct node_memory {
+  std::size_t total = 0;
+  std::size_t free  = 0;
+};
+std::optional<node_memory> numa_node_memory(int node)
+{
+  std::ifstream meminfo("/sys/devices/system/node/node" + std::to_string(node) + "/meminfo");
+  if (!meminfo) { return std::nullopt; }
+  // Lines read "Node 0 MemFree:  123456 kB".
+  node_memory memory;
+  std::string word, key;
+  std::size_t kib = 0;
+  while (meminfo >> word >> word >> key >> kib >> word) {
+    if (key == "MemTotal:") { memory.total = kib << 10; }
+    if (key == "MemFree:" || key == "Active(file):" || key == "Inactive(file):") {
+      memory.free += kib << 10;
+    }
+  }
+  if (memory.total == 0) { return std::nullopt; }
+  return memory;
+}
+
 /// Shared driver behind @ref materialize_all_batches, @ref materialize_pin_to_host, and
 /// @ref materialize_all_batches_compressed: walk the
 /// ingestible's metadata + batch coalescer to completion, materialize each emitted batch onto a
-/// round-robin GPU, and hand it to @p on_batch. The single-threaded, deterministic round-robin
-/// placement means re-pinning the same source yields identical placement (required by
-/// insert_pinned_entry's merge path on the GPU tier) and bounds peak GPU residency to ~one batch
-/// (the host tier frees each table in @p on_batch before the next is materialized).
+/// round-robin GPU, and hand it to @p on_batch. Batches decode a few at a time, but take their
+/// placement and reach @p on_batch in batch order, so re-pinning the same source yields identical
+/// placement (required by insert_pinned_entry's merge path on the GPU tier). Peak GPU residency
+/// is ~pin_decodes_in_flight batches (the host tier frees each table in @p on_batch).
 /// @return the late-mat uniqueness verdicts, positional with the pinned columns
 ///         (empty when the probe was not asked for).
 std::vector<late_mat::unique_verdict> materialize_pin_batches(
@@ -280,20 +315,21 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check abandoned: {}", why);
   };
 
-  // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
-  // together with its GPU placement + the decode stream. Mirrors
-  // load_balancing_scan_batch_coalescer::process_provider_inputs, minus the connector/balancer
-  // and the post-decode step: there is no downstream scan operator at pin time, so the
-  // unfiltered table is delivered to the sink directly. The device guard stays in scope across
-  // the on_batch call, so the sink runs on the correct device.
-  auto handle_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
-    if (!batch) { return; }
-    // round_robin_strategy ignores pipeline_id/data; it returns the next device id
-    // from its cursor. gpu_spaces is non-empty (checked above), so the strategy always
-    // yields a device. space_by_device round-trips it to the materialization target.
-    int const gpu_id =
-      placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
-    auto* target = space_by_device.at(gpu_id);
+  // One coalesced batch decoded into a GPU-resident cudf::table on its placement's GPU, with the
+  // stream that decoded it.
+  struct decoded_batch {
+    std::unique_ptr<op::scan::scan_info> batch;
+    int gpu_id;
+    cucascade::memory::memory_space* target;
+    sirius::memory::runtime_stream_pool::lease stream_lease;
+    std::unique_ptr<cudf::table> tbl;
+  };
+  // Mirrors load_balancing_scan_batch_coalescer::process_provider_inputs, minus the
+  // connector/balancer and the post-decode step: there is no downstream scan operator at pin
+  // time. Runs on its own thread, beside other batches' decodes (see the loop below).
+  auto decode = [&ingestible, &options](std::unique_ptr<op::scan::scan_info> batch,
+                                        int gpu_id,
+                                        cucascade::memory::memory_space* target) {
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
     // Borrow a real (non-default) stream from the target's runtime stream pool: the
     // duckdb-native decoder's cudaMemcpyBatchAsync rejects the legacy default
@@ -301,17 +337,28 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // materialized buffers' deallocation stream stays valid after this call.
     auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*target);
     auto stream       = stream_lease.get();
-
     // A pin caches the table UNFILTERED: it has no row filter (no WHERE), and the
     // ingestible's projection_ids are identity into column_ids, so the reader already
     // emits exactly the pinned columns in column_ids order. materialize_metadata_to_table
     // thus yields the cache-ready table directly — no scan_operator_input wrapper and no
     // post_filter_and_project (which would only apply a row filter or re-project to a
-    // query's output layout, neither of which a pin needs). `batch` is borrowed by const
-    // ref and outlives the call.
+    // query's output layout, neither of which a pin needs).
     auto materialized = ingestible.materialize_metadata_to_table(
       *batch, *target, stream, false, nullptr, options.expression_policy);
-    auto tbl              = materialized.table.release(stream, target->get_default_allocator());
+    auto tbl = materialized.table.release(stream, target->get_default_allocator());
+    return decoded_batch{std::move(batch), gpu_id, target, std::move(stream_lease), std::move(tbl)};
+  };
+
+  // The rest of a batch's pin, in batch order: hand the decoded table to on_batch with its GPU
+  // placement and decode stream. The device guard stays in scope across the on_batch call, so
+  // the sink runs on the correct device.
+  auto handle_batch = [&](decoded_batch decoded) {
+    int const gpu_id = decoded.gpu_id;
+    auto* target     = decoded.target;
+    auto& batch      = decoded.batch;
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
+    auto stream           = decoded.stream_lease.get();
+    auto tbl              = std::move(decoded.tbl);
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
@@ -383,18 +430,56 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
   };
 
+  // Up to pin_decodes_in_flight batches decode at once, so one batch's reads overlap the others'
+  // decodes. Each batch's placement is taken in batch order, and the rest of its pin runs here
+  // in batch order, so the chunks and their placement are what a serial pin makes. A decode that
+  // fails throws from get(); the deque's futures then wait for the decodes still running before
+  // it unwinds.
+  std::deque<std::future<decoded_batch>> decodes;
+  auto handle_next = [&] {
+    auto decoded = decodes.front().get();
+    decodes.pop_front();
+    handle_batch(std::move(decoded));
+  };
+  auto submit = [&](std::unique_ptr<op::scan::scan_info> batch) {
+    if (!batch) { return; }
+    // round_robin_strategy ignores pipeline_id/data; it returns the next device id
+    // from its cursor. gpu_spaces is non-empty (checked above), so the strategy always
+    // yields a device. space_by_device round-trips it to the materialization target.
+    int const gpu_id =
+      placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
+    decodes.push_back(
+      std::async(std::launch::async, decode, std::move(batch), gpu_id, space_by_device.at(gpu_id)));
+    if (decodes.size() >= pin_decodes_in_flight) { handle_next(); }
+  };
+  // Each file's footer is read and its row groups listed by a split task. Up to
+  // pin_footers_in_flight run ahead, each on its own thread, and reach the coalescer in file
+  // order. A task that fails throws from get(); the futures left wait for theirs to finish.
+  std::deque<std::future<std::unique_ptr<op::scan::scan_info>>> footers;
+  auto coalesce_next = [&] {
+    auto info = footers.front().get();
+    footers.pop_front();
+    if (!info) { return; }
+    for (auto& b : coalescer->push(std::move(info))) {
+      submit(std::move(b));
+    }
+  };
   while (!ingestible.has_processed_all_metadata()) {
     // A pin reads its fixed ingestible on the one ioctx it was given; route every file to it.
     auto task = ingestible.next_split_provider([io_ctx_sp](std::string_view) { return io_ctx_sp; });
     if (!task) { continue; }
-    auto info = task({});
-    if (!info) { continue; }
-    for (auto& b : coalescer->push(std::move(info))) {
-      handle_batch(std::move(b));
-    }
+    footers.push_back(
+      std::async(std::launch::async, [task = std::move(task)] { return task({}); }));
+    if (footers.size() >= pin_footers_in_flight) { coalesce_next(); }
+  }
+  while (!footers.empty()) {
+    coalesce_next();
   }
   for (auto& b : coalescer->flush()) {
-    handle_batch(std::move(b));
+    submit(std::move(b));
+  }
+  while (!decodes.empty()) {
+    handle_next();
   }
 
   if (std::any_of(options.probe_unique_columns.begin(),
@@ -587,6 +672,40 @@ bool compress_and_stage_batch(cudf::table const& tbl,
 
 }  // namespace
 
+void check_pin_memory(cucascade::memory::memory_space& space, std::size_t bytes, double limit)
+{
+  auto const capacity = space.get_max_memory();
+  auto const used     = capacity - std::min(capacity, space.get_available_memory());
+  auto const gib      = [](std::size_t b) { return static_cast<double>(b) / (1ull << 30); };
+  if (static_cast<double>(used + bytes) > limit * static_cast<double>(capacity)) {
+    throw sirius::invalid_input_exception(
+      "pin_table: {:.1f} GiB more would fill {:.1f} of the {:.1f} GiB of {} memory space {}, past "
+      "pin_table_memory_limit ({}); pin fewer columns, compress them, or give the space more "
+      "memory",
+      gib(bytes),
+      gib(used + bytes),
+      gib(capacity),
+      space.get_tier() == cucascade::memory::Tier::HOST ? "host" : "GPU",
+      space.get_device_id(),
+      limit);
+  }
+  if (space.get_tier() != cucascade::memory::Tier::HOST) { return; }
+  auto const node = numa_node_memory(space.get_device_id());
+  if (!node) { return; }
+  if (static_cast<double>(node->total - std::min(node->total, node->free) + bytes) >
+      limit * static_cast<double>(node->total)) {
+    throw sirius::invalid_input_exception(
+      "pin_table: {:.1f} GiB more would leave {:.1f} of the {:.1f} GiB of NUMA node {} free, "
+      "less than pin_table_memory_limit ({}) allows; the host pools of the processes on the node "
+      "add up to more than it holds",
+      gib(bytes),
+      gib(node->free - std::min(node->free, bytes)),
+      gib(node->total),
+      space.get_device_id(),
+      limit);
+  }
+}
+
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
@@ -609,6 +728,7 @@ materialized_pin materialize_all_batches(
       // Cached GPU batches are stored with a null writer stream, so the data
       // must be fully resident before it can be served or host-converted.
       stream.sync();
+      check_pin_memory(*target, 0, options.memory_limit);
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
@@ -672,6 +792,7 @@ host_pin_result materialize_pin_to_host(
                 throw std::runtime_error(
                   "target host space has no fixed_size_host_memory_resource");
               }
+              check_pin_memory(*target_host_space, payload_bytes, options.memory_limit);
               auto payload_res = target_host_space->make_reservation_or_null(payload_bytes);
               auto blob        = std::make_shared<sirius::pinned_compressed_blob>();
               blob->header     = std::move(header);
@@ -707,6 +828,7 @@ host_pin_result materialize_pin_to_host(
 
       if (!compressed_this_chunk) {
         cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
+        check_pin_memory(*target_host_space, gpu_repr.get_size_in_bytes(), options.memory_limit);
         auto host_reservation =
           target_host_space->make_reservation_or_null(gpu_repr.get_size_in_bytes());
         if (host_reservation == nullptr) {
@@ -909,6 +1031,7 @@ device_pin_result materialize_all_batches_compressed(
         out.chunks.push_back(device_pin_chunk{
           .compressed = nullptr, .columns = std::move(shared_cols), .memory_space = src_space});
       }
+      check_pin_memory(*src_space, 0, options.memory_limit);
     });
 
   {

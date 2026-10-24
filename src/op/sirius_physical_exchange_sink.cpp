@@ -71,6 +71,15 @@ sirius_physical_exchange_sink::sirius_physical_exchange_sink(
     throw sirius::invalid_input_exception(
       "exchange sink: gather to rank {} of {}", _spec.target, _service->world_size());
   }
+  if (_spec.sender && *_spec.sender >= _service->world_size()) {
+    throw sirius::invalid_input_exception(
+      "exchange sink: sender rank {} of {}", *_spec.sender, _service->world_size());
+  }
+}
+
+bool sirius_physical_exchange_sink::sends() const
+{
+  return !_spec.sender || *_spec.sender == _service->rank();
 }
 
 void sirius_physical_exchange_sink::set_range_boundaries(
@@ -99,6 +108,9 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   if (!batches.empty()) {
     std::lock_guard lock{_input_schema_mutex};
     if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batches.front())); }
+  }
+  if (!sends()) {
+    return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks));
   }
   for (std::size_t b = 0; b < handles.size(); ++b) {
     // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
@@ -220,6 +232,7 @@ void sirius_physical_exchange_sink::on_finalize_operator()
 {
   // A failed exchange throws here; its receivers already learn of it through on_error.
   try {
+    if (!sends()) { return; }
     if (_spec.routing == exchange_spec::mode::gather) {
       _service->close(_stream, _spec.target);
       return;

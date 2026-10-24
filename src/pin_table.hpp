@@ -42,6 +42,9 @@ struct PinTableArgs {
   /// Optional per-call request for Simpatico pin compression. When omitted,
   /// the legacy session/config setting remains the default.
   std::optional<bool> compression;
+  /// Distributed: every rank pins the whole table rather than its share, so scans of it need no
+  /// exchange (a small table every join builds from, for instance).
+  bool replicate = false;
   /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
   /// `format` named parameter, else inferred from the path extension
   /// (.parquet -> parquet, .db/.duckdb -> duckdb).
@@ -177,11 +180,23 @@ struct pin_materialization_options {
   /// leaves the probe off, which is the default; the caller derives it from
   /// @c late_mat::pin_unique_probe_selection.
   std::vector<bool> probe_unique_columns;
+  /// pin_table_memory_limit: the share of the memory space it pins into, and of the free memory
+  /// of a host space's NUMA node, the pin may fill before it fails (@ref check_pin_memory).
+  double memory_limit = 1.0;
 };
+
+/**
+ * @brief Throws unless storing @p bytes more in @p space keeps it within @p limit of its capacity,
+ * counting what it already holds, and, for a host space, keeps @p limit of its NUMA node's
+ * memory from being in use. The node is counted because the host pools of every process on it
+ * share it, and can add up to more than it holds; a pin that would run it out fails here, instead
+ * of the kernel killing a process later.
+ */
+void check_pin_memory(cucascade::memory::memory_space& space, std::size_t bytes, double limit);
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
 /// materializing every emitted batch into a GPU-resident cudf::table and round-robining
-/// placement across @p gpu_spaces. Single-threaded with deterministic placement, so
+/// placement across @p gpu_spaces. Deterministic placement, so
 /// re-pinning the same source yields identical @c chunk_memory_spaces (required by
 /// @c sirius_scan_manager::insert_pinned_entry 's merge path).
 ///

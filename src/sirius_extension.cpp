@@ -75,6 +75,8 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "exchange/all_gather.hpp"
+#include "exchange/exchange_service.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -82,6 +84,7 @@ extern "C" int cudaProfilerStop();
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -148,6 +151,7 @@ extern "C" int cudaProfilerStop();
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -189,6 +193,116 @@ std::uint64_t count_narrowed_columns(
     }
   }
   return count;
+}
+
+// A distributed parquet pin: each rank pins its share of the table, or all of it when replicated,
+// and the ranks agree before any keeps it, on whether every rank pinned and on the carrier each
+// column is planned at. Each rank's outcome travels as INT32s: whether it failed, then for each
+// pinned column the type id and scale of the widest carrier its chunks narrowed the column to,
+// or one of these.
+constexpr std::int32_t pin_without_chunks = -1;  ///< The rank's share holds no rows.
+constexpr std::int32_t pin_not_narrowed   = -2;  ///< Some chunk holds the column native.
+
+/**
+ * @brief Exchanges this rank's pin outcome with every rank's: @p storage, the pinned chunks'
+ * column metadata, or null with @p error when this rank's pin failed.
+ *
+ * @return By column name, the carrier every rank's scans plan: the widest any rank narrowed it to,
+ * when every rank holding rows narrowed it.
+ * @throws duckdb::InvalidInputException, on every rank, when any rank failed.
+ */
+std::map<std::string, cudf::data_type> agree_on_pin(
+  duckdb::SiriusContext& sirius_ctx,
+  sirius::operator_params const& params,
+  std::string const& table,
+  std::vector<std::string> const& columns,
+  sirius::pinned_column_storage_matrix const* storage,
+  std::string const& error)
+{
+  std::vector<std::int32_t> mine{storage == nullptr ? 1 : 0};
+  for (std::size_t c = 0; c < columns.size(); ++c) {
+    std::optional<cudf::data_type> widest;
+    bool narrowed = storage != nullptr && !storage->empty();
+    for (auto const& chunk : storage ? *storage : sirius::pinned_column_storage_matrix{}) {
+      if (c >= chunk.size() || !chunk[c].narrowed) {
+        narrowed = false;
+        break;
+      }
+      if (!widest || cudf::size_of(chunk[c].carrier) > cudf::size_of(*widest)) {
+        widest = chunk[c].carrier;
+      }
+    }
+    if (storage == nullptr || storage->empty()) {
+      mine.insert(mine.end(), {pin_without_chunks, 0});
+    } else if (!narrowed) {
+      mine.insert(mine.end(), {pin_not_narrowed, 0});
+    } else {
+      mine.insert(mine.end(), {static_cast<std::int32_t>(widest->id()), widest->scale()});
+    }
+  }
+
+  auto* gpu    = sirius_ctx.get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto service = sirius_ctx.get_exchange_service(params);
+  auto const stream = cudf::get_default_stream();
+  auto column       = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          static_cast<cudf::size_type>(mine.size()));
+  RMM_CUDA_TRY(cudaMemcpy(column->mutable_view().data<std::int32_t>(),
+                          mine.data(),
+                          mine.size() * sizeof(std::int32_t),
+                          cudaMemcpyHostToDevice));
+  std::vector<std::unique_ptr<cudf::column>> table_columns;
+  table_columns.push_back(std::move(column));
+  auto batch    = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(table_columns)),
+                                       *gpu,
+                                       stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  auto const id = (sirius_ctx.next_distributed_query() << sirius::exchange::query_stream_bits) | 1;
+  // Ranks finish their shares at different times; a pin can take many minutes.
+  auto const all =
+    sirius::exchange::all_gather(*service, id, batch, *gpu, stream, std::chrono::hours{1});
+
+  std::vector<std::vector<std::int32_t>> outcomes;
+  vector<string> failed;
+  for (std::size_t rank = 0; rank < all.size(); ++rank) {
+    std::vector<std::int32_t> theirs;
+    if (all[rank]) {
+      auto ro   = all[rank]->to_read_only();
+      auto view = sirius::get_cudf_table_view(ro).column(0);
+      theirs.resize(static_cast<std::size_t>(view.size()));
+      RMM_CUDA_TRY(cudaMemcpy(theirs.data(),
+                              view.data<std::int32_t>(),
+                              theirs.size() * sizeof(std::int32_t),
+                              cudaMemcpyDeviceToHost));
+    }
+    // A rank that pinned other columns cannot agree on these.
+    if (theirs.size() != mine.size() || theirs[0] != 0) { failed.push_back(std::to_string(rank)); }
+    outcomes.push_back(std::move(theirs));
+  }
+  if (!failed.empty()) {
+    throw InvalidInputException(
+      "pin_table '%s': rank(s) %s could not pin their share, so no rank keeps the pin%s",
+      table,
+      StringUtil::Join(failed, ", "),
+      error.empty() ? "" : "; this rank: " + error);
+  }
+
+  std::map<std::string, cudf::data_type> agreed;
+  for (std::size_t c = 0; c < columns.size(); ++c) {
+    std::optional<cudf::data_type> widest;
+    bool vetoed = false;
+    for (auto const& outcome : outcomes) {
+      auto const id = outcome[1 + 2 * c];
+      if (id == pin_not_narrowed) { vetoed = true; }
+      if (id < 0) { continue; }
+      auto const type_id            = static_cast<cudf::type_id>(id);
+      cudf::data_type const carrier = cudf::is_fixed_point(cudf::data_type{type_id})
+                                        ? cudf::data_type{type_id, outcome[2 + 2 * c]}
+                                        : cudf::data_type{type_id};
+      if (!widest || cudf::size_of(carrier) > cudf::size_of(*widest)) { widest = carrier; }
+    }
+    if (!vetoed && widest) { agreed.emplace(columns[c], *widest); }
+  }
+  return agreed;
 }
 
 // SQL replay binds again on another connection. Validate that connection's final
@@ -1009,6 +1123,11 @@ unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context
     result->args.compression = compression_it->second.GetValue<bool>();
   }
 
+  auto replicate_it = input.named_parameters.find("replicate");
+  if (replicate_it != input.named_parameters.end() && !replicate_it->second.IsNull()) {
+    result->args.replicate = replicate_it->second.GetValue<bool>();
+  }
+
   // Resolve the source format: an explicit 'format' parameter, else inferred from
   // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
   auto to_lower = [](std::string s) {
@@ -1040,6 +1159,12 @@ unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context
     throw BinderException("pin_table: provide a positional path (parquet) or format => 'duckdb'");
   }
 
+  if (result->args.replicate &&
+      (result->args.format != "parquet" || result->args.tier == "parquet")) {
+    // Only a decoded pin serves the scans that read a replicated table whole on every rank.
+    throw BinderException(
+      "pin_table 'replicate' applies to parquet tables on tier 'gpu' or 'host'");
+  }
   if (result->args.format == "parquet") {
     if (result->args.path.empty()) {
       throw BinderException("pin_table: format 'parquet' requires a positional path argument");
@@ -1197,10 +1322,13 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       std::sort(file_paths.begin(), file_paths.end());
       // Distributed: each rank pins the share of the files its scans of them read, so the pin
       // serves those scans (cache_entry_info matches files and byte ranges) and the ranks
-      // together hold the table once.
+      // together hold the table once. A replicated pin holds every file whole on every rank,
+      // and the scans it serves read the whole table on every rank.
       auto const share_options = duckdb::query_operator_options(context);
       auto share               = sirius::planner::file_share_for_rank(
-        std::move(file_paths), share_options->exchange_rank, share_options->exchange_peers.size());
+        std::move(file_paths),
+        data.args.replicate ? 0 : share_options->exchange_rank,
+        data.args.replicate ? 1 : share_options->exchange_peers.size());
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -1338,9 +1466,35 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     auto const pinned_column_names = cache_info.column_names();
     auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
 
+    // A distributed parquet pin's ranks agree on its outcome before any keeps it (agree_on_pin):
+    // a rank whose materialization fails still takes part, so every rank fails together.
+    bool const across_ranks =
+      data.args.format == "parquet" && pin_op_params.exchange_peers.size() > 1;
+    std::map<std::string, cudf::data_type> agreed_carriers;
+    auto materialize = [&](auto&& run) {
+      if (!across_ranks) { return run(); }
+      std::optional<decltype(run())> result;
+      std::string error;
+      try {
+        result.emplace(run());
+      } catch (std::exception const& e) {
+        error = e.what();
+      } catch (...) {
+        error = "unknown error";
+      }
+      agreed_carriers = agree_on_pin(*sirius_ctx,
+                                     pin_op_params,
+                                     data.args.name,
+                                     pinned_column_names,
+                                     result ? &result->column_storage : nullptr,
+                                     error);
+      return std::move(*result);
+    };
+
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                             std::vector<std::size_t> row_counts) {
       sirius::scan_manager::pinned_entry_metadata metadata;
+      if (across_ranks) { metadata.rank_agreed_carriers = agreed_carriers; }
       if (verdicts.size() == pinned_column_names.size()) {
         for (std::size_t i = 0; i < verdicts.size(); ++i) {
           if (verdicts[i] == sirius::late_mat::unique_verdict::proven)
@@ -1361,17 +1515,20 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
       // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
       // chunk back on a NUMA-local GPU.
-      auto host_result =
-        sirius::materialize_pin_to_host(*ingestible,
-                                        gpu_spaces_mut,
-                                        host_space_by_gpu,
-                                        *scan_mgr.io_ctx(),
-                                        pinned_column_types,
-                                        pin_comp,
-                                        {.expression_policy   = pin_op_params.expression_policy(),
-                                         .capture_chunk_stats = capture_chunk_stats,
-                                         .enable_compressed_materialization = compressed_pin,
-                                         .probe_unique_columns = probe_unique_columns});
+      auto host_result = materialize([&] {
+        return sirius::materialize_pin_to_host(
+          *ingestible,
+          gpu_spaces_mut,
+          host_space_by_gpu,
+          *scan_mgr.io_ctx(),
+          pinned_column_types,
+          pin_comp,
+          {.expression_policy                 = pin_op_params.expression_policy(),
+           .capture_chunk_stats               = capture_chunk_stats,
+           .enable_compressed_materialization = compressed_pin,
+           .probe_unique_columns              = probe_unique_columns,
+           .memory_limit                      = pin_op_params.pin_table_memory_limit});
+      });
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(host_result.column_storage));
@@ -1394,16 +1551,19 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       // on), then compress it when it qualifies, keeping the compressed payload in device
       // memory; batches that do not qualify are pinned uncompressed. Both forms land in
       // one ordered chunk vector, so a table that mixes them pins without special-casing.
-      auto dev_result = sirius::materialize_all_batches_compressed(
-        *ingestible,
-        gpu_spaces_mut,
-        *scan_mgr.io_ctx(),
-        pinned_column_types,
-        pin_comp,
-        {.expression_policy                 = pin_op_params.expression_policy(),
-         .capture_chunk_stats               = false,
-         .enable_compressed_materialization = compressed_pin,
-         .probe_unique_columns              = probe_unique_columns});
+      auto dev_result = materialize([&] {
+        return sirius::materialize_all_batches_compressed(
+          *ingestible,
+          gpu_spaces_mut,
+          *scan_mgr.io_ctx(),
+          pinned_column_types,
+          pin_comp,
+          {.expression_policy                 = pin_op_params.expression_policy(),
+           .capture_chunk_stats               = false,
+           .enable_compressed_materialization = compressed_pin,
+           .probe_unique_columns              = probe_unique_columns,
+           .memory_limit                      = pin_op_params.pin_table_memory_limit});
+      });
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(dev_result.column_storage));
@@ -1418,15 +1578,18 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     } else {
       // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
       // (with its GPU placement) and pin them in place.
-      auto mat =
-        sirius::materialize_all_batches(*ingestible,
-                                        gpu_spaces_mut,
-                                        *scan_mgr.io_ctx(),
-                                        pinned_column_types,
-                                        {.expression_policy   = pin_op_params.expression_policy(),
-                                         .capture_chunk_stats = capture_chunk_stats,
-                                         .enable_compressed_materialization = compressed_pin,
-                                         .probe_unique_columns = probe_unique_columns});
+      auto mat = materialize([&] {
+        return sirius::materialize_all_batches(
+          *ingestible,
+          gpu_spaces_mut,
+          *scan_mgr.io_ctx(),
+          pinned_column_types,
+          {.expression_policy                 = pin_op_params.expression_policy(),
+           .capture_chunk_stats               = capture_chunk_stats,
+           .enable_compressed_materialization = compressed_pin,
+           .probe_unique_columns              = probe_unique_columns,
+           .memory_limit                      = pin_op_params.pin_table_memory_limit});
+      });
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(mat.column_storage));
@@ -2402,6 +2565,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
       options.Add("name", LogicalType::VARCHAR);
       options.Add("cols", LogicalType::LIST(LogicalType::VARCHAR));
       options.Add("compression", LogicalType::BOOLEAN);
+      options.Add("replicate", LogicalType::BOOLEAN);
       options.Add("format", LogicalType::VARCHAR);
       options.Add("schema_name", LogicalType::VARCHAR);
     });
@@ -2946,6 +3110,16 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetPinTableMemoryLimit(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const fraction = DoubleValue::Get(parameter);
+  if (!(fraction > 0.0) || fraction > 1.0) {
+    throw InvalidInputException("pin_table_memory_limit must be in (0.0, 1.0], got %f", fraction);
+  }
+  get_operator_params(context, scope)->pin_table_memory_limit = fraction;
+  SIRIUS_LOG_DEBUG("Updated config PIN_TABLE_MEMORY_LIMIT to {}", fraction);
+}
+
 static void SetEnableDecimalSumStatsBound(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                           = get_operator_params(context, scope);
@@ -3259,6 +3433,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
                     SetEnablePinnedZoneMapPruning);
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "pin_table_memory_limit",
+                    "share of the memory it pins into that pin_table may fill, counting what is "
+                    "already there; past it the pin fails on every rank",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(operator_defaults.pin_table_memory_limit),
+                    SetPinTableMemoryLimit);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_decimal_sum_stats_bound",

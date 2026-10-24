@@ -329,7 +329,18 @@ can serve a scan: same format, same identity, and a **column superset** of the s
 Parquet pin never serves a DuckDB scan or vice versa. A whole-file pin never serves a byte-range
 scan, nor the reverse. In distributed execution each rank pins its own share of the files
 (`planner::file_share_for_rank`, the split its scans of them read), so the ranks together hold the
-table once and each rank's pin serves that rank's scans. DuckDB cache serving additionally requires
+table once and each rank's pin serves that rank's scans. A pin taken with `replicate = true` holds
+every file whole on every rank instead. A scan it can serve then reads every file whole on every
+rank (`parquet_ingestible_table_info::replicated`), and the distributed planner sends none of its
+rows: a join builds from it where it is, and what is computed from such scans alone stays on every
+rank (`distribute_plan`).
+
+`pin_table` fails rather than fill more than `pin_table_memory_limit` (default 0.9) of the memory
+space it pins into, counting what the space already holds, or leave less than that share of a host
+space's NUMA node free (`check_pin_memory`). The host pools of all the processes on a node share
+its memory, and on hosts whose GPU memory shows up as NUMA nodes, only the nodes with CPUs hold
+them. A pin reads up to 16 files' footers and decodes up to 8 batches at once, and stores the
+batches in order. DuckDB cache serving additionally requires
 every projected column's current native cuDF mapping to equal the mapping recorded at pin time; a
 mismatch is a clean cache miss rather than a conversion of stale data under a new type.
 

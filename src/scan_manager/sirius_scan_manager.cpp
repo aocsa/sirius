@@ -2778,6 +2778,14 @@ void apply_pin_metadata(pinned_entry& entry,
     entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(*metadata.mvcc));
     entry.mvcc_mask_cache.reset();
   }
+  if (metadata.rank_agreed_carriers) {
+    if (!entry.rank_agreed_carriers) { entry.rank_agreed_carriers.emplace(); }
+    for (auto const& [name, carrier] : *metadata.rank_agreed_carriers) {
+      if (std::ranges::find(stored_columns, name) != stored_columns.end()) {
+        (*entry.rank_agreed_carriers)[name] = carrier;
+      }
+    }
+  }
   if (metadata.proven_unique_columns.empty()) return;
   entry.proven_unique_columns.resize(entry.cache_info.names.size(), false);
   for (auto const& name : metadata.proven_unique_columns) {
@@ -2908,6 +2916,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       entry.num_rows               = previous.num_rows;
       entry.zone_maps              = previous.zone_maps.clone();
       entry.proven_unique_columns  = previous.proven_unique_columns;
+      entry.rank_agreed_carriers   = previous.rank_agreed_carriers;
       if (!metadata.mvcc && previous.mvcc) {
         entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(*previous.mvcc);
       }
@@ -3508,6 +3517,20 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_p
   return nullptr;
 }
 
+std::shared_ptr<const pinned_entry> sirius_scan_manager::find_replicated_parquet_pin(
+  std::span<std::string const> resolved_file_paths,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids) const
+{
+  // A rank's share of local files always carries byte ranges, so a whole-file pin of every file
+  // is a replicated one; rank_agreed_carriers marks it as taken by every rank.
+  auto entry = find_pinned_entry_for_parquet_files(resolved_file_paths, {});
+  if (!entry || !entry->rank_agreed_carriers ||
+      entry->cache_info.column_projection_for(column_ids).empty()) {
+    return nullptr;
+  }
+  return entry;
+}
+
 void validate_column_storage_shape(pinned_column_storage_matrix const& matrix,
                                    std::size_t expected_chunks,
                                    std::size_t expected_columns,
@@ -3632,6 +3655,15 @@ std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& 
                                                             std::size_t entry_position,
                                                             cudf::data_type native_type)
 {
+  if (entry.rank_agreed_carriers) {
+    if (entry_position >= entry.cache_info.names.size()) { return std::nullopt; }
+    auto const agreed = entry.rank_agreed_carriers->find(entry.cache_info.names[entry_position]);
+    if (agreed == entry.rank_agreed_carriers->end() ||
+        !sirius::can_narrow_to(native_type, agreed->second)) {
+      return std::nullopt;
+    }
+    return agreed->second;
+  }
   if (!pinned_column_narrowed_in_all_chunks(entry, entry_position)) { return std::nullopt; }
 
   // The recorded matrix is pinned to the cached column count at insertion; refuse to answer from
