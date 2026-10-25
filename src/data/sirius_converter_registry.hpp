@@ -28,6 +28,11 @@
 #include <mutex>
 #include <stdexcept>
 
+namespace sirius::scan_manager {
+/// Defined in scan_manager/partial_pin_serving.cpp.
+void register_partial_pin_converters(cucascade::representation_converter_registry& registry);
+}  // namespace sirius::scan_manager
+
 namespace sirius {
 
 /**
@@ -63,6 +68,7 @@ class converter_registry {
     cucascade::register_builtin_converters(*registry);
     sirius::register_compression_converters(*registry);
     sirius::spill::register_chunked_spill_converters(*registry, copy_chunk_bytes);
+    sirius::scan_manager::register_partial_pin_converters(*registry);
     copy_chunk_bytes_ = copy_chunk_bytes;
     instance_         = std::move(registry);
   }

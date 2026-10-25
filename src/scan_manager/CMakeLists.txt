@@ -12,6 +12,7 @@ target_sources(
           readahead_scan_manager.cpp
           round_robin_strategy.cpp
           memory_prefetcher.cpp
+          partial_pin_serving.cpp
           sirius_scan_manager.cpp
           split_connector.cpp
           split_provider.cpp)

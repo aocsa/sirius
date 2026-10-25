@@ -270,6 +270,14 @@ struct scan_manager_config {
   /// splits. Disabled by default.
   memory_prefetcher_config memory_prefetcher{};
 
+  /// Let a parquet pin that holds only some of a scan's columns serve them, reading the scan's
+  /// other columns of the same rows from disk. Off by default.
+  bool pin_partial_serving{false};
+
+  /// Least share of a scan's decoded row width a pin must hold to serve it partly. A smaller
+  /// share saves little and still costs a disk read per chunk.
+  double pin_partial_min_fraction{0.3};
+
   /// Refresh the knobs derived from @ref cache.
   void apply_cache_mode() noexcept
   {
