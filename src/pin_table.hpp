@@ -117,6 +117,20 @@ struct pinned_column_storage_meta {
 /// Chunk-major stored-column metadata: element [c][i] describes cached column i of chunk c.
 using pinned_column_storage_matrix = std::vector<std::vector<pinned_column_storage_meta>>;
 
+/// The parquet row groups one pinned chunk decoded, in decode order. A chunk's rows are exactly
+/// these row groups' rows, unfiltered, so a scan can read any other column of the same rows from
+/// disk and line it up with the pinned columns.
+struct pinned_chunk_source {
+  struct file_row_groups {
+    std::string path;  ///< canonical, as in cache_entry_info::resolved_file_paths
+    std::vector<cudf::size_type> row_groups;
+    bool operator==(file_row_groups const&) const = default;
+  };
+  std::vector<file_row_groups> files;
+  std::size_t num_rows{0};  ///< rows the chunk holds
+  bool operator==(pinned_chunk_source const&) const = default;
+};
+
 /// GPU-resident tables produced by driving a @c gpu_ingestible to completion, with
 /// each table's GPU placement recorded in @c chunk_memory_spaces (parallel to
 /// @c tables). Consumed by the pin_table path: fed directly into
@@ -131,6 +145,9 @@ struct materialized_pin {
   /// pins these become @c duckdb_mvcc_metadata::base_row_count_per_chunk — the
   /// positional chunk→rowid-range map query-time MVCC merge relies on.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// Parquet pins: the row groups behind each chunk, parallel to the chunks. Empty when any
+  /// batch was not a parquet split (duckdb-native pins).
+  std::vector<pinned_chunk_source> chunk_sources;
   /// Per-chunk zone-map capture: chunk_stats[c][i] = stats of batch column i of
   /// chunk c (null = none). Parallel to @c tables when capture ran; empty when
   /// capture was skipped (no pinned column types). Fed together with the
@@ -233,6 +250,8 @@ struct host_pin_result {
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// See @ref materialized_pin::chunk_sources.
+  std::vector<pinned_chunk_source> chunk_sources;
   /// Per-chunk zone-map capture (taken on the GPU table before host conversion /
   /// compression); chunk_stats[c][i] = stats of batch column i of chunk c (null =
   /// none). Parallel to @c chunks when capture ran; empty when capture was skipped
@@ -283,6 +302,8 @@ struct device_pin_result {
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// See @ref materialized_pin::chunk_sources.
+  std::vector<pinned_chunk_source> chunk_sources;
   /// Late-mat uniqueness verdicts, positional with the pinned columns; see
   /// @ref materialized_pin::unique_verdicts.
   std::vector<late_mat::unique_verdict> unique_verdicts;

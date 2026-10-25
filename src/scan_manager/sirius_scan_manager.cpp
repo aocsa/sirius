@@ -48,6 +48,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/partial_pin_serving.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_context.hpp"
 
@@ -1893,6 +1894,13 @@ void sirius_scan_manager::prepare_for_query(
           delta_request->plan.delta_rows());
       }
     }
+    // A partly served scan joins each pinned chunk with a disk read of the same rows: it takes no
+    // decode-time row dropping, which would desynchronize the two halves, and no deferral.
+    if (assignment.partial) {
+      provider_inputs_by_assignment.push_back(
+        provider_inputs{std::move(masks), std::move(delta_splits), {}});
+      continue;
+    }
     // The scan's filter as the decompressor can use it: columns the query only
     // ever tests for equality and never projects can come back as the boolean
     // answer instead of values, and range conjuncts can drop rows while the
@@ -1960,16 +1968,36 @@ void sirius_scan_manager::prepare_for_query(
     // two -- it occupies an output position with no materialized column -- and such a scan
     // cannot serve from a pin, since a pin never captures a partition column and a scan
     // requesting one therefore misses the cache.
-    auto provider                 = make_provider_for_pinned_entry(assignment.entry,
-                                                   assignment.columns,
-                                                   std::move(assignment.plan),
-                                                   assignment.op->batch_telemetry(),
-                                                   std::move(inputs.masks),
-                                                   std::move(inputs.delta_splits),
-                                                   assignment.op->normalization_targets(),
-                                                   assignment.op->has_physical_overrides(),
-                                                   std::move(inputs.pushdown_req),
-                                                   std::move(consumer));
+    std::unique_ptr<databatch_provider> provider;
+    if (assignment.partial) {
+      auto const& files = assignment.entry->cache_info.resolved_file_paths;
+      auto io_ctx       = files.empty() ? nullptr : ioctx_for_path(files.front());
+      if (!io_ctx) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::prepare_for_query] no io backend reads "
+          "the files of pinned entry '" +
+          assignment.entry_name + "'");
+      }
+      auto scan = std::make_shared<partial_pin_scan const>(assignment.entry,
+                                                           std::move(*assignment.partial),
+                                                           std::move(io_ctx),
+                                                           assignment.op->contract_id());
+      provider  = make_partial_pin_provider(std::move(scan),
+                                           assignment.entry,
+                                           std::move(assignment.plan),
+                                           assignment.op->normalization_targets());
+    } else {
+      provider = make_provider_for_pinned_entry(assignment.entry,
+                                                assignment.columns,
+                                                std::move(assignment.plan),
+                                                assignment.op->batch_telemetry(),
+                                                std::move(inputs.masks),
+                                                std::move(inputs.delta_splits),
+                                                assignment.op->normalization_targets(),
+                                                assignment.op->has_physical_overrides(),
+                                                std::move(inputs.pushdown_req),
+                                                std::move(consumer));
+    }
     provider->contract_id         = assignment.op->contract_id();
     provider->validation.identity = assignment.entry->identity_evidence;
     provider->validation.layout   = assignment.entry->layout_evidence;
@@ -2770,6 +2798,21 @@ std::vector<std::size_t> cache_entry_info::column_projection_for(
 }
 
 namespace {
+/// A new entry takes the pin's chunk sources when they describe its chunks; otherwise it is
+/// pinned without them, which only rules out reading its missing columns from disk later.
+void adopt_chunk_sources(pinned_entry& entry,
+                         std::vector<sirius::pinned_chunk_source> sources,
+                         std::string_view name)
+{
+  if (sources.empty()) { return; }
+  if (auto const problem = chunk_sources_problem(entry, sources)) {
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager] pinned entry '{}': dropping chunk sources: {}", name, *problem);
+    return;
+  }
+  entry.chunk_sources = std::move(sources);
+}
+
 void apply_pin_metadata(pinned_entry& entry,
                         pinned_entry_metadata metadata,
                         std::span<const std::string> stored_columns)
@@ -2963,6 +3006,15 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
           }
         }
       }
+      // Equal per-chunk row counts can still be different row groups. When both pins know their
+      // sources, they must agree; an entry pinned without them stays without them.
+      if (!previous.chunk_sources.empty() && !metadata.chunk_sources.empty() &&
+          previous.chunk_sources != metadata.chunk_sources) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::insert_pinned_entry] merge mismatch — the new materialization's "
+          "chunks hold different row groups than the existing entry's");
+      }
+      entry.chunk_sources = previous.chunk_sources;
       // Only now that the merge is known to be legal: the append below grows the existing
       // matrix row by row alongside cache_info, so an existing matrix that does not already
       // cover every chunk and column would desynchronize the two silently. Checked after the
@@ -3106,6 +3158,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   } catch (std::exception const&) {
     entry.layout_evidence = {true, false};
   }
+  adopt_chunk_sources(entry, std::move(metadata.chunk_sources), name);
   apply_pin_metadata(entry, std::move(metadata), entry.cache_info.names);
   publish_pinned_entry(name, std::move(entry));
   // The replace path stored every column.
@@ -3213,6 +3266,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
     entry.layout_evidence = {true, false};
   }
   std::lock_guard pin_lk{_pinned_entries_mutex};
+  adopt_chunk_sources(entry, std::move(metadata.chunk_sources), name);
   apply_pin_metadata(entry, std::move(metadata), entry.cache_info.names);
   publish_pinned_entry(name, std::move(entry));
 }
@@ -3279,6 +3333,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
     entry.layout_evidence = {true, false};
   }
   std::lock_guard pin_lk{_pinned_entries_mutex};
+  adopt_chunk_sources(entry, std::move(metadata.chunk_sources), name);
   apply_pin_metadata(entry, std::move(metadata), entry.cache_info.names);
   publish_pinned_entry(name, std::move(entry));
 }
@@ -3640,6 +3695,42 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   }
 
   throw std::runtime_error("pinned entry has an unsupported tier");
+}
+
+std::optional<std::string> chunk_sources_problem(
+  pinned_entry const& entry, std::span<sirius::pinned_chunk_source const> sources)
+{
+  std::size_t chunks = 0;
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    chunks = entry.host_chunks.size();
+  } else if (!entry.device_chunks.empty()) {
+    chunks = entry.device_chunks.size();
+  } else if (!entry.data_batches_by_column.empty()) {
+    chunks = entry.data_batches_by_column.begin()->second.size();
+  }
+  if (sources.size() != chunks) {
+    return "sources describe " + std::to_string(sources.size()) + " chunk(s) but the entry has " +
+           std::to_string(chunks);
+  }
+  auto const& files = entry.cache_info.resolved_file_paths;
+  std::size_t rows  = 0;
+  for (std::size_t c = 0; c < sources.size(); ++c) {
+    if (sources[c].files.empty()) {
+      return "chunk " + std::to_string(c) + " has no source row groups";
+    }
+    for (auto const& file : sources[c].files) {
+      if (file.row_groups.empty() || std::ranges::find(files, file.path) == files.end()) {
+        return "chunk " + std::to_string(c) + " names row groups of '" + file.path +
+               "', which is not one of the entry's files";
+      }
+    }
+    rows += sources[c].num_rows;
+  }
+  if (rows != entry.num_rows) {
+    return "sources hold " + std::to_string(rows) + " rows but the entry has " +
+           std::to_string(entry.num_rows);
+  }
+  return std::nullopt;
 }
 
 bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry, std::size_t entry_position)
@@ -4037,7 +4128,45 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
       return std::nullopt;
     }
   }
-  return std::nullopt;
+
+  // No entry holds every column. One that holds some of a parquet scan's columns can still serve
+  // those, with the rest of the same rows read from disk; take the one holding the most.
+  auto const* parquet = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&table_info);
+  if (!_config.pin_partial_serving || parquet == nullptr) { return std::nullopt; }
+  auto const materialized = op->get_ingestible().materialized_column_order();
+  std::optional<cached_assignment> best;
+  for (auto const& [pinned_name, entry_ptr] : snapshot) {
+    auto cover =
+      partial_cover_for(*entry_ptr, *parquet, materialized, _config.pin_partial_min_fraction);
+    if (!cover || (best && cover->pinned_share <= best->partial->pinned_share)) { continue; }
+    try {
+      validate_pinned_entry_for_serving(*entry_ptr, cover->pinned_slots);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_scan_manager] pinned entry '{}' cannot partly serve operator '{}': {}",
+        pinned_name,
+        op->get_operator_id(),
+        e.what());
+      continue;
+    }
+    auto const filter_view =
+      state.pruning_enabled ? extract_scan_filters(table_info) : scan_filter_view{};
+    auto plan =
+      build_cached_scan_plan(*entry_ptr, filter_view.table_filters, filter_view.column_ids);
+    auto slots = cover->pinned_slots;
+    best       = cached_assignment{
+      op, entry_ptr, std::move(slots), pinned_name, std::move(plan), std::move(*cover)};
+  }
+  if (best) {
+    SIRIUS_LOG_INFO(
+      "[sirius_scan_manager] assigned pinned entry '{}' to operator '{}' partly: {} of {} "
+      "column(s) from the pin, the rest from disk",
+      best->entry_name,
+      op->get_operator_id(),
+      best->partial->pinned_slots.size(),
+      best->partial->from_pin.size());
+  }
+  return best;
 }
 
 }  // namespace sirius::scan_manager

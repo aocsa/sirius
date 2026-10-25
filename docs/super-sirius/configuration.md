@@ -329,6 +329,8 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
+| `pin_partial_serving` | bool | `false` | Let a parquet pin that holds only some of a scan's columns serve them, reading the scan's other columns of the same rows from disk. Needs pins taken by a build that records each chunk's row groups. |
+| `pin_partial_min_fraction` | fraction | `0.3` | Least share of a scan's decoded row width a pin must hold to serve it partly. A smaller share saves little, and the disk half reads its columns without the scan's filter. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
 sub-config below.

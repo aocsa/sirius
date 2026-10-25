@@ -201,6 +201,8 @@ struct pinned_entry_metadata {
   std::vector<std::string> proven_unique_columns;
   /// Distributed pins: see @ref pinned_entry::rank_agreed_carriers.
   std::optional<std::map<std::string, cudf::data_type>> rank_agreed_carriers;
+  /// Parquet pins: see @ref pinned_entry::chunk_sources.
+  std::vector<sirius::pinned_chunk_source> chunk_sources;
 };
 
 /**
@@ -274,6 +276,11 @@ struct pinned_entry {
   /// Total rows across pinned chunks. Re-insertion merges only when this and the
   /// cache identity match.
   std::size_t num_rows{0};
+  /// Parquet pins: the row groups behind each chunk, positional with the chunks. Lets a scan
+  /// read the columns this entry lacks for exactly a chunk's rows. Empty when unknown: a
+  /// duckdb-native pin, sources that failed @ref chunk_sources_problem at insert, or a merge
+  /// onto an entry pinned without them.
+  std::vector<sirius::pinned_chunk_source> chunk_sources;
   /// Zone-map sidecar: pin-time DuckDB types + per-chunk min/max statistics,
   /// positional with cache_info.column_ids. Absent (never prunes) when the
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
@@ -326,6 +333,12 @@ struct pinned_entry {
 /// recording the assignment and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
+
+/// Why @p sources cannot describe @p entry's chunks, or nullopt when they can: one source per
+/// stored chunk, row counts summing to the entry's, and every file one of the entry's files.
+/// Checked at insert, where failing sources are dropped rather than failing the pin.
+[[nodiscard]] std::optional<std::string> chunk_sources_problem(
+  pinned_entry const& entry, std::span<sirius::pinned_chunk_source const> sources);
 
 /// Validate the shape of @p matrix alone: it must hold @p expected_chunks rows of
 /// @p expected_columns cells each. @p allow_empty admits the empty matrix, which reads as
@@ -420,6 +433,19 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
  */
+/// How a pin holding only some of a parquet scan's columns serves it: the pinned columns from the
+/// pin, the others for the same rows from disk (scan_manager/partial_pin_serving.hpp).
+struct partial_cover {
+  std::vector<std::size_t>
+    pinned_slots;  ///< entry positions of the pinned columns, materialized order
+  std::vector<std::string>
+    disk_columns;  ///< parquet names of the other columns, materialized order
+  /// Per materialized column: from the pin (the next pinned slot) or from disk (the next name).
+  std::vector<bool> from_pin;
+  std::size_t disk_bytes_per_row{0};  ///< decoded width of the disk columns, for estimates
+  double pinned_share{0};             ///< the pinned columns' share of the decoded row width
+};
+
 struct cached_scan_plan {
   std::vector<std::size_t> survivor_chunk_indices;  ///< indices of chunks that survived pruning
   std::size_t pruned{0};
@@ -1048,6 +1074,9 @@ class sirius_scan_manager {
     std::vector<std::size_t> columns;  ///< selected columns, materialized order
     std::string entry_name;            ///< handoff key into the state's pending mask jobs
     cached_scan_plan plan;             ///< zone-map survivor plan, moved into the provider
+    /// Set when the entry holds only some of the scan's columns: @c columns then lists the pinned
+    /// ones, and the provider reads the rest from disk.
+    std::optional<partial_cover> partial;
   };
 
   /// \brief Match @p op against the pinned entries. On a hit, validates the

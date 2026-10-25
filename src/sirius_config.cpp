@@ -354,6 +354,8 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
+  r.optional("pin_partial_serving", opt.pin_partial_serving);
+  r.optional("pin_partial_min_fraction", opt.pin_partial_min_fraction, yaml::fraction<double>{});
   r.reject_unknown();
   // Stamped here rather than by the caller: `cache` and the `uring` sub-config
   // it overrides have both been read by now.

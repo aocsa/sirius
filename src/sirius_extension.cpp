@@ -1492,8 +1492,10 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     };
 
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
-                            std::vector<std::size_t> row_counts) {
+                            std::vector<std::size_t> row_counts,
+                            std::vector<sirius::pinned_chunk_source> chunk_sources) {
       sirius::scan_manager::pinned_entry_metadata metadata;
+      metadata.chunk_sources = std::move(chunk_sources);
       if (across_ranks) { metadata.rank_agreed_carriers = agreed_carriers; }
       if (verdicts.size() == pinned_column_names.size()) {
         for (std::size_t i = 0; i < verdicts.size(); ++i) {
@@ -1545,7 +1547,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         std::move(pinned_column_types),
         std::move(host_result.chunk_stats),
         std::move(host_result.column_storage),
-        pin_metadata(host_result.unique_verdicts, std::move(host_result.base_row_count_per_chunk)));
+        pin_metadata(host_result.unique_verdicts,
+                     std::move(host_result.base_row_count_per_chunk),
+                     std::move(host_result.chunk_sources)));
     } else if (pin_comp.enabled) {
       // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
       // on), then compress it when it qualifies, keeping the compressed payload in device
@@ -1574,7 +1578,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         std::move(dev_result.chunks),
         *gpu_spaces_mut[0],
         std::move(dev_result.column_storage),
-        pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
+        pin_metadata(dev_result.unique_verdicts,
+                     std::move(dev_result.base_row_count_per_chunk),
+                     std::move(dev_result.chunk_sources)));
     } else {
       // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
       // (with its GPU placement) and pin them in place.
@@ -1602,7 +1608,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         std::move(pinned_column_types),
         std::move(mat.chunk_stats),
         std::move(mat.column_storage),
-        pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)));
+        pin_metadata(
+          mat.unique_verdicts, std::move(base_row_count_per_chunk), std::move(mat.chunk_sources)));
     }
 
     output.SetCardinality(1);

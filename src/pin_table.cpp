@@ -28,6 +28,7 @@
 #include "memory/runtime_stream_pool.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius/exception.hpp"
@@ -258,11 +259,15 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options,
-  const pin_batch_sink& on_batch)
+  const pin_batch_sink& on_batch,
+  std::vector<pinned_chunk_source>& chunk_sources)
 {
   if (gpu_spaces.empty()) {
     throw std::invalid_argument("[materialize_pin_batches] gpu_spaces must be non-empty");
   }
+  chunk_sources.clear();
+  // Cleared at the first batch that is not a parquet split: sources must cover every chunk.
+  bool record_sources = true;
 
   // GPU placement via the same strategy the query path uses
   // (sirius_scan_manager::prepare_for_query). A fresh strategy per call starts its
@@ -362,6 +367,20 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
+    if (record_sources) {
+      if (auto const* split = dynamic_cast<op::scan::parquet_split_info const*>(batch.get())) {
+        pinned_chunk_source source{.files = {}, .num_rows = chunk_rows};
+        source.files.reserve(split->rg_slices.size());
+        for (auto const& slice : split->rg_slices) {
+          source.files.push_back(
+            {op::scan::canonical_scan_file_path(slice.file_path), slice.row_group_indices});
+        }
+        chunk_sources.push_back(std::move(source));
+      } else {
+        record_sources = false;
+        chunk_sources.clear();
+      }
+    }
     // Zone-map capture, while the decode device guard + stream are active and the
     // GPU table is alive. The scalar downloads inside are synchronous, so the
     // capture is complete before the sink converts or frees the table. Clean
@@ -734,7 +753,8 @@ materialized_pin materialize_all_batches(
       out.chunk_memory_spaces.push_back(target);
       out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
-    });
+    },
+    out.chunk_sources);
   return out;
 }
 
@@ -845,7 +865,8 @@ host_pin_result materialize_pin_to_host(
         stream.sync();
         out.chunks.emplace_back(std::move(host_repr));
       }
-    });
+    },
+    out.chunk_sources);
 
   {
     std::size_t compressed_count = 0;
@@ -1032,7 +1053,8 @@ device_pin_result materialize_all_batches_compressed(
           .compressed = nullptr, .columns = std::move(shared_cols), .memory_space = src_space});
       }
       check_pin_memory(*src_space, 0, options.memory_limit);
-    });
+    },
+    out.chunk_sources);
 
   {
     std::size_t compressed_count = 0;
