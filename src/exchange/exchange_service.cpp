@@ -31,6 +31,7 @@ exchange_service::exchange_service(fabric& fabric,
                                    cucascade::memory::memory_space& gpu,
                                    cucascade::memory::memory_space* host,
                                    transport::options opts)
+  : _fabric(fabric)
 {
   transport::callbacks cb{[this](stream_id stream,
                                  rank_t from,

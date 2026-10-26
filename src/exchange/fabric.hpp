@@ -103,6 +103,9 @@ class fabric {
 
   /// Appends the notifications received since the last call to @p out.
   virtual void poll(std::vector<fabric_notification>& out) = 0;
+
+  /// Whether writes to @p peer are staged through host memory (no peer access between the GPUs).
+  [[nodiscard]] virtual bool host_staged(rank_t /*peer*/) const { return false; }
 };
 
 }  // namespace sirius::exchange

@@ -93,7 +93,7 @@ class nixl_fabric : public fabric {
   void poll(std::vector<fabric_notification>& out) override;
 
   /// Whether writes to @p peer go through its host mirror rather than NIXL.
-  [[nodiscard]] bool host_staged(rank_t peer) const { return _peers.at(peer).staged; }
+  [[nodiscard]] bool host_staged(rank_t peer) const override { return _peers.at(peer).staged; }
 
  private:
   struct peer {

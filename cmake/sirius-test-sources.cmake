@@ -49,6 +49,7 @@ set(TEST_SOURCES
     test/cpp/exchange/test_exchange_collectives.cpp
     test/cpp/exchange/test_exchange_operators.cpp
     test/cpp/exchange/test_exchange_transport.cpp
+    test/cpp/exchange/test_shuffle_compression.cpp
     test/cpp/exchange/test_exchange_wire.cpp
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp

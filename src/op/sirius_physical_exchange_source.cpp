@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_exchange_source.hpp"
 
+#include "compression/shuffle_compression.hpp"
 #include "creator/task_creator.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
@@ -313,10 +314,34 @@ std::unique_ptr<operator_data> sirius_physical_exchange_source::get_next_task_in
 }
 
 std::unique_ptr<operator_data> sirius_physical_exchange_source::execute(
-  const operator_data& input, ::cuda::stream_ref /*stream*/)
+  const operator_data& input, ::cuda::stream_ref stream)
 {
-  return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input).get_data_batches());
+  auto const& in = dynamic_cast<const pipelineable_operator_data&>(input);
+  auto batches   = in.get_data_batches();
+  if (compression::shuffle_compression_mode() == compression::shuffle_compression::off) {
+    return std::make_unique<pipelineable_operator_data>(std::move(batches));
+  }
+  // A peer's EXCHANGE_SINK packed what it sent here with Simpatico: one UINT64 column, which this
+  // stream's own schema never is when packing applies.
+  bool const one_uint64 =
+    has_physical_overrides()
+      ? get_physical_types().size() == 1 &&
+          get_physical_types()[0].id() == cudf::type_id::UINT64
+      : get_types().size() == 1 && get_types()[0].id() == sirius::type_id::UBIGINT;
+  if (one_uint64) { return std::make_unique<pipelineable_operator_data>(std::move(batches)); }
+  auto const read_only = in.get_read_only_batches();
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto const view = get_cudf_table_view(read_only[i]);
+    if (!compression::is_shuffle_blob_schema(view)) { continue; }
+    auto* space = read_only[i].get_memory_space();
+    if (space == nullptr) {
+      throw sirius::internal_exception("exchange source: a packed batch is not resident");
+    }
+    auto table =
+      compression::decompress_from_shuffle(view, stream, space->get_default_allocator());
+    batches[i] = make_data_batch(std::move(table), *space, stream, batch_telemetry());
+  }
+  return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 
 std::size_t sirius_physical_exchange_source::no_history_peak_memory_estimate(

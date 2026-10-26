@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_exchange_sink.hpp"
 
+#include "compression/shuffle_compression.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
 #include "log/logging.hpp"
@@ -29,6 +30,7 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <algorithm>
+#include <map>
 #include <utility>
 
 namespace sirius::op {
@@ -122,7 +124,49 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
       ranks.push_back(r);
     }
   }
+  pack_for_peers(slices, ranks, stream);
   return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks));
+}
+
+void sirius_physical_exchange_sink::pack_for_peers(
+  std::vector<std::shared_ptr<cucascade::data_batch>>& slices,
+  std::vector<std::size_t> const& ranks,
+  ::cuda::stream_ref stream)
+{
+  using compression::shuffle_compression;
+  auto const mode = compression::shuffle_compression_mode();
+  if (mode == shuffle_compression::off || slices.empty()) { return; }
+  {
+    // A stream of one UINT64 column would look packed to its EXCHANGE_SOURCE: never pack it.
+    std::lock_guard lock{_input_schema_mutex};
+    if (_input_schema && compression::is_shuffle_blob_schema(_input_schema->view())) { return; }
+  }
+  // A broadcast sends one batch to every rank: pack it once.
+  std::map<cucascade::data_batch const*, std::shared_ptr<cucascade::data_batch>> packed;
+  for (std::size_t i = 0; i < slices.size(); ++i) {
+    auto const to = static_cast<exchange::rank_t>(ranks[i]);
+    if (to == _service->rank()) { continue; }
+    if (mode == shuffle_compression::staged && !_service->host_staged(to)) { continue; }
+    if (auto const it = packed.find(slices[i].get()); it != packed.end()) {
+      slices[i] = it->second;
+      continue;
+    }
+    auto const read_only = slices[i]->to_read_only();
+    auto* space          = read_only.get_memory_space();
+    if (space == nullptr) { continue; }
+    compression::shuffle_compression_stats stats;
+    auto table = compression::compress_for_shuffle(
+      get_cudf_table_view(read_only), stream, space->get_default_allocator(), stats);
+    std::shared_ptr<cucascade::data_batch> out = slices[i];
+    if (table) {
+      out = make_data_batch(std::move(table), *space, stream, batch_telemetry());
+      ++_packed_batches;
+      _raw_bytes += stats.raw_bytes;
+      _packed_bytes += stats.packed_bytes;
+    }
+    packed.emplace(slices[i].get(), out);
+    slices[i] = std::move(out);
+  }
 }
 
 std::unique_ptr<cudf::table> sirius_physical_exchange_sink::empty_like_input() const
@@ -231,6 +275,15 @@ std::size_t sirius_physical_exchange_sink::no_history_peak_memory_estimate(
 void sirius_physical_exchange_sink::on_finalize_operator()
 {
   // A failed exchange throws here; its receivers already learn of it through on_error.
+  if (auto const n = _packed_batches.load(); n > 0) {
+    SIRIUS_LOG_INFO("exchange sink: stream {} packed {} batches for peers, {} -> {} bytes ({:.2f}x)",
+                    _stream,
+                    n,
+                    _raw_bytes.load(),
+                    _packed_bytes.load(),
+                    static_cast<double>(_raw_bytes.load()) /
+                      static_cast<double>(std::max<std::size_t>(_packed_bytes.load(), 1)));
+  }
   try {
     if (!sends()) { return; }
     if (_spec.routing == exchange_spec::mode::gather) {

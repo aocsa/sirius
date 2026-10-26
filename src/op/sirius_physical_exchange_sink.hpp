@@ -23,6 +23,7 @@
 #include <cudf/types.hpp>
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -121,6 +122,11 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
 
  private:
   /// The slices of @p batch, one per rank; empty for a rank that gets none of it.
+  /// Replaces each slice for a peer with its Simpatico-packed form, per
+  /// SIRIUS_EXCHANGE_COMPRESSION (see compression/shuffle_compression.hpp).
+  void pack_for_peers(std::vector<std::shared_ptr<cucascade::data_batch>>& slices,
+                      std::vector<std::size_t> const& ranks,
+                      ::cuda::stream_ref stream);
   std::vector<std::shared_ptr<cucascade::data_batch>> route(
     cucascade::read_only_data_batch const& batch,
     std::shared_ptr<cucascade::data_batch> const& handle,
@@ -132,6 +138,10 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   std::mutex _boundaries_mutex;
   std::shared_ptr<cudf::table const> _boundaries;
   mutable std::mutex _input_schema_mutex;
+  /// Batches packed with Simpatico for peers (SIRIUS_EXCHANGE_COMPRESSION), and their bytes.
+  std::atomic<std::size_t> _packed_batches{0};
+  std::atomic<std::size_t> _raw_bytes{0};
+  std::atomic<std::size_t> _packed_bytes{0};
   /// Empty, with the columns of the first input batch.
   std::unique_ptr<cudf::table> _input_schema;
 };

@@ -69,6 +69,8 @@ class exchange_service {
 
   [[nodiscard]] rank_t rank() const noexcept { return _transport->rank(); }
   [[nodiscard]] rank_t world_size() const noexcept { return _transport->world_size(); }
+  /// See fabric::host_staged.
+  [[nodiscard]] bool host_staged(rank_t peer) const { return _fabric.host_staged(peer); }
 
   /// @throws the exchange's error once it has failed.
   void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch)
@@ -111,6 +113,7 @@ class exchange_service {
   std::map<stream_id, bool> _detached;
   std::map<std::uint64_t, std::exception_ptr> _aborted;
   std::exception_ptr _error;
+  fabric& _fabric;
   // Last: its engine thread calls back into the members above until it is destroyed.
   std::unique_ptr<transport> _transport;
 };
