@@ -50,24 +50,48 @@ def check_answer(answer_csv, sf, q):
 
 
 def suite_rows(run, label, do_validate):
-    inv = json.load(open(f"{run}/invocation.json")) if os.path.exists(f"{run}/invocation.json") else {}
+    inv = (
+        json.load(open(f"{run}/invocation.json"))
+        if os.path.exists(f"{run}/invocation.json")
+        else {}
+    )
     rows = {}
     for line in open(f"{run}/executions.jsonl"):
         e = json.loads(line)
         key = (e["schedule"], e["query"])
-        r = rows.setdefault(key, dict(harness="suite", label=label, sf=e["sf"], gpus=e["ranks"],
-                                      mode=e["schedule"], query=e["query"], warmup_s=[], timed_s=[],
-                                      status="ok", answer="unvalidated", checks=[]))
+        r = rows.setdefault(
+            key,
+            dict(
+                harness="suite",
+                label=label,
+                sf=e["sf"],
+                gpus=e["ranks"],
+                mode=e["schedule"],
+                query=e["query"],
+                warmup_s=[],
+                timed_s=[],
+                status="ok",
+                answer="unvalidated",
+                checks=[],
+            ),
+        )
         if e["rc"]:
             r["status"] = "failed"
             continue
-        (r["timed_s"] if e["phase"] == "measured" else r["warmup_s"]).append(e["seconds"])
+        (r["timed_s"] if e["phase"] == "measured" else r["warmup_s"]).append(
+            e["seconds"]
+        )
         if e["phase"] == "measured":
             r["checks"].append(e.get("vs_ref"))
             if do_validate:
-                ans = glob.glob(f"{run}/suite_{e['schedule']}*/answers/q{e['query']}_r{e['repeat']}.csv")
-                r["checks"].append({True: "ok", False: "differs", None: "unverified"}[
-                    check_answer(ans[0], e["sf"], e["query"]) if ans else None])
+                ans = glob.glob(
+                    f"{run}/suite_{e['schedule']}*/answers/q{e['query']}_r{e['repeat']}.csv"
+                )
+                r["checks"].append(
+                    {True: "ok", False: "differs", None: "unverified"}[
+                        check_answer(ans[0], e["sf"], e["query"]) if ans else None
+                    ]
+                )
     for r in rows.values():
         r["answer"] = verdict(r.pop("checks"))
         r["build"] = inv.get("commit")
@@ -89,20 +113,41 @@ def run_query_rows(path, label, mode):
             latest[r["query"]] = r
     for q, r in sorted(latest.items()):
         t, v, cold = r.get("times_s") or [], r.get("vs_ref", []), mode == "cold"
-        yield dict(harness="run_query", label=label, sf=r["sf"], gpus=None, mode=mode, query=q,
-                   warmup_s=[] if cold else t[:1], timed_s=t[:1] if cold else t[1:],
-                   status="ok" if r.get("rc") == 0 and t else "failed",
-                   answer=verdict(v[:1] if cold else v[1:]))
+        yield dict(
+            harness="run_query",
+            label=label,
+            sf=r["sf"],
+            gpus=None,
+            mode=mode,
+            query=q,
+            warmup_s=[] if cold else t[:1],
+            timed_s=t[:1] if cold else t[1:],
+            status="ok" if r.get("rc") == 0 and t else "failed",
+            answer=verdict(v[:1] if cold else v[1:]),
+        )
 
 
 def benchmark_rows(run, label):
     rows = {}
     for f in glob.glob(f"{run}/**/record.json", recursive=True):
         e = json.load(open(f))
-        r = rows.setdefault((e["mode"], e["query"]), dict(
-            harness="benchmark", label=label, sf=e["scale"], gpus=e["num_gpus"], mode=e["mode"],
-            query=e["query"], warmup_s=[], timed_s=[], status="ok"))
-        (r["warmup_s"] if e["phase"] == "warmup" else r["timed_s"]).append((e["repeat"], e["query_s"]))
+        r = rows.setdefault(
+            (e["mode"], e["query"]),
+            dict(
+                harness="benchmark",
+                label=label,
+                sf=e["scale"],
+                gpus=e["num_gpus"],
+                mode=e["mode"],
+                query=e["query"],
+                warmup_s=[],
+                timed_s=[],
+                status="ok",
+            ),
+        )
+        (r["warmup_s"] if e["phase"] == "warmup" else r["timed_s"]).append(
+            (e["repeat"], e["query_s"])
+        )
         if e["status"] != "ok" or e.get("exit_code") != 0:
             r["status"] = "failed"
     accepted = defaultdict(list)
@@ -124,7 +169,9 @@ def load(spec, mode, do_validate):
         return list(suite_rows(run, label, do_validate))
     if os.path.isfile(run):
         if not mode:
-            sys.exit(f"{run}: a run_query.py results.jsonl needs --mode cold or --mode hot")
+            sys.exit(
+                f"{run}: a run_query.py results.jsonl needs --mode cold or --mode hot"
+            )
         return list(run_query_rows(run, label, mode))
     if glob.glob(f"{run}/**/record.json", recursive=True):
         return list(benchmark_rows(run, label))
@@ -132,9 +179,13 @@ def load(spec, mode, do_validate):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("runs", nargs="+")
-    ap.add_argument("--mode", choices=["cold", "hot"], help="for run_query.py results.jsonl")
+    ap.add_argument(
+        "--mode", choices=["cold", "hot"], help="for run_query.py results.jsonl"
+    )
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--jsonl", help="also write the per-query rows here")
     ap.add_argument("--compare", action="store_true")
@@ -147,21 +198,32 @@ def main():
     groups = defaultdict(dict)
     for r in rows:
         groups[(r["label"], r["mode"])][r["query"]] = r
-    print("| Run | Mode | Finished | Answers ok | Total, first timed run (s) | Total, best timed run (s) |")
+    print(
+        "| Run | Mode | Finished | Answers ok | Total, first timed run (s) | Total, best timed run (s) |"
+    )
     print("|---|---|---:|---:|---:|---:|")
     for (label, mode), qs in groups.items():
         done = [r for r in qs.values() if r["status"] == "ok" and r["timed_s"]]
         ok = sum(r["answer"] == "ok" for r in done)
-        print(f"| {label} | {mode} | {len(done)}/{len(qs)} | {ok}/{len(qs)} | "
-              f"{sum(r['timed_s'][0] for r in done):.1f} | {sum(min(r['timed_s']) for r in done):.1f} |")
+        print(
+            f"| {label} | {mode} | {len(done)}/{len(qs)} | {ok}/{len(qs)} | "
+            f"{sum(r['timed_s'][0] for r in done):.1f} | {sum(min(r['timed_s']) for r in done):.1f} |"
+        )
     if a.compare and len(groups) >= 2:
         (ka, ra), (kb, rb) = list(groups.items())[:2]
-        print(f"\n| Query | {ka[0]} {ka[1]} best (s) | {kb[0]} {kb[1]} best (s) | ratio |")
+        print(
+            f"\n| Query | {ka[0]} {ka[1]} best (s) | {kb[0]} {kb[1]} best (s) | ratio |"
+        )
         print("|---|---:|---:|---:|")
         for q in sorted(set(ra) | set(rb)):
-            x, y = (min(g[q]["timed_s"]) if q in g and g[q]["timed_s"] else None for g in (ra, rb))
+            x, y = (
+                min(g[q]["timed_s"]) if q in g and g[q]["timed_s"] else None
+                for g in (ra, rb)
+            )
             ratio = f"{x / y:.2f}x" if x and y else ""
-            print(f"| Q{q} | {x if x is not None else ''} | {y if y is not None else ''} | {ratio} |")
+            print(
+                f"| Q{q} | {x if x is not None else ''} | {y if y is not None else ''} | {ratio} |"
+            )
 
 
 if __name__ == "__main__":

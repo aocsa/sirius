@@ -77,7 +77,9 @@ def clear(d):
     os.makedirs(d, exist_ok=True)
     entries = [e for e in os.listdir(d) if e != SPILL_MARK]
     if entries and not os.path.exists(os.path.join(d, SPILL_MARK)):
-        sys.exit(f"--spill-dir {d} holds files this script did not create; pick an empty directory")
+        sys.exit(
+            f"--spill-dir {d} holds files this script did not create; pick an empty directory"
+        )
     for e in entries:
         p = os.path.join(d, e)
         subprocess.run(["rm", "-rf", p], check=True)
@@ -100,10 +102,15 @@ def check_memory(ranks, pool, overhead_gib):
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=30, check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        print("warning: nvidia-smi unavailable, host memory not checked", file=sys.stderr)
+        print(
+            "warning: nvidia-smi unavailable, host memory not checked", file=sys.stderr
+        )
         return
     node_of = {}
     for line in out.splitlines():
@@ -143,7 +150,9 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--out", required=True)
-    ap.add_argument("--config", required=True, help="Sirius YAML; @SPILL_DIR@ is replaced")
+    ap.add_argument(
+        "--config", required=True, help="Sirius YAML; @SPILL_DIR@ is replaced"
+    )
     ap.add_argument("--data", required=True)
     ap.add_argument("--sf", type=int, default=10000)
     ap.add_argument("--queries", default=",".join(str(q) for q in range(1, 23)))
@@ -157,12 +166,20 @@ def main():
         help="untimed statement after setup; empty to skip",
     )
     ap.add_argument("--port", type=int, default=33000)
-    ap.add_argument("--timeout", type=int, default=7200, help="seconds for the whole suite")
-    ap.add_argument("--pin-tier", default="none", choices=["none", "host", "gpu", "parquet"])
-    ap.add_argument("--pin-plans", help="Simpatico plan directory: pin with compression")
+    ap.add_argument(
+        "--timeout", type=int, default=7200, help="seconds for the whole suite"
+    )
+    ap.add_argument(
+        "--pin-tier", default="none", choices=["none", "host", "gpu", "parquet"]
+    )
+    ap.add_argument(
+        "--pin-plans", help="Simpatico plan directory: pin with compression"
+    )
     ap.add_argument("--pin-only", default="", help="pin only these tables")
     ap.add_argument("--pin-skip", default="", help="tables not to pin")
-    ap.add_argument("--pin-exclude", default="", help="columns not to pin, e.g. o_comment")
+    ap.add_argument(
+        "--pin-exclude", default="", help="columns not to pin, e.g. o_comment"
+    )
     ap.add_argument(
         "--pin-replicate", default="", help="tables to pin whole on every rank"
     )
@@ -177,19 +194,30 @@ def main():
         help="host memory each rank uses outside its pool, for the NUMA-node check",
     )
     ap.add_argument("--skip-memory-check", action="store_true")
-    ap.add_argument("--ref-dir", help="an earlier run_query.py output, for reference answers")
     ap.add_argument(
-        "--spill-dir", default=f"/tmp/{os.environ.get('USER', 'sirius')}/tpch-bench-spill"
+        "--ref-dir", help="an earlier run_query.py output, for reference answers"
+    )
+    ap.add_argument(
+        "--spill-dir",
+        default=f"/tmp/{os.environ.get('USER', 'sirius')}/tpch-bench-spill",
     )
     ap.add_argument("--tag", default="")
-    ap.add_argument("--dry-run", action="store_true", help="write the SQL file and stop")
+    ap.add_argument(
+        "--dry-run", action="store_true", help="write the SQL file and stop"
+    )
     a = ap.parse_args()
     if a.schedule == "cold" and (a.warmups, a.repeats) != (1, 2):
         sys.exit("cold is one measured run per query: drop --warmups/--repeats")
     if a.schedule != "cold" and (a.warmups < 1 or a.repeats < 1):
         sys.exit("lukewarm and hot need --warmups >= 1 and --repeats >= 1")
-    if not a.dry_run and subprocess.run(["pgrep", "-x", "duckdb"], capture_output=True).returncode == 0:
-        sys.exit("a duckdb process is running: wait for it, or stop it, before benchmarking")
+    if (
+        not a.dry_run
+        and subprocess.run(["pgrep", "-x", "duckdb"], capture_output=True).returncode
+        == 0
+    ):
+        sys.exit(
+            "a duckdb process is running: wait for it, or stop it, before benchmarking"
+        )
 
     queries = [int(q) for q in a.queries.split(",")]
     texts = {q: text(q, a.sf) for q in queries}
@@ -224,7 +252,9 @@ def main():
     if a.host_pool:
         host["capacity_bytes"] = a.host_pool
         if "initial_number_pools" in host:  # keep pinning the whole pool at start
-            per_pool = to_bytes(host.get("block_size", "1MiB")) * int(host.get("pool_size", 128))
+            per_pool = to_bytes(host.get("block_size", "1MiB")) * int(
+                host.get("pool_size", 128)
+            )
             host["initial_number_pools"] = to_bytes(a.host_pool) // per_pool
     cfg = f"{qout}/sirius.yaml"
     open(cfg, "w").write(yaml.safe_dump(conf, sort_keys=False))
@@ -266,7 +296,9 @@ def main():
     binaries = {
         "duckdb": f"{build}/duckdb",
         "extension": f"{build}/extension/sirius/sirius.duckdb_extension",
-        "libsirius": os.path.normpath(f"{build}/../../../build/release/install/lib/libsirius.so.0.0.0"),
+        "libsirius": os.path.normpath(
+            f"{build}/../../../build/release/install/lib/libsirius.so.0.0.0"
+        ),
     }
     json.dump(
         dict(
@@ -275,7 +307,9 @@ def main():
             commit=git("rev-parse", "HEAD"),
             dirty=bool(git("status", "--porcelain", "--untracked-files=no")),
             build=build,
-            build_sha256={k: sha256(p) for k, p in binaries.items() if os.path.exists(p)},
+            build_sha256={
+                k: sha256(p) for k, p in binaries.items() if os.path.exists(p)
+            },
             config=os.path.abspath(a.config),
             config_sha256=sha256(a.config),
             rendered_config_sha256=sha256(cfg),
@@ -289,7 +323,9 @@ def main():
             prime_sql=a.prime_sql,
             host_pool=a.host_pool,
             pins=list(pins),
-            placement={k: os.environ.get(k) for k in ("GPUS", "CPUS", "THREADS", "PREAMBLE")},
+            placement={
+                k: os.environ.get(k) for k in ("GPUS", "CPUS", "THREADS", "PREAMBLE")
+            },
             queries_sha256=sha256(f"{REPO}/test/tpch_performance/queries.py"),
         ),
         open(f"{a.out}/invocation.json", "w"),
@@ -307,7 +343,13 @@ def main():
     clear(a.spill_dir)
     t0 = time.time()
     p = subprocess.run(
-        [f"{REPO}/scripts/exchange_sql_ranks.sh", str(a.ranks), sqlf, str(a.port), qout],
+        [
+            f"{REPO}/scripts/exchange_sql_ranks.sh",
+            str(a.ranks),
+            sqlf,
+            str(a.port),
+            qout,
+        ],
         cwd=a.out,
         env=env,
         capture_output=True,
@@ -316,7 +358,9 @@ def main():
     )
     wall = time.time() - t0
     spill = sum(
-        os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(a.spill_dir) for f in fs
+        os.path.getsize(os.path.join(r, f))
+        for r, _, fs in os.walk(a.spill_dir)
+        for f in fs
     )
     clear(a.spill_dir)
 
@@ -332,7 +376,14 @@ def main():
                     if os.path.exists(f):
                         refs[q] = parse(open(f, errors="replace").read())[-1][0]
                         break
-            rec = dict(query=q, phase=phase, repeat=i, schedule=a.schedule, sf=a.sf, ranks=a.ranks)
+            rec = dict(
+                query=q,
+                phase=phase,
+                repeat=i,
+                schedule=a.schedule,
+                sf=a.sf,
+                ranks=a.ranks,
+            )
             if got is None or not got[1] or any("Error" in c for c in got[1]):
                 rec.update(rc=1, seconds=None)
             else:
@@ -352,7 +403,8 @@ def main():
     json.dump(
         dict(
             pin_s=dict(zip(pins, [r[2] for r in pin_runs])),
-            pin_ok=all(r[0] == [["true"]] for r in pin_runs) and len(pin_runs) == len(pins),
+            pin_ok=all(r[0] == [["true"]] for r in pin_runs)
+            and len(pin_runs) == len(pins),
             wall_s=round(wall, 1),
             spill_bytes=spill,
             executions=len(plan),
@@ -362,7 +414,9 @@ def main():
         open(f"{a.out}/{name}-summary.json", "w"),
         indent=1,
     )
-    print(f"{len(runs)}/{len(plan)} executions parsed, rc={p.returncode}, wall {wall:.0f} s")
+    print(
+        f"{len(runs)}/{len(plan)} executions parsed, rc={p.returncode}, wall {wall:.0f} s"
+    )
     if p.returncode or len(runs) != len(plan):
         print(p.stdout[-3000:], p.stderr[-3000:], sep="\n")
         sys.exit(1)
