@@ -1,0 +1,6 @@
+column_name,column_type,null,key,default,extra
+s_suppkey,INTEGER,YES,NULL,NULL,NULL
+s_name,VARCHAR,YES,NULL,NULL,NULL
+s_address,VARCHAR,YES,NULL,NULL,NULL
+s_phone,VARCHAR,YES,NULL,NULL,NULL
+total_revenue,"DECIMAL(38,4)",YES,NULL,NULL,NULL

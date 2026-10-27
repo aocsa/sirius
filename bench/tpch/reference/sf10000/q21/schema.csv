@@ -1,0 +1,3 @@
+column_name,column_type,null,key,default,extra
+s_name,VARCHAR,YES,NULL,NULL,NULL
+numwait,BIGINT,YES,NULL,NULL,NULL

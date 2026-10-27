@@ -1,0 +1,3 @@
+column_name,column_type,null,key,default,extra
+o_orderpriority,VARCHAR,YES,NULL,NULL,NULL
+order_count,BIGINT,YES,NULL,NULL,NULL

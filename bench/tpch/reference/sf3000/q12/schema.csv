@@ -1,0 +1,4 @@
+column_name,column_type,null,key,default,extra
+l_shipmode,VARCHAR,YES,NULL,NULL,NULL
+high_line_count,HUGEINT,YES,NULL,NULL,NULL
+low_line_count,HUGEINT,YES,NULL,NULL,NULL
