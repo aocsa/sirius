@@ -259,9 +259,10 @@ correctness.
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's listener, comma-separated in rank order. Empty runs in one process. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
 
-The exchange connects on the connection's first distributed query; the settings cannot change
-after that. Set `enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU
-alone would return a wrong answer.
+Setting `sirius_exchange_rank` after `sirius_exchange_peers` connects the exchange during session
+setup; set the other way round, it connects on the connection's first distributed query. The
+settings cannot change after that. Set `enable_duckdb_fallback = false` on every rank: one rank
+falling back to the CPU alone would return a wrong answer.
 
 NIXL is an optional build dependency, linked from an out-of-tree install:
 
@@ -282,7 +283,10 @@ Without it, a distributed query fails with "needs a Sirius built with -DSIRIUS_W
 
 `scripts/exchange_sql_ranks.sh <ranks> <file.sql> [base port] [log dir]` runs a SQL file on N
 local GPUs, rank i on GPU i, and prints rank 0's output. It prepends loading the extension,
-`enable_duckdb_fallback = false` and the two exchange settings.
+`enable_duckdb_fallback = false` and the two exchange settings (none with one rank). `GPUS`,
+`CPUS`, `THREADS`, `PREAMBLE` and `SIRIUS_BUILD_DIR` choose the GPUs, a CPU list per rank, DuckDB's
+threads, extra SQL and the build; see the script's header. For benchmarks, use
+[`bench/tpch/`](../../bench/tpch/README.md).
 
 ```bash
 cat > /tmp/q12.sql <<'SQL'
@@ -309,8 +313,9 @@ Expected at SF1000: `MAIL 6233248 9344850` and `SHIP 6235412 9349394`, DuckDB's 
 | With it (keeps 2.0% of `orders` before its exchange) | 10.0 s | 6.38 s |
 | One GB200, one process | | 6.4 s |
 
-The first run includes connecting NIXL to every peer. Q12 here is bound by the `lineitem` scan,
-which every rank reads from the same shared storage, so 4 GPUs are no faster than one.
+The first run was measured when the exchange still connected inside the first query. Q12 here
+is bound by the `lineitem` scan, which every rank reads from the same shared storage, so 4 GPUs
+are no faster than one.
 
 ## Limits
 
