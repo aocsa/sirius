@@ -123,13 +123,19 @@ def check_memory(ranks, pool, overhead_gib):
         need[n] = need.get(n, 0) + pool + overhead_gib * 2**30
     for n, b in need.items():
         with open(f"/sys/devices/system/node/node{n}/meminfo") as f:
-            total = int(next(l.split()[3] for l in f if "MemTotal" in l)) * 1024
-        if b > 0.95 * total:
-            sys.exit(
-                f"NUMA node {n}: {b / 2**30:.0f} GiB of host pools and per-rank overhead "
-                f"exceed 95% of its {total / 2**30:.0f} GiB; lower --host-pool or pass "
-                "--skip-memory-check"
-            )
+            info = {l.split()[2].rstrip(":"): int(l.split()[3]) * 1024 for l in f}
+        # Free now counts the page cache as reclaimable, as the GPU-idle waits do.
+        limits = (
+            (0.95 * info["MemTotal"], "95% of its"),
+            (info["MemFree"] + info["FilePages"], "the free memory of its"),
+        )
+        for limit, what in limits:
+            if b > limit:
+                sys.exit(
+                    f"NUMA node {n}: {b / 2**30:.0f} GiB of host pools and per-rank overhead "
+                    f"exceed {what} {limit / 2**30:.0f} GiB; lower --host-pool or pass "
+                    "--skip-memory-check"
+                )
 
 
 def sha256(path):
