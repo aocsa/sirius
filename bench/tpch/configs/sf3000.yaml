@@ -1,0 +1,46 @@
+# TPC-H SF3000, one process per GPU: the same file for 1 rank and N ranks, so every value is per
+# GPU. Values follow the best 1-GPU config (bench/sf3k-sf10k-1gpu-repro/configs/sf3k-1gpu.yaml on
+# integ/sf3k-joost-2201-2204) with the keys this build reads, a host pool that fits two ranks per
+# 478 GiB NUMA node on a 4x GB200 host when pinned whole at start (210 GiB OOMed node 0 at SF30000),
+# and the small-read cap of the distributed SF10000 runs.
+# run_suite.py replaces @SPILL_DIR@ and, with --host-pool, capacity_bytes and initial_number_pools.
+sirius:
+  memory:
+    gpu:
+      usage_limit_fraction: 0.908
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.9
+      downgrade_stop_fraction: 0.85
+    host:
+      capacity_bytes: 180Gi
+      block_size: 1MiB
+      pool_size: 128              # 128 MiB per pool
+      initial_number_pools: 1440  # the whole 180 GiB, pinned at start, outside any timed query
+    disk:
+      disk_id: 0
+      capacity_bytes: 1000000000000
+      downgrade_root_dirs: "@SPILL_DIR@"
+  executor:
+    scan_manager:
+      num_threads: 16
+      uring_n_reactors: 4
+      memory_prefetcher: { enable: true, num_threads: 4 }
+      # Lukewarm and hot depend on this cache: keep the mode and fraction the same on every run
+      # you compare. 0.2 of the pool is the 1-GPU campaign's setting.
+      cache: { mode: sirius, eviction: lru, eviction_threshold_fraction: 0.2 }
+      uring: { max_inflight_small_reads: 16, small_read_bytes: 4MiB }
+    pipeline:
+      num_threads: 16
+    downgrade:
+      num_threads: 2
+    task_creator:
+      num_threads: 2
+  operator_params:
+    scan_task_batch_size: 4GB
+    max_sort_partition_bytes: 0   # auto
+    hash_partition_bytes: 12GB
+    concat_batch_bytes: 2GB
+    max_build_hash_table_bytes: 12GB
+    max_dynamic_filter_bloom_bytes_per_gpu: 4096MiB  # as at SF10000, so the two files differ only here
+  telemetry:
+    enable_quent: false

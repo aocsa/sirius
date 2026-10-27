@@ -84,6 +84,47 @@ def clear(d):
     open(os.path.join(d, SPILL_MARK), "w").close()
 
 
+def to_bytes(v):
+    """Sirius-style byte sizes: 210Gi, 4GB, 1MiB, or a plain integer."""
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([KMGT]?)(i?)B?\s*", str(v))
+    if not m:
+        sys.exit(f"cannot read the byte size {v!r}")
+    n, unit, binary = m.groups()
+    return int(float(n) * (1024 if binary else 1000) ** " KMGT".index(unit or " "))
+
+
+def check_memory(ranks, pool, overhead_gib):
+    """Refuse a run whose host pools (plus per-rank overhead) overfill a GPU's CPU NUMA node."""
+    gpus = os.environ.get("GPUS") or ",".join(str(i) for i in range(ranks))
+    gpus = gpus.split(",")[:ranks]
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        print("warning: nvidia-smi unavailable, host memory not checked", file=sys.stderr)
+        return
+    node_of = {}
+    for line in out.splitlines():
+        idx, bus = (x.strip() for x in line.split(","))
+        with open(f"/sys/bus/pci/devices/{bus[4:].lower()}/numa_node") as f:
+            node_of[idx] = max(0, int(f.read()))
+    need = {}
+    for g in gpus:
+        n = node_of.get(g, 0)
+        need[n] = need.get(n, 0) + pool + overhead_gib * 2**30
+    for n, b in need.items():
+        with open(f"/sys/devices/system/node/node{n}/meminfo") as f:
+            total = int(next(l.split()[3] for l in f if "MemTotal" in l)) * 1024
+        if b > 0.95 * total:
+            sys.exit(
+                f"NUMA node {n}: {b / 2**30:.0f} GiB of host pools and per-rank overhead "
+                f"exceed 95% of its {total / 2**30:.0f} GiB; lower --host-pool or pass "
+                "--skip-memory-check"
+            )
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -125,7 +166,17 @@ def main():
     ap.add_argument(
         "--pin-replicate", default="", help="tables to pin whole on every rank"
     )
-    ap.add_argument("--host-pool", help="override the config's host capacity_bytes")
+    ap.add_argument(
+        "--host-pool",
+        help="override the config's host capacity_bytes (and initial_number_pools to match)",
+    )
+    ap.add_argument(
+        "--rank-overhead-gib",
+        type=int,
+        default=40,
+        help="host memory each rank uses outside its pool, for the NUMA-node check",
+    )
+    ap.add_argument("--skip-memory-check", action="store_true")
     ap.add_argument("--ref-dir", help="an earlier run_query.py output, for reference answers")
     ap.add_argument(
         "--spill-dir", default=f"/tmp/{os.environ.get('USER', 'sirius')}/tpch-bench-spill"
@@ -166,11 +217,19 @@ def main():
     if os.path.exists(f"{qout}/exchange_rank_0.log"):
         sys.exit(f"{qout} holds an earlier run: use a new --out or --tag")
     os.makedirs(f"{qout}/answers", exist_ok=True)
-    yaml = open(a.config).read().replace("@SPILL_DIR@", a.spill_dir)
+    import yaml
+
+    conf = yaml.safe_load(open(a.config).read().replace("@SPILL_DIR@", a.spill_dir))
+    host = conf["sirius"]["memory"]["host"]
     if a.host_pool:
-        yaml = re.sub(r"(host: \{ capacity_bytes: )[^ },]+", rf"\g<1>{a.host_pool}", yaml)
+        host["capacity_bytes"] = a.host_pool
+        if "initial_number_pools" in host:  # keep pinning the whole pool at start
+            per_pool = to_bytes(host.get("block_size", "1MiB")) * int(host.get("pool_size", 128))
+            host["initial_number_pools"] = to_bytes(a.host_pool) // per_pool
     cfg = f"{qout}/sirius.yaml"
-    open(cfg, "w").write(yaml)
+    open(cfg, "w").write(yaml.safe_dump(conf, sort_keys=False))
+    if not a.dry_run and not a.skip_memory_check:
+        check_memory(a.ranks, to_bytes(host["capacity_bytes"]), a.rank_overhead_gib)
 
     lines = [
         f"create view {t} as select * from read_parquet('{a.data}/{t}/*.parquet');"
