@@ -1,0 +1,11 @@
+sirius:
+  memory:
+    host: { capacity_bytes: 250Gi }
+    disk: { disk_id: 0, capacity_bytes: 30000000000, downgrade_root_dirs: "@SPILL_DIR@" }
+  executor:
+    scan_manager:
+      num_threads: 32
+      uring_n_reactors: 4
+      cache: { mode: none }
+  operator_params:
+    max_dynamic_filter_bloom_bytes_per_gpu: 4Gi
