@@ -270,7 +270,8 @@ connector make_parquet_scan_connector()
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
           .provider                   = std::nullopt,
-          .certify                    = supported_parquet};
+          .certify                    = supported_parquet,
+          .splits_across_ranks        = true};
 }
 
 connector make_read_parquet_connector()
@@ -286,7 +287,8 @@ connector make_read_parquet_connector()
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
           .provider                   = std::nullopt,
-          .certify                    = supported_parquet};
+          .certify                    = supported_parquet,
+          .splits_across_ranks        = true};
 }
 
 connector make_sirius_read_parquet_connector()
@@ -302,7 +304,8 @@ connector make_sirius_read_parquet_connector()
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
           .provider                   = std::nullopt,
-          .certify                    = supported_parquet};
+          .certify                    = supported_parquet,
+          .splits_across_ranks        = true};
 }
 
 connector make_iceberg_scan_connector()
@@ -318,7 +321,8 @@ connector make_iceberg_scan_connector()
           .selector_outside_bind_data = true,
           .decline_reason             = registered_iceberg_decline_reason,
           .provider                   = std::nullopt,
-          .certify                    = supported_iceberg};
+          .certify                    = supported_iceberg,
+          .splits_across_ranks        = true};
 }
 
 connector make_sirius_stream_source_connector()

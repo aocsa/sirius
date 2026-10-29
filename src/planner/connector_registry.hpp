@@ -72,6 +72,9 @@ struct connector {
                                             op::sirius_physical_table_scan const&,
                                             duckdb::ClientContext&,
                                             scan_contract_provenance&) = nullptr;
+  //! Whether `lower` gives each rank of a distributed query only its share of the rows. A scan
+  //! without it would read the whole table on every rank, so distributed planning refuses it.
+  bool splits_across_ranks = false;
 };
 
 enum class lookup_decline : uint8_t {

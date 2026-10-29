@@ -375,7 +375,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
         "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
         "has no URI parameter");
     }
-    info->resolved_file_paths = std::move(resolved_file_paths);
+    assign_files_to_rank(*info, std::move(resolved_file_paths), op_params);
   } else {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
@@ -1322,6 +1322,12 @@ void lower_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& 
       scan.read_views->entry(scan.contract_id).eligibility.verdict !=
         sirius::op::scan::eligibility_verdict::supported) {
     throw std::logic_error("scan lowering requires a supported verdict");
+  }
+  if (params.exchange_peers.size() > 1 && !entry->splits_across_ranks) {
+    throw sirius::not_implemented_exception(
+      "distributed execution does not split {} scans across ranks: every rank would read the "
+      "whole table. Read it from Parquet files instead",
+      entry->function_name);
   }
   auto state = context.registered_state
                  ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")

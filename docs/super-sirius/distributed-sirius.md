@@ -321,8 +321,11 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 
 - **Joins:** a nested-loop join that emits unmatched build rows, and a delim join whose join
   keys are not its delim columns, are refused rather than run per rank.
+- **Scans:** only Parquet and Iceberg scans are split across ranks. A scan of a DuckDB table is
+  refused, since every rank would read the whole table.
 - **Remote files:** an S3 table needs at least as many files as there are ranks; local files
-  split by byte range have no such limit.
+  split by byte range have no such limit. A `read_parquet('s3://…')` is planned as one file, so it
+  is refused on more than one rank.
 - **Query start:** every rank must run the same statements in the same order, which is what
   numbers the exchanges' streams. So one connection per process runs distributed queries; another
   connection's distributed query is refused until that one closes. With `max_concurrent_queries`

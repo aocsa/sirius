@@ -51,6 +51,7 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/scoped_sirius_setting.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -460,6 +461,34 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
     Catch::Matchers::ContainsSubstring("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
                                        "carrier"));
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a distributed query refuses a scan it cannot split by rank",
+                 "[plan_tree_shape][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"plan_tree_shape_split"};
+  auto const parquet = scratch.path() / "kv.parquet";
+  REQUIRE_FALSE(con
+                  ->Query("COPY (SELECT range AS k FROM range(10)) TO " +
+                          sirius::test::sql_literal(parquet.string()) + " (FORMAT PARQUET)")
+                  ->HasError());
+
+  // Both plans are refused while their scans are lowered, before planning would connect.
+  REQUIRE_FALSE(con->Query("SET sirius_exchange_peers = '127.0.0.1:1,127.0.0.1:2'")->HasError());
+
+  // A DuckDB table: every rank would read all of it.
+  REQUIRE_THROWS_WITH(
+    generate_sirius_plan(*con, "SELECT val FROM big_left WHERE id > 5"),
+    Catch::Matchers::ContainsSubstring("does not split seq_scan scans across ranks"));
+
+  // Sirius's own reader plans its URI as one file. A URI with a scheme counts as remote, and
+  // ranks share remote files whole, so one file cannot serve two ranks.
+  REQUIRE_THROWS_WITH(
+    generate_sirius_plan(*con,
+                         "SELECT k FROM sirius_read_parquet(" +
+                           sirius::test::sql_literal("file://" + parquet.string()) + ")"),
+    Catch::Matchers::ContainsSubstring("a remote table of 1 files across 2 ranks"));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
