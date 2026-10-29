@@ -161,6 +161,20 @@ TEST_CASE("cache_entry_info: parquet different file set misses", "[scan][can_ser
   REQUIRE(pinned.can_serve_with_columns(two_files).empty());
 }
 
+TEST_CASE("cache_entry_info: a scan over byte ranges bypasses a matching pin", "[scan][can_serve]")
+{
+  // A pin holds every row group of a.parquet; a scan of one byte range must not get them all.
+  auto pinned = parquet_cache({"a.parquet"}, {0});
+  parquet_ingestible_table_info scan;
+  fill(scan, {"a.parquet"}, {0});
+  scan.resolved_file_ranges = {{{0, 4096}}};
+  REQUIRE(pinned.can_serve_with_columns(scan).empty());
+
+  // A (0,0) range reads the whole file, which the pin still serves.
+  scan.resolved_file_ranges = {{{0, 0}}};
+  REQUIRE(pinned.can_serve_with_columns(scan) == std::vector<std::size_t>{0});
+}
+
 TEST_CASE("cache_entry_info: parquet virtual columns always bypass a matching pin",
           "[scan][can_serve][virtual_columns]")
 {
