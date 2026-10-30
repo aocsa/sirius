@@ -112,9 +112,9 @@ sirius_physical_exchange_sink::sirius_physical_exchange_sink(
                                        _spec.null_precedence.size() != _spec.key_columns.size())) {
     throw sirius::invalid_input_exception("exchange sink: range routing needs an order per key");
   }
-  if (_spec.null_keys_to_every_rank && _spec.routing != mode::hash) {
+  if (_spec.mark_join_build && _spec.routing != mode::hash) {
     throw sirius::invalid_input_exception(
-      "exchange sink: null keys go to every rank only in hash routing");
+      "exchange sink: a MARK join's build is routed by hash only");
   }
   if (_spec.routing == mode::gather && _spec.target >= _service->world_size()) {
     throw sirius::invalid_input_exception(
@@ -149,23 +149,35 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
     std::lock_guard lock{_input_schema_mutex};
     if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batches.front())); }
   }
+  auto const to_every_rank = [&](std::shared_ptr<cucascade::data_batch> const& slice) {
+    for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+      slices.push_back(slice);
+      ranks.push_back(r);
+    }
+  };
+  std::shared_ptr<cucascade::data_batch> first_keyed_row;
   for (std::size_t b = 0; b < handles.size(); ++b) {
     // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
     if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
     std::vector<std::shared_ptr<cucascade::data_batch>> routed;
-    auto split = _spec.null_keys_to_every_rank
+    auto split = _spec.mark_join_build
                    ? split_null_keys(batches[b], _spec.key_columns, stream, batch_telemetry())
                    : std::nullopt;
-    if (!split) {
-      routed = route(batches[b], handles[b], stream);
-    } else {
-      for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
-        slices.push_back(split->null_keys);
-        ranks.push_back(r);
-      }
-      auto const keyed = split->keyed->to_read_only();
-      if (get_cudf_table_view(keyed).num_rows() > 0) {
-        routed = route(keyed, split->keyed, stream);
+    std::optional<cucascade::read_only_data_batch> split_keyed;
+    if (split) {
+      to_every_rank(split->null_keys);
+      split_keyed.emplace(split->keyed->to_read_only());
+    }
+    auto const& keyed       = split_keyed ? *split_keyed : batches[b];
+    auto const& keyed_batch = split ? split->keyed : handles[b];
+    auto const keyed_view   = get_cudf_table_view(keyed);
+    if (keyed_view.num_rows() > 0) {
+      routed = route(keyed, keyed_batch, stream);
+      if (_spec.mark_join_build && !first_keyed_row && !_row_sent_to_every_rank.load()) {
+        auto* space = keyed.get_memory_space();
+        auto first  = std::make_unique<cudf::table>(
+          cudf::slice(keyed_view, {0, 1}, stream).front(), stream, space->get_default_allocator());
+        first_keyed_row = make_data_batch(std::move(first), *space, stream, batch_telemetry());
       }
     }
     for (exchange::rank_t r = 0; r < routed.size(); ++r) {
@@ -173,6 +185,11 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
       slices.push_back(std::move(routed[r]));
       ranks.push_back(r);
     }
+  }
+  // Claimed only after everything above that can fail: a task that runs out of memory is run
+  // again on the same input, and must then send the row itself.
+  if (first_keyed_row && !_row_sent_to_every_rank.exchange(true)) {
+    to_every_rank(first_keyed_row);
   }
   return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks));
 }

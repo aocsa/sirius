@@ -516,14 +516,37 @@ TEST_CASE("a failed exchange tells a later query to restart every rank", "[excha
                     Catch::Matchers::ContainsSubstring("restart every rank"));
 }
 
-TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL key to every rank",
-          "[exchange][operators]")
+/// Drains @p source until its stream ends; @return its rows with a NULL key and the others.
+std::pair<cudf::size_type, cudf::size_type> count_null_and_keyed(
+  sirius_physical_exchange_source& source)
+{
+  cudf::size_type nulls = 0, keyed = 0;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (!source.all_ports_empty()) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    auto data = source.get_next_task_input_data();
+    if (!data) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      continue;
+    }
+    for (auto const& batch : dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches()) {
+      auto const keys = sirius::get_cudf_table_view(batch->to_read_only()).column(0);
+      nulls += keys.null_count();
+      keyed += keys.size() - keys.null_count();
+    }
+  }
+  return {nulls, keyed};
+}
+
+TEST_CASE(
+  "a MARK join's build exchange sends rows with a NULL key, and one other row, to every rank",
+  "[exchange][operators]")
 {
   ranks c(3);
   exchange_spec spec;
-  spec.key_columns             = {0};
-  spec.null_keys_to_every_rank = true;
-  constexpr stream_id stream   = 10;
+  spec.key_columns           = {0};
+  spec.mark_join_build       = true;
+  constexpr stream_id stream = 10;
   std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
   for (rank_t r = 0; r < c.world(); ++r) {
     sources.push_back(std::make_unique<sirius_physical_exchange_source>(
@@ -541,28 +564,63 @@ TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL k
     sink.finalize_operator();
   }
 
+  auto const world            = static_cast<cudf::size_type>(c.world());
   cudf::size_type keyed_total = 0;
   for (rank_t r = 0; r < c.world(); ++r) {
-    cudf::size_type nulls = 0;
-    auto const deadline   = std::chrono::steady_clock::now() + std::chrono::seconds{60};
-    while (!sources[r]->all_ports_empty()) {
-      REQUIRE(std::chrono::steady_clock::now() < deadline);
-      auto data = sources[r]->get_next_task_input_data();
-      if (!data) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        continue;
-      }
-      for (auto const& batch :
-           dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches()) {
-        auto const keys = sirius::get_cudf_table_view(batch->to_read_only()).column(0);
-        nulls += keys.null_count();
-        keyed_total += keys.size() - keys.null_count();
-      }
-    }
-    CHECK(nulls == nulls_per_batch * static_cast<cudf::size_type>(c.world()));
+    auto const [nulls, keyed] = count_null_and_keyed(*sources[r]);
+    CHECK(nulls == nulls_per_batch * world);
+    keyed_total += keyed;
   }
-  CHECK(keyed_total ==
-        (rows_per_batch - nulls_per_batch) * static_cast<cudf::size_type>(c.world()));
+  // Each rank's keyed rows once by hash, plus each sink's first keyed row to every rank.
+  CHECK(keyed_total == (rows_per_batch - nulls_per_batch) * world + world * world);
+}
+
+TEST_CASE("a MARK join's build exchange leaves no rank with an empty build while one has rows",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  exchange_spec spec;
+  spec.key_columns           = {0};
+  spec.mark_join_build       = true;
+  constexpr stream_id stream = 11;
+  std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    sources.push_back(std::make_unique<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[r].service, stream, std::set<rank_t>{0, 1, 2}, false));
+  }
+  auto const one_key_batch = [](bool null_keys) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                     std::vector<std::int64_t>(rows_per_batch, 5)));
+    columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                     std::vector<std::int32_t>(rows_per_batch, 1)));
+    if (null_keys) {
+      columns[0]->set_null_mask(cudf::create_null_mask(rows_per_batch, cudf::mask_state::ALL_NULL),
+                                rows_per_batch);
+    }
+    return gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+  };
+  // Rank 1's rows share one key, so hashing alone gives them all to one rank. Rank 0's keys are
+  // all NULL: they go to every rank, and no other row goes with them.
+  for (rank_t r = c.world(); r-- > 0;) {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+    if (r == 1) {
+      sink_batch(sink, one_key_batch(false));
+      sink_batch(sink, one_key_batch(false));
+    }
+    if (r == 0) { sink_batch(sink, one_key_batch(true)); }
+    sink.finalize_operator();
+  }
+
+  std::vector<cudf::size_type> keyed_per_rank;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    auto const [nulls, keyed] = count_null_and_keyed(*sources[r]);
+    CHECK(nulls == rows_per_batch);
+    keyed_per_rank.push_back(keyed);
+  }
+  // The rank key 5 hashes to gets every row and one copy; each other rank gets that copy only.
+  std::sort(keyed_per_rank.begin(), keyed_per_rank.end());
+  CHECK(keyed_per_rank == std::vector<cudf::size_type>{1, 1, 2 * rows_per_batch + 1});
 }
 
 TEST_CASE("a VALUES source keeps its rows on rank 0 alone", "[exchange][operators]")

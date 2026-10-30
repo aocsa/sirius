@@ -129,7 +129,7 @@ its path to every peer at start.
 
 | Mode | Routes | Notes |
 |---|---|---|
-| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `null_keys_to_every_rank`, a row with a NULL in a key column goes to every rank |
+| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `mark_join_build`, a row with a NULL in a key column, and the sink's first other row, go to every rank |
 | `range` | by the key columns against world − 1 boundaries | Input batches sorted on the keys; each rank's rows are one sorted run, cut at `lower_bound` as `SORT_PARTITION` cuts |
 | `broadcast` | every row to every rank | |
 | `gather` | every row to one rank | |
@@ -205,7 +205,10 @@ A hash join's build side is broadcast when its estimated size is at most 1 GiB a
 probe side's divided by ranks − 1, and when its join type emits build rows only with a probe match.
 A hashed `MARK` join (`IN`, `NOT IN`, `ANY`) sends build rows with a NULL key to every rank: one
 NULL build key makes an unmatched probe row's mark NULL rather than false, on whichever rank that
-row is.
+row is. A rank whose build has a row without a NULL key also sends one such row to every rank, so
+a rank whose share of the build is empty still sees that the build has rows, and marks a NULL
+probe key NULL rather than false. On a rank its key does not hash to, that row matches nothing,
+since probe rows with its key go where it hashes; there it duplicates a row the hash sent.
 A nested-loop join refuses the types that emit unmatched build rows (`RIGHT`, `OUTER`,
 `RIGHT_SEMI`, `RIGHT_ANTI`), since every rank holds the whole build.
 
@@ -355,7 +358,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 |---|---|
 | `[exchange][wire]`, `[exchange][batch_io]` | Headers and refusals; batches through 64 KiB to 1 MiB frames to the GPU and host |
 | `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; shuffled notifications; no room; failed writes |
-| `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
+| `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; a MARK join build's NULL keys and one other row to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
 | `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only) |
