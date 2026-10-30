@@ -39,6 +39,9 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Distributed Execution](distributed-sirius.md) | One query across processes and GPUs: `EXCHANGE_SINK`/`EXCHANGE_SOURCE`, the NIXL transport with per-peer credits, the plan rewrite, Bloom filters merged across ranks, and running TPC-H Q12 on 4 GPUs |
 | [Distributed Gateway](distributed-gateway.md) | One Quack endpoint for every rank: starts the ranks, sends each statement to all of them in one order with a gateway-assigned query number, returns rank 0's result; planning once and ephemeral workers as proposals ([ephemeral variant](distributed-gateway-ephemeral.md)) |
 | [Distributed Testing](distributed-testing.md) | Bringing up and testing distributed Sirius and the gateway on a new box with several GPUs, or on several one-GPU boxes on one network |
+| [Two-box Q12 SF100](two-box-q12-sf100.md) | Hand checklist: TPC-H Q12 at SF100 on gcn-17 + gcn-18, one GPU each, no gateway |
+| [Gateway Q12 SF100 2 GPU](gateway-q12-sf100-2gpu.md) | Hand checklist: TPC-H Q12 at SF100 through the gateway on gcn-17, GPUs 0 and 1 |
+| [Gateway Q12 SF100 two boxes](gateway-q12-sf100-2box.md) | Hand checklist: TPC-H Q12 at SF100 through the gateway on gcn-17 + gcn-18, one GPU each |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |
 | [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, and the `SIRIUS_EXP_LATE_MAT_*` gates |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
