@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
   PRIVATE all_gather.cpp
+          all_gather_filter_merge.cpp
           batch_io.cpp
           exchange_runtime.cpp
           exchange_service.cpp

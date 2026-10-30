@@ -20,6 +20,7 @@
 
 #include "catch.hpp"
 #include "exchange/all_gather.hpp"
+#include "exchange/all_gather_filter_merge.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
@@ -169,11 +170,12 @@ struct accumulating_join {
       {{channel, sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
       {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
       {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
-    plan.set_distributed({.service      = std::move(service),
-                          .first_stream = 41,
-                          .gpu          = env().gpu,
-                          .bloom_keys   = bloom_keys,
-                          .timeout      = std::chrono::seconds{30}});
+    plan.set_distributed(std::make_shared<sirius::exchange::all_gather_filter_merge>(
+      sirius::exchange::all_gather_filter_merge::options{.service      = std::move(service),
+                                                         .first_stream = 41,
+                                                         .gpu          = env().gpu,
+                                                         .bloom_keys   = bloom_keys,
+                                                         .timeout = std::chrono::seconds{30}}));
     session =
       std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), nullptr);
   }

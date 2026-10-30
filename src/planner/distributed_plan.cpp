@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
+#include "exchange/all_gather_filter_merge.hpp"
 #include "exchange/exchange_service.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -188,11 +189,12 @@ struct rewriter {
     }
     auto const first = stream();
     next_stream += max_filter_keys;
-    join.set_distributed_dynamic_filters(
-      {.service      = service,
-       .first_stream = first,
-       .gpu          = gpu,
-       .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
+    join.set_distributed_dynamic_filters(std::make_shared<exchange::all_gather_filter_merge>(
+      exchange::all_gather_filter_merge::options{
+        .service      = service,
+        .first_stream = first,
+        .gpu          = gpu,
+        .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)}));
     shape += "F";
   }
 

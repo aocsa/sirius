@@ -237,7 +237,7 @@ Running such an operator on each rank's share would return a wrong answer.
 
 After a join's exchange, a rank's build holds only its share of the keys, so a filter from it
 alone would drop rows another rank's build matches. In distributed mode a publishing join
-carries a `distributed_merge`. Every rank then:
+carries a `cross_rank_filter_merge` (`exchange::all_gather_filter_merge`). Every rank then:
 
 1. builds a Bloom of one size for each key, from the plan's build estimate clamped to
    [2^16, 2^30] keys;
