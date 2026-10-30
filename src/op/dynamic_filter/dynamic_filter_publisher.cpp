@@ -665,15 +665,12 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    // A build too large for the cap gets a Bloom cut to it: more false positives, still a filter.
-    // Distributed, every rank sizes it alike from the plan, so the ranks' filters merge.
+    // Distributed, every rank sizes it alike from the plan, cut to the cap, so the ranks' filters
+    // merge.
     auto const* distributed = plan.distributed();
     auto const wanted       = distributed ? distributed->bloom_keys() : rows;
-    auto const sized_for =
-      distributed
-        ? merged_bloom_keys(plan)
-        : std::min(rows, bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), keys.size()));
-    auto const geometry = detail::accumulated_bloom_geometry::try_create(
+    auto const sized_for    = distributed ? merged_bloom_keys(plan) : rows;
+    auto const geometry     = detail::accumulated_bloom_geometry::try_create(
       sized_for, keys.size(), plan.max_bloom_bytes_per_gpu());
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
