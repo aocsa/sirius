@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
