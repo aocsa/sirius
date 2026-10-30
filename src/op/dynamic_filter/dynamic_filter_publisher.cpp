@@ -207,6 +207,18 @@ std::size_t bloom_keys_within_cap(std::uint64_t cap, std::size_t key_count) noex
   return blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
 }
 
+/**
+ * @brief Distributed: the keys each rank's Bloom is sized for, whether its build arrives whole or
+ * accumulated, so that every rank's Blooms have one size and merge: the plan's estimate, cut to the
+ * per-GPU cap shared by every admitted key.
+ */
+std::size_t merged_bloom_keys(dynamic_filter_publish_plan const& plan) noexcept
+{
+  return std::min(
+    plan.distributed()->bloom_keys(),
+    bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), plan.admitted_keys().size()));
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -658,9 +670,9 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     auto const* distributed = plan.distributed();
     auto const wanted       = distributed ? distributed->bloom_keys() : rows;
     auto const sized_for =
-      std::min(wanted,
-               bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(),
-                                     distributed ? plan.admitted_keys().size() : keys.size()));
+      distributed
+        ? merged_bloom_keys(plan)
+        : std::min(rows, bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), keys.size()));
     auto const geometry = detail::accumulated_bloom_geometry::try_create(
       sized_for, keys.size(), plan.max_bloom_bytes_per_gpu());
     if (!geometry) {
@@ -1240,7 +1252,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         case membership_filter_kind::bloom: {
           nvtx_scoped_range vr{"dynfilter::build_bloom"};
           filters.membership = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
-            col, distributed ? distributed->bloom_keys() : std::size_t{0}, stream, allocator_ref);
+            col, distributed ? merged_bloom_keys(plan) : std::size_t{0}, stream, allocator_ref);
           choice = "bloom";
           break;
         }

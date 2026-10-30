@@ -262,6 +262,53 @@ TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
   }
 }
 
+TEST_CASE("a rank building its Bloom whole merges it with one accumulating it",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // Planned for 2^24 keys; the 64 KiB cap cuts both ranks' Blooms to the same 32Ki keys.
+  constexpr std::size_t planned_keys = std::size_t{1} << 24;
+  ranks c(2);
+  accumulating_join accumulating(c.all[0].service, planned_keys, 64 * KiB);
+  cudf::data_type const int64{cudf::type_id::INT64};
+  auto const whole_channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  sirius::op::dynamic_filter_publish_plan whole{
+    {{.build_key_ordinal = 0, .storage_type = int64}},
+    {{whole_channel, sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
+    {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
+    {.max_bloom_bytes_per_gpu = 64 * KiB}};
+  whole.set_distributed(std::make_shared<sirius::exchange::all_gather_filter_merge>(
+    sirius::exchange::all_gather_filter_merge::options{.service      = c.all[1].service,
+                                                       .first_stream = 41,
+                                                       .gpu          = env().gpu,
+                                                       .bloom_keys   = planned_keys,
+                                                       .timeout      = std::chrono::seconds{30}}));
+  std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
+  producers.push_back(whole_channel->register_producer({0}));
+  whole_channel->freeze_registration();
+
+  // Rank 0 holds the even keys, rank 1 the odd ones.
+  on_every_rank(2, [&](rank_t r) {
+    if (r == 0) {
+      accumulating.build(keys_batch(0, 2, 2000));
+      return;
+    }
+    auto const batch = keys_batch(1, 2, 2000);
+    auto const build = batch->to_read_only();
+    static_cast<void>(sirius::op::publish_dynamic_filters(
+      whole, sirius::get_cudf_table_view(build), utils::default_stream(), producers));
+  });
+
+  auto const snapshot = whole_channel->snapshot();
+  REQUIRE(snapshot.entries().size() == 1);
+  auto const* whole_bloom = dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(
+    snapshot.entries().front().filter.get());
+  for (auto const* bloom : {accumulating.bloom(), whole_bloom}) {
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == 64 * KiB);
+    CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
+  }
+}
+
 TEST_CASE("a rank whose accumulation ends without a filter does not hold up the others",
           "[exchange][collectives][dynamic_filter]")
 {
