@@ -137,6 +137,11 @@ SET sirius_exchange_rank = 1;
 set on every rank by the gateway
 
 statement error con2
+SET gpu_execution = false;
+----
+set on every rank by the gateway
+
+statement error con2
 FROM sirius_gateway_stop();
 ----
 gateway's console
