@@ -884,8 +884,12 @@ void dynamic_filter_publication_session::observe_whole_build(
       deposit();
       return pinned;
     } catch (...) {
-      std::scoped_lock lock(operation.mutex);
-      operation.complete(completion::FAILED, true);
+      {
+        std::scoped_lock lock(operation.mutex);
+        operation.complete(completion::FAILED, true);
+      }
+      // The other ranks wait on this rank's part in each key's merge; a no-op once merge() ran.
+      leave_merge(operation.plan);
       throw;
     }
   }();
@@ -952,13 +956,17 @@ void dynamic_filter_publication_session::observe_whole_build(
       std::scoped_lock lock(operation.mutex);
       operation.complete(completion::FAILED, true);
     }
+    leave_merge(operation.plan);
     SIRIUS_LOG_WARN(
       "[publish_dynamic_filters] publication exhausted device memory; continuing without filters: "
       "{}",
       error.what());
   } catch (...) {
-    std::scoped_lock lock(operation.mutex);
-    operation.complete(completion::FAILED, true);
+    {
+      std::scoped_lock lock(operation.mutex);
+      operation.complete(completion::FAILED, true);
+    }
+    leave_merge(operation.plan);
     throw;
   }
 }
@@ -1305,6 +1313,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
     // Retire accepted work before the outer filter owners are destroyed during unwinding.
     auto error = std::current_exception();
     stream.sync();
+    // The other ranks wait on this rank's part in each key's merge; a no-op once merge() ran.
+    leave_merge(plan);
     std::rethrow_exception(error);
   }
 }

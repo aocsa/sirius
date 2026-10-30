@@ -276,6 +276,47 @@ TEST_CASE("a rank whose accumulation ends without a filter does not hold up the 
   CHECK(joins[1]->bloom() == nullptr);
 }
 
+TEST_CASE("a rank whose whole-build publication fails does not hold up the others",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  cudf::data_type const int64{cudf::type_id::INT64};
+  std::vector<sirius::op::dynamic_filter_publication_outcome> outcomes(2);
+  auto const start = std::chrono::steady_clock::now();
+  on_every_rank(2, [&](rank_t r) {
+    auto const channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    // Rank 1's key ordinal lies outside its build table, so its publication throws before the
+    // merge.
+    sirius::op::dynamic_filter_publish_plan plan{
+      {{.build_key_ordinal = r == 1 ? 1 : 0, .storage_type = int64}},
+      {{channel, sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
+      {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}}};
+    plan.set_distributed(std::make_shared<sirius::exchange::all_gather_filter_merge>(
+      sirius::exchange::all_gather_filter_merge::options{.service      = c.all[r].service,
+                                                         .first_stream = 61,
+                                                         .gpu          = env().gpu,
+                                                         .bloom_keys   = 4096,
+                                                         .timeout = std::chrono::seconds{30}}));
+    std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
+    producers.push_back(channel->register_producer({0}));
+    channel->freeze_registration();
+    auto const batch  = keys_batch(r, 2, 2000);
+    auto const build  = batch->to_read_only();
+    auto const stream = utils::default_stream();
+    if (r == 1) {
+      CHECK_THROWS_AS(sirius::op::publish_dynamic_filters(
+                        plan, sirius::get_cudf_table_view(build), stream, producers),
+                      std::logic_error);
+    } else {
+      outcomes[r] = sirius::op::publish_dynamic_filters(
+        plan, sirius::get_cudf_table_view(build), stream, producers);
+    }
+  });
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+  // Rank 0's Bloom would miss rank 1's keys.
+  CHECK(outcomes[0].filters_pushed == 0);
+}
+
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
 {
   ranks c(2);

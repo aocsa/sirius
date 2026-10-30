@@ -29,6 +29,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -48,6 +49,10 @@ void all_gather_filter_merge::merge(std::vector<op::key_filters>& per_key,
 {
   _took_part    = true;
   auto const& d = _options;
+  // The first key whose all-gather this rank has not joined. If anything throws, the other ranks
+  // would wait on this rank's part in the rest until the timeout; after the last key, none is left.
+  std::size_t next_key           = 0;
+  absl::Cleanup const leave_rest = [&] { leave_keys(next_key, per_key.size()); };
   // A rank's contribution: rep | family | scale | storage bytes | the Bloom's words, as UINT32.
   constexpr std::size_t header = 4;
   auto const mr                = d.gpu->get_default_allocator();
@@ -78,6 +83,7 @@ void all_gather_filter_merge::merge(std::vector<op::key_filters>& per_key,
         std::make_unique<cudf::table>(std::move(columns)), *d.gpu, stream, {});
     }
     std::vector<std::shared_ptr<cucascade::data_batch>> all;
+    next_key = k + 1;
     try {
       all = exchange::all_gather(
         *d.service, d.first_stream + k, std::move(mine), *d.gpu, stream.get(), d.timeout);
@@ -123,8 +129,13 @@ void all_gather_filter_merge::merge(std::vector<op::key_filters>& per_key,
 void all_gather_filter_merge::leave(std::size_t keys) noexcept
 {
   if (_took_part.exchange(true)) { return; }
+  leave_keys(0, keys);
+}
+
+void all_gather_filter_merge::leave_keys(std::size_t first, std::size_t last) noexcept
+{
   try {
-    for (std::size_t k = 0; k < keys; ++k) {
+    for (std::size_t k = first; k < last; ++k) {
       exchange::leave_all_gather(*_options.service, _options.first_stream + k);
     }
   } catch (std::exception const& e) {

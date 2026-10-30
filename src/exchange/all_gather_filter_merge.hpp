@@ -55,6 +55,8 @@ class all_gather_filter_merge final : public op::cross_rank_filter_merge {
   void leave(std::size_t keys) noexcept override;
 
  private:
+  void leave_keys(std::size_t first, std::size_t last) noexcept;
+
   options _options;
   /// This rank has taken its part in every key's merge, with filters or without.
   std::atomic<bool> _took_part{false};
