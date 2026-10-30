@@ -17,6 +17,7 @@
 #include "exchange/exchange_runtime.hpp"
 
 #include "exchange/exchange_service.hpp"
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #ifdef SIRIUS_WITH_NIXL
@@ -63,14 +64,35 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
   // thread all take the current device.
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{gpu.get_device_id()}};
   // A one-rank world has no peers; still give the receive ring frames, since frame_ring needs one.
-  auto const peer_count = static_cast<std::uint32_t>(peers.size() > 1 ? peers.size() - 1 : 1);
-  auto b                = std::make_shared<bundle>();
-  b->send               = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes);
-  b->recv = std::make_unique<frame_ring>(opts.recv_frames_per_peer * peer_count, opts.frame_bytes);
+  auto const peer_count  = static_cast<std::uint32_t>(peers.size() > 1 ? peers.size() - 1 : 1);
+  auto const recv_frames = opts.recv_frames_per_peer * peer_count;
+  // The rings are cudaMalloc'd outside the GPU space's allocator: their bytes stay reserved from
+  // it while the exchange runs, so the space does not hand them out again.
+  auto const ring_bytes = (std::size_t{opts.send_frames} + recv_frames) * opts.frame_bytes;
+  auto rings_reserved   = gpu.make_reservation_or_null(ring_bytes);
+  if (!rings_reserved) {
+    throw sirius::internal_exception(
+      "exchange: the GPU memory space has no room for {} bytes of frame rings", ring_bytes);
+  }
+  auto b  = std::make_shared<bundle>();
+  b->send = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes);
+  b->recv = std::make_unique<frame_ring>(recv_frames, opts.frame_bytes);
   nixl_fabric::config cfg{rank, std::move(peers)};
   cfg.staging = opts.staging;
   b->fabric   = std::make_unique<nixl_fabric>(std::move(cfg), *b->send, *b->recv);
   b->service  = std::make_unique<exchange_service>(*b->fabric, *b->send, *b->recv, gpu, host);
+  b->service->keep_reserved(std::move(rings_reserved));
+  // So is the pinned receive mirror, from the host space.
+  if (b->fabric->has_mirror() && host != nullptr) {
+    if (auto mirror = host->make_reservation_or_null(b->recv->bytes())) {
+      b->service->keep_reserved(std::move(mirror));
+    } else {
+      SIRIUS_LOG_WARN(
+        "exchange: the host memory space has no room to account for the {}-byte "
+        "receive mirror",
+        b->recv->bytes());
+    }
+  }
   return std::shared_ptr<exchange_service>(b, b->service.get());
 #else
   static_cast<void>(rank);

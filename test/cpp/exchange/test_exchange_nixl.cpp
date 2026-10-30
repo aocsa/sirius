@@ -224,6 +224,9 @@ TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "
                                        "127.0.0.1:" + std::to_string(free_port())};
   sirius::exchange::nixl_exchange_options const opts{
     .frame_bytes = 64 * KiB, .send_frames = 4, .recv_frames_per_peer = 4};
+  // Each rank's rings, 4 send and 4 receive frames, stay reserved from the GPU space.
+  auto const ring_bytes = std::size_t{8} * 64 * KiB;
+  auto const before     = env().gpu->get_total_reserved_memory();
   // Each waits for the other's hello.
   std::shared_ptr<exchange_service> s0;
   std::exception_ptr s0_error;
@@ -244,6 +247,8 @@ TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "
   other.join();
   if (s0_error) { std::rethrow_exception(s0_error); }
 
+  auto const connected = env().gpu->get_total_reserved_memory();
+  CHECK(connected >= before + 2 * ring_bytes);
   stream_id const stream = sirius::exchange::make_stream_id(1, 1);
   std::vector<std::shared_ptr<exchange_service>> services{s0, s1};
   std::vector<received> got(2);
@@ -266,6 +271,7 @@ TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "
   services.clear();
   s0.reset();
   s1.reset();
+  CHECK(env().gpu->get_total_reserved_memory() + 2 * ring_bytes <= connected);
 }
 
 TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multiprocess]")

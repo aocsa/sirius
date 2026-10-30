@@ -148,6 +148,14 @@ void exchange_service::shutdown()
   }
   // Outside the lock: the engine thread calls back into this service until it is joined.
   stopped.reset();
+  std::lock_guard lock{_mutex};
+  _reserved.clear();
+}
+
+void exchange_service::keep_reserved(std::unique_ptr<cucascade::memory::reservation> reserved)
+{
+  std::lock_guard lock{_mutex};
+  _reserved.push_back(std::move(reserved));
 }
 
 void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receiver)

@@ -90,6 +90,9 @@ class nixl_fabric : public fabric {
   void notify(rank_t peer, std::string notification) override;
   void poll(std::vector<fabric_notification>& out) override;
 
+  /// Whether this rank keeps a pinned receive mirror, recv's size, for peers that stage to it.
+  [[nodiscard]] bool has_mirror() const noexcept { return _mirror != nullptr; }
+
   /// Whether writes to @p peer go through its host mirror rather than NIXL.
   [[nodiscard]] bool host_staged(rank_t peer) const { return _peers.at(peer).staged; }
 

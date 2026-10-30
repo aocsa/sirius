@@ -18,6 +18,8 @@
 
 #include "exchange/transport.hpp"
 
+#include <cucascade/memory/memory_reservation.hpp>
+
 #include <exception>
 #include <map>
 #include <memory>
@@ -96,6 +98,10 @@ class exchange_service {
   /// past that point; their later send() and close() throw.
   void shutdown();
 
+  /// Holds @p reserved until shutdown() or destruction: memory the exchange uses outside its
+  /// spaces' allocators (its rings), so the spaces do not hand it out again.
+  void keep_reserved(std::unique_ptr<cucascade::memory::reservation> reserved);
+
   /// This rank has retired @p query: drops what is kept for it, and what arrives for it from now
   /// on. Queries are numbered when planned, so one run later (a prepared statement) can retire
   /// after higher-numbered ones.
@@ -125,6 +131,7 @@ class exchange_service {
   /// Every query from 1 to this one has retired here, and so has each in _retired_above.
   distributed_query_id _retired{0};
   std::set<distributed_query_id> _retired_above;
+  std::vector<std::unique_ptr<cucascade::memory::reservation>> _reserved;
   /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
   // Last: its engine thread calls back into the members above until it is destroyed. Null once

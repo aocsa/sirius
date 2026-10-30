@@ -633,7 +633,10 @@ TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL k
   }
 
   cudf::size_type keyed_total = 0;
+  service.keep_reserved(env().gpu->make_reservation_or_null(KiB * KiB));
+  auto const reserved = env().gpu->get_total_reserved_memory();
   for (rank_t r = 0; r < c.world(); ++r) {
+  CHECK(env().gpu->get_total_reserved_memory() + KiB * KiB <= reserved);
     cudf::size_type nulls = 0;
     auto const deadline   = std::chrono::steady_clock::now() + std::chrono::seconds{60};
     while (!sources[r]->all_ports_empty()) {

@@ -348,7 +348,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 - **Hosts:** every run so far used one host. Ranks on several hosts, and networks without RDMA,
   are untested.
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
-  Clusters much larger than 8 ranks would need credits granted on demand (#2371).
+  The rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU, reserved from the GPU memory space, and
+  a pinned receive mirror of the receive ring's size is reserved from the host space. Clusters
+  much larger than 8 ranks would need credits granted on demand (#2371).
 - **CI:** no CI job builds with `-DSIRIUS_WITH_NIXL=ON`, so the NIXL fabric and the
   `[exchange][nixl]` tests run only on developer machines.
 
