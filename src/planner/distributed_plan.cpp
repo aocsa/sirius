@@ -23,6 +23,8 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/wire.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "op/scan/parquet_scan_core.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -54,6 +56,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -527,31 +530,59 @@ void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
     info.resolved_file_paths = std::move(files);
     return;
   }
-  auto const world  = op_params.exchange_peers.size();
-  auto const rank   = op_params.exchange_rank;
+  auto const world = op_params.exchange_peers.size();
+  auto const rank  = op_params.exchange_rank;
+  // Files are selected from the whole table, as one scan would, so every rank splits the same
+  // selection and a file keeps the table's index. An Iceberg scan selects no files, and keys
+  // its deletes by position among the scan's own files.
+  bool const iceberg = dynamic_cast<op::scan::iceberg_ingestible_table_info*>(&info) != nullptr;
+  std::vector<std::size_t> selected;
+  if (!iceberg && info.table_filters && info.has_requested_user_virtual_columns()) {
+    auto const plan = op::scan::build_scan_plan(info.column_ids,
+                                                info.projection_ids,
+                                                info.names,
+                                                info.returned_types,
+                                                info.projected_output_count,
+                                                info.partition_indices,
+                                                info.virtual_columns,
+                                                /*allow_metadata_only=*/true);
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      if (op::scan::parquet_file_selected(info, plan, files[i], i)) { selected.push_back(i); }
+    }
+  }
+  // With none selected, every rank still takes its share of every file: each finds none of its
+  // own selected, and lowers its scan as the others do.
+  if (selected.empty()) {
+    selected.resize(files.size());
+    std::iota(selected.begin(), selected.end(), std::size_t{0});
+  }
+  auto const take = [&](std::size_t file) {
+    info.resolved_file_paths.push_back(std::move(files[file]));
+    if (!iceberg) { info.resolved_file_indices.push_back(file); }
+  };
   auto const remote = std::any_of(
     files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
   if (remote) {
-    if (files.size() < world) {
+    if (selected.size() < world) {
       throw sirius::not_implemented_exception(
         "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
         "Split it into at least {} files, or read it from local files, which split by byte range",
-        files.size(),
+        selected.size(),
         world,
         world);
     }
-    for (std::size_t i = rank; i < files.size(); i += world) {
-      info.resolved_file_paths.push_back(std::move(files[i]));
+    for (std::size_t i = rank; i < selected.size(); i += world) {
+      take(selected[i]);
     }
     return;
   }
   std::vector<std::uint64_t> bytes;
-  bytes.reserve(files.size());
-  for (auto const& f : files) {
-    bytes.push_back(std::filesystem::file_size(f));
+  bytes.reserve(selected.size());
+  for (auto const file : selected) {
+    bytes.push_back(std::filesystem::file_size(files[file]));
   }
   for (auto const& r : sirius::planner::byte_ranges_for_rank(bytes, rank, world)) {
-    info.resolved_file_paths.push_back(std::move(files[r.file]));
+    take(selected[r.file]);
     info.resolved_file_ranges.push_back({{r.start, r.length}});
   }
 }

@@ -100,7 +100,8 @@ struct file_byte_range {
 /**
  * @brief Gives @p info the files of @p files this rank scans.
  *
- * Distributed, every rank binds every file of a table and scans its share of them. Local files
+ * Distributed, every rank binds every file of a table and scans its share of those @p info's
+ * FILENAME and FILE_INDEX filters select, or of all of them when they select none. Local files
  * are split by byte range (`byte_ranges_for_rank`); remote ones, which take no byte ranges,
  * whole, files rank, rank + world, ...
  */

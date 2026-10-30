@@ -1018,31 +1018,11 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
       bind.resolved_file_paths.size());
   }
   for (std::size_t i = 0; i < _file_paths.size(); ++i) {
-    bool keep = true;
-    if (_source_kind == parquet_source_kind::PLAIN_PARQUET && bind.table_filters) {
-      for (auto const& entry : *bind.table_filters) {
-        auto const position = entry.GetIndex();
-        auto const* filter  = &entry.Filter();
-        if (position >= bind.column_ids.size()) { continue; }
-        auto const id     = bind.column_ids[position].GetPrimaryIndex();
-        auto const column = std::find_if(_plan->virtual_columns.begin(),
-                                         _plan->virtual_columns.end(),
-                                         [id](auto const& entry) { return entry.column_id == id; });
-        if (column == _plan->virtual_columns.end() ||
-            column->kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER) {
-          continue;
-        }
-        auto const value  = column->kind == scan_plan::parquet_virtual_column_kind::FILENAME
-                              ? duckdb::Value(_file_paths[i])
-                              : duckdb::Value::UBIGINT(i);
-        auto const result = evaluate_parquet_source_filter(*filter, value);
-        if (result == source_filter_result::NO_MATCH || result == source_filter_result::SQL_NULL) {
-          keep = false;
-          break;
-        }
-      }
+    auto const index = bind.resolved_file_indices.empty() ? i : bind.resolved_file_indices[i];
+    if (_source_kind != parquet_source_kind::PLAIN_PARQUET ||
+        parquet_file_selected(bind, *_plan, _file_paths[i], index)) {
+      _selected_file_indices.push_back(i);
     }
-    if (keep) { _selected_file_indices.push_back(i); }
   }
   // The bound output schema is sufficient for an empty source. Never reintroduce
   // a pruned file just to obtain its footer; SQL lowering supplies a typed empty
@@ -1051,6 +1031,35 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
 }
 
 parquet_scan_core::~parquet_scan_core() = default;
+
+bool parquet_file_selected(parquet_ingestible_table_info const& bind,
+                           scan_plan const& plan,
+                           std::string const& path,
+                           std::size_t index)
+{
+  if (!bind.table_filters) { return true; }
+  for (auto const& entry : *bind.table_filters) {
+    auto const position = entry.GetIndex();
+    auto const* filter  = &entry.Filter();
+    if (position >= bind.column_ids.size()) { continue; }
+    auto const id     = bind.column_ids[position].GetPrimaryIndex();
+    auto const column = std::find_if(plan.virtual_columns.begin(),
+                                     plan.virtual_columns.end(),
+                                     [id](auto const& entry) { return entry.column_id == id; });
+    if (column == plan.virtual_columns.end() ||
+        column->kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER) {
+      continue;
+    }
+    auto const value  = column->kind == scan_plan::parquet_virtual_column_kind::FILENAME
+                          ? duckdb::Value(path)
+                          : duckdb::Value::UBIGINT(index);
+    auto const result = evaluate_parquet_source_filter(*filter, value);
+    if (result == source_filter_result::NO_MATCH || result == source_filter_result::SQL_NULL) {
+      return false;
+    }
+  }
+  return true;
+}
 
 //===----------------------------------------------------------------------===//
 // coalescer / post-filter factories
@@ -1938,9 +1947,10 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   out->original_schema = resolved_metadata->original_schema;
   out->arrow_schema    = resolved_metadata->arrow_schema;
   out->file_path       = file_path;
-  out->file_index      = file_index;
-  out->datasource      = std::move(sirius_ds);
-  out->reader_options  = std::move(file_options);
+  out->file_index =
+    _info->resolved_file_indices.empty() ? file_index : _info->resolved_file_indices[file_index];
+  out->datasource     = std::move(sirius_ds);
+  out->reader_options = std::move(file_options);
   if (mapping) out->reader_options = std::make_shared<cudf::io::parquet_reader_options>(opts);
   out->field_mapping           = mapping;
   out->carrier_unavailable     = carrier_unavailable;

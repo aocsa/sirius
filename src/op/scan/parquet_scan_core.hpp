@@ -17,6 +17,14 @@
 #pragma once
 #include "op/scan/parquet_scan_types.hpp"
 namespace sirius::op::scan {
+
+/// Whether file @p path, file @p index of the table, may hold rows that pass @p bind's filters
+/// on the FILENAME and FILE_INDEX columns of @p plan.
+[[nodiscard]] bool parquet_file_selected(parquet_ingestible_table_info const& bind,
+                                         scan_plan const& plan,
+                                         std::string const& path,
+                                         std::size_t index);
+
 class parquet_scan_core {
  public:
   using metadata_scan_task_t = gpu_ingestible::metadata_scan_task_t;

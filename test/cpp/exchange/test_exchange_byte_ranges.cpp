@@ -17,9 +17,19 @@
 // How a distributed scan splits a table's files across ranks by byte range.
 
 #include "catch.hpp"
+#include "op/scan/parquet_scan_types.hpp"
 #include "planner/distributed_plan.hpp"
+#include "sirius_config.hpp"
+#include "utils/parquet_fixture_utils.hpp"
+#include "utils/table_filter_test_utils.hpp"
 
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
+
+#include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <memory>
+#include <string>
 #include <vector>
 
 using sirius::planner::byte_ranges_for_rank;
@@ -82,4 +92,49 @@ TEST_CASE("byte_ranges_for_rank balances unevenly sized files by bytes", "[excha
   CHECK(byte_ranges_for_rank(files, 0, 2) == std::vector<file_byte_range>{{0, 0, 450}});
   CHECK(byte_ranges_for_rank(files, 1, 2) ==
         std::vector<file_byte_range>{{0, 450, 150}, {1, 0, 200}, {2, 0, 100}});
+}
+
+TEST_CASE("assign_files_to_rank selects files by file_index before splitting them",
+          "[exchange][byte_range]")
+{
+  // Three files of 1000 bytes: unselected, rank 1 scans half of file 1 and file 2.
+  sirius::test::scratch_dir scratch{"assign_files_by_index"};
+  std::vector<std::string> files;
+  for (int f = 0; f < 3; ++f) {
+    files.push_back((scratch.path() / ("part" + std::to_string(f) + ".parquet")).string());
+    std::ofstream(files.back()) << std::string(1000, 'x');
+  }
+  auto const file_index = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
+  auto const share      = [&](std::size_t rank, std::uint64_t wanted) {
+    auto owned = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+    auto& info = *owned;
+    info.column_ids.emplace_back(0ULL);
+    info.column_ids.emplace_back(file_index);
+    info.names          = {"k"};
+    info.returned_types = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+    info.virtual_columns.push_back(
+      {file_index, "file_index", sirius::logical_type::make(sirius::type_id::UBIGINT), {}});
+    info.table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info.table_filters->PushFilter(
+      duckdb::ProjectionIndex(1),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL,
+                                    duckdb::Value::UBIGINT(wanted)));
+    sirius::operator_params params;
+    params.exchange_peers = {"127.0.0.1:1", "127.0.0.1:2"};
+    params.exchange_rank  = static_cast<std::uint32_t>(rank);
+    sirius::planner::assign_files_to_rank(info, files, params);
+    return owned;
+  };
+
+  // Each rank scans half of the selected file, under the table's index.
+  for (std::size_t rank = 0; rank < 2; ++rank) {
+    auto const mine = share(rank, 2);
+    CHECK(mine->resolved_file_paths == std::vector<std::string>{files[2]});
+    CHECK(mine->resolved_file_indices == std::vector<std::size_t>{2});
+    CHECK(mine->resolved_file_ranges.size() == 1);
+  }
+  // None selected: rank 1 keeps its share of all three, which the scan finds unselected too.
+  auto const none = share(1, 7);
+  CHECK(none->resolved_file_paths == std::vector<std::string>{files[1], files[2]});
+  CHECK(none->resolved_file_indices == std::vector<std::size_t>{1, 2});
 }
