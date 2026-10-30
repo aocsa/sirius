@@ -806,6 +806,12 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] std::shared_ptr<sirius::exchange::exchange_service> get_exchange_service(
     sirius::operator_params const& params);
 
+  /// \brief This process's part in distributed execution.
+  [[nodiscard]] sirius::exchange::distributed_session& distributed() noexcept
+  {
+    return distributed_;
+  }
+
   /// \brief See exchange::distributed_session::next_query, once per statement: planning the
   /// statement again returns the same number. A query planned before the connection's execution
   /// window opens is tied to that window when it opens.

@@ -22,6 +22,7 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <memory>
+#include <string>
 
 using window = duckdb::SiriusContext::StandaloneQueryScope;
 
@@ -100,4 +101,26 @@ TEST_CASE("a statement planned twice keeps its distributed query number",
 
   begin_statement(*connection);
   CHECK(ctx->next_distributed_query(*connection->context) == first + 1);
+}
+
+TEST_CASE("exchange peers are distinct host:port addresses", "[exchange][query_windows]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto connection = sirius::test::g_integration_env->make_connection();
+  auto set_peers  = [&](std::string const& peers) {
+    return connection.Query("SET sirius_exchange_peers = '" + peers + "'");
+  };
+
+  CHECK_FALSE(set_peers(" 127.0.0.1:1 ,127.0.0.1:2,")->HasError());
+  CHECK_FALSE(set_peers("")->HasError());
+  for (auto const* bad : {"127.0.0.1", ":1", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:1x"}) {
+    auto const result = set_peers(std::string{"127.0.0.1:1,"} + bad);
+    INFO(bad);
+    REQUIRE(result->HasError());
+    CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("is not host:port"));
+  }
+  auto const twice = set_peers("127.0.0.1:1, 127.0.0.1:1");
+  REQUIRE(twice->HasError());
+  CHECK_THAT(twice->GetError(), Catch::Matchers::ContainsSubstring("is listed twice"));
 }

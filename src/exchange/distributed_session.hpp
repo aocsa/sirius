@@ -49,6 +49,12 @@ class distributed_session {
   [[nodiscard]] std::shared_ptr<exchange_service> get_exchange_service(
     operator_params const& params, memory::sirius_memory_reservation_manager& memory);
 
+  /// \brief Refuses, once connected, other peers or another rank than this process connected
+  /// with. A connection that sets them anew sets the same ones.
+  /// @throws sirius::invalid_input_exception
+  void require_peers(std::vector<std::string> const& peers);
+  void require_rank(std::uint32_t rank);
+
   /// \brief Numbers a distributed query planned on @p connection, from 1, and ties it to
   /// @p active_window unless that is 0. Every rank runs the same statements, so the same query
   /// gets the same number, and its exchanges the same stream ids. That holds for one statement

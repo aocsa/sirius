@@ -49,6 +49,22 @@ std::shared_ptr<exchange_service> distributed_session::get_exchange_service(
   return service_;
 }
 
+void distributed_session::require_peers(std::vector<std::string> const& peers)
+{
+  std::lock_guard lock{mutex_};
+  if (service_ && peers != peers_) {
+    throw invalid_input_exception("sirius_exchange_peers cannot change once connected");
+  }
+}
+
+void distributed_session::require_rank(std::uint32_t rank)
+{
+  std::lock_guard lock{mutex_};
+  if (service_ && rank != rank_) {
+    throw invalid_input_exception("sirius_exchange_rank cannot change once connected");
+  }
+}
+
 std::uint64_t distributed_session::next_query(std::uint64_t connection, std::uint64_t active_window)
 {
   std::lock_guard lock{mutex_};

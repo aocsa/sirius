@@ -20,10 +20,12 @@
 #include "catch.hpp"
 #include "exchange/nixl_fabric.hpp"
 #include "exchange/transport_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/copying.hpp>
 
 #include <arpa/inet.h>
+#include <duckdb.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -32,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <random>
@@ -165,6 +168,45 @@ TEST_CASE("two ranks in one process exchange batches through host staging", "[ex
   send_all(*r1->t, {1, 2}, 2, 20'000);
   check_all(r0->got, 0, 2, {1, 2}, 2, 20'000);
   check_all(r1->got, 1, 2, {1, 2}, 2, 20'000);
+}
+
+TEST_CASE("a connected process keeps its exchange peers and rank",
+          "[exchange][nixl][isolated_context]")
+{
+  auto const cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
+                   "minimal.yaml";
+  auto const peers =
+    "127.0.0.1:" + std::to_string(free_port()) + ",127.0.0.1:" + std::to_string(free_port());
+  auto db0 = sirius::test::open_sirius_db(nullptr, cfg);
+  auto db1 = sirius::test::open_sirius_db(nullptr, cfg);
+  duckdb::Connection c0(*db0);
+  duckdb::Connection c1(*db1);
+  REQUIRE_FALSE(c0.Query("SET sirius_exchange_peers = '" + peers + "'")->HasError());
+  REQUIRE_FALSE(c1.Query("SET sirius_exchange_peers = '" + peers + "'")->HasError());
+  // Setting the rank connects, waiting for the other rank's hello.
+  duckdb::unique_ptr<duckdb::QueryResult> connected0;
+  std::thread other([&] { connected0 = c0.Query("SET sirius_exchange_rank = 0"); });
+  auto const connected1 = c1.Query("SET sirius_exchange_rank = 1");
+  other.join();
+  REQUIRE_FALSE(connected0->HasError());
+  REQUIRE_FALSE(connected1->HasError());
+
+  // The other rank would wait for one that plans locally, or as another rank.
+  for (auto const* change : {"SET sirius_exchange_peers = ''",
+                             "RESET sirius_exchange_peers",
+                             "SET sirius_exchange_peers = '127.0.0.1:1'",
+                             "SET sirius_exchange_rank = 1"}) {
+    auto const result = c0.Query(change);
+    INFO(change);
+    REQUIRE(result->HasError());
+    CHECK_THAT(result->GetError(),
+               Catch::Matchers::ContainsSubstring("cannot change once connected"));
+  }
+
+  // A connection that takes over distributed queries sets the same ones, in either order.
+  duckdb::Connection again(*db1);
+  CHECK_FALSE(again.Query("SET sirius_exchange_rank = 1")->HasError());
+  CHECK_FALSE(again.Query("SET sirius_exchange_peers = '" + peers + "'")->HasError());
 }
 
 TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multiprocess]")

@@ -146,6 +146,7 @@ extern "C" int cudaProfilerStop();
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -2613,24 +2614,40 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
 
 static void SetExchangePeers(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto* params = get_operator_params(context, scope);
   std::vector<std::string> peers;
-  auto const list = StringValue::Get(parameter);
-  for (std::size_t at = 0; at < list.size();) {
-    auto const comma = std::min(list.find(',', at), list.size());
-    if (comma > at) { peers.push_back(list.substr(at, comma - at)); }
-    at = comma + 1;
+  for (auto peer : StringUtil::Split(StringValue::Get(parameter), ',')) {
+    StringUtil::Trim(peer);
+    if (peer.empty()) { continue; }
+    auto const colon = peer.rfind(':');
+    uint16_t port    = 0;
+    auto const end   = peer.data() + peer.size();
+    if (colon == std::string::npos || colon == 0 ||
+        std::from_chars(peer.data() + colon + 1, end, port).ptr != end || port == 0) {
+      throw InvalidInputException("sirius_exchange_peers: '%s' is not host:port", peer);
+    }
+    // Rejected rather than dropped: a rank is its index in the list.
+    if (std::find(peers.begin(), peers.end(), peer) != peers.end()) {
+      throw InvalidInputException("sirius_exchange_peers: '%s' is listed twice", peer);
+    }
+    peers.push_back(std::move(peer));
   }
-  get_operator_params(context, scope)->exchange_peers = std::move(peers);
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    sirius_ctx->distributed().require_peers(peers);
+  }
+  params->exchange_peers = std::move(peers);
 }
 
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params          = get_operator_params(context, scope);
-  params->exchange_rank = static_cast<uint32_t>(UBigIntValue::Get(parameter));
+  auto* params    = get_operator_params(context, scope);
+  auto const rank = static_cast<uint32_t>(UBigIntValue::Get(parameter));
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx) { sirius_ctx->distributed().require_rank(rank); }
+  params->exchange_rank = rank;
   // Peers set first: connect now, during session setup, rather than inside the first
   // distributed query, which would otherwise wait for every peer's process to reach it.
-  if (!sirius::planner::is_distributed(*params)) { return; }
-  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+  if (sirius_ctx && sirius::planner::is_distributed(*params)) {
     static_cast<void>(sirius_ctx->get_exchange_service(*params));
   }
 }
