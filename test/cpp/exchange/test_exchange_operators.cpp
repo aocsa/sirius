@@ -25,6 +25,7 @@
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
@@ -842,5 +843,90 @@ TEST_CASE("a join merging its filters across ranks gives each admitted key its o
     for (auto const s : mine) {
       CHECK(s >= first_after_keys);
     }
+  }
+}
+
+TEST_CASE("a right semi join's early build filter is removed and its publication cancelled",
+          "[exchange][operators][dynamic_filter]")
+{
+  using type = sirius::op::SiriusPhysicalOperatorType;
+  ranks c(2);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  cudf::data_type const int64{cudf::type_id::INT64};
+  std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter_set>> channels(c.world());
+  std::vector<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> plans(c.world());
+  std::vector<std::string> errors(c.world());
+  std::vector<std::thread> threads;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    threads.emplace_back([&, r] {
+      try {
+        channels[r] = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+        sirius::op::dynamic_filter_publish_plan filters{
+          {{.storage_type = int64}},
+          {{channels[r], sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
+          {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
+          {.enable_multi_partition = true}};
+        duckdb::vector<sirius::logical_type> const types{bigint};
+        auto side = [&](std::size_t rows) {
+          auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
+            types, rows, sirius::op::partition_spec({0}));
+          partition->children.push_back(
+            duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(types, rows, false));
+          auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(types, rows, false);
+          concat->children.push_back(std::move(partition));
+          return concat;
+        };
+        duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
+        stub.types = {duckdb::LogicalType::BIGINT};
+        duckdb::vector<sirius::join_condition> conditions(1);
+        conditions[0].left = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint});
+        conditions[0].right =
+          std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint});
+        plans[r] = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+          stub,
+          side(1'000'000),
+          side(1'000'000),
+          std::move(conditions),
+          duckdb::JoinType::RIGHT_SEMI,
+          duckdb::vector<std::size_t>{},
+          duckdb::vector<std::size_t>{},
+          duckdb::vector<sirius::logical_type>{},
+          1000,
+          sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+          std::move(filters));
+        // As the planner wraps it: CONCAT -> PARTITION -> BUILD_FILTER -> build input.
+        auto& join      = plans[r]->Cast<sirius::op::sirius_physical_hash_join>();
+        auto& partition = *join.children[1]->children[0];
+        auto filter     = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
+          types, 1'000'000, join.dynamic_filter_session());
+        filter->children.push_back(std::move(partition.children[0]));
+        partition.children[0] = std::move(filter);
+        sirius::planner::distribute_plan(plans[r], c.all[r].service, *env().gpu, 7, lifecycle);
+      } catch (std::exception const& e) {
+        errors[r] = e.what();
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  REQUIRE(errors == std::vector<std::string>(c.world()));
+  for (rank_t r = 0; r < c.world(); ++r) {
+    // EXCHANGE_SOURCE -> EXCHANGE_SINK -> HASH_JOIN: the join's rows are gathered.
+    auto& join = *plans[r]->children[0]->children[0];
+    REQUIRE(join.type == type::HASH_JOIN);
+    auto& build_partition = *join.children[1]->children[0];
+    CHECK(build_partition.children[0]->type == type::EXCHANGE_SOURCE);
+    std::function<bool(sirius::op::sirius_physical_operator const&)> has_build_filter =
+      [&](sirius::op::sirius_physical_operator const& node) {
+        return node.type == type::BUILD_FILTER ||
+               std::ranges::any_of(node.children,
+                                   [&](auto const& child) { return has_build_filter(*child); });
+      };
+    CHECK_FALSE(has_build_filter(*plans[r]));
+    // Cancelled: the probe's channel holds no producer that could still publish.
+    channels[r]->freeze_registration();
+    CHECK(channels[r]->snapshot().terminal());
   }
 }

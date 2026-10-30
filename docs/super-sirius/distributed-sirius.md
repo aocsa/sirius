@@ -250,8 +250,8 @@ or a rank missed the 2-minute wait. IN-lists and zone maps are not published in 
 A build split into several partitions accumulates its Bloom from every batch instead, and merges
 it the same way. Its size is the plan's estimate, cut so that the join's admitted keys fit
 `max_dynamic_filter_bloom_bytes_per_gpu` together. Ranks merge only Blooms of one size, so a rank that builds one
-partition while another builds several drops the filter. Right semi and anti joins plan no
-BUILD_FILTER stage in distributed mode, so they publish nothing.
+partition while another builds several drops the filter. Right semi and anti joins publish
+nothing: `distribute_plan()` removes their BUILD_FILTER stage and cancels their publication.
 
 A rank with an empty build still merges, contributing an empty Bloom. A rank
 that never saw a whole build joins each key's all-gather without a filter, so the others drop

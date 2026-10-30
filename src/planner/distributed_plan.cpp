@@ -255,7 +255,17 @@ struct rewriter {
             build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
           return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
         }
-        merge_filters_across_ranks(join);
+        // A right semi or anti join publishes from a BUILD_FILTER under its build PARTITION, before
+        // its probe drains. There it would see only this rank's rows before the exchange, and
+        // nothing merges them in time: the join publishes nothing.
+        if (auto& input = build.children[0]; input->type == T::BUILD_FILTER) {
+          join.cancel_dynamic_filter_publication();
+          auto child = std::move(input->children[0]);
+          input      = std::move(child);
+          shape += "f";
+        } else {
+          merge_filters_across_ranks(join);
+        }
         // Each side's rows meet their matches once both are exchanged on the join keys. A MARK
         // join's marks also depend on whether the whole build has rows and NULL keys, so its
         // build sends every rank those (exchange_spec::mark_join_build).
