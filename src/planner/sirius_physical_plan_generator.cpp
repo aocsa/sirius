@@ -2283,11 +2283,12 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
   if (sirius_ctx && !op_params.exchange_peers.empty()) {
     auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
-    sirius::planner::distribute_plan(plan,
-                                     sirius_ctx->get_exchange_service(op_params),
-                                     *gpu,
-                                     sirius_ctx->next_distributed_query(context),
-                                     sirius_ctx->get_query_lifecycle_registry());
+    sirius::planner::distribute_plan(
+      plan,
+      sirius_ctx->get_exchange_service(op_params),
+      *gpu,
+      sirius_ctx->next_distributed_query(context, op_params.distributed_query_id),
+      sirius_ctx->get_query_lifecycle_registry());
   }
 }
 

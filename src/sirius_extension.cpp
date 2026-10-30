@@ -2634,6 +2634,11 @@ static void SetExchangeRank(ClientContext& context, SetScope scope, Value& param
   }
 }
 
+static void SetDistributedQueryId(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->distributed_query_id = UBigIntValue::Get(parameter);
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -3437,6 +3442,12 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             LogicalType::UBIGINT,
                             Value::UBIGINT(0),
                             SetExchangeRank);
+  config.AddExtensionOption("sirius_distributed_query_id",
+                            "Distributed execution: number of the next distributed query, set by "
+                            "a gateway; must increase. 0 numbers queries per process",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0),
+                            SetDistributedQueryId);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

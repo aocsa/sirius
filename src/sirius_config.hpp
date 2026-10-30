@@ -233,6 +233,9 @@ struct operator_params {
   std::vector<std::string> exchange_peers;
   /// This process's rank among exchange_peers.
   uint32_t exchange_rank = 0;
+  /// Nonzero: the number of the next distributed query, set by a gateway that numbers every
+  /// rank's queries. Must increase; zero numbers queries per process.
+  uint64_t distributed_query_id = 0;
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;

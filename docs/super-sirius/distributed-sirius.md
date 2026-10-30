@@ -263,6 +263,7 @@ correctness.
 |---|---|---|
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's listener, comma-separated in rank order. Empty runs in one process. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
+| `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the [gateway](distributed-gateway.md) on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
 
 The exchange connects on the connection's first distributed query; the settings cannot change
 after that. Set `enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU

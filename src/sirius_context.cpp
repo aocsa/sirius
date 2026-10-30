@@ -1291,7 +1291,7 @@ void SiriusContext::terminate()
   is_initialized_ = false;
 }
 
-uint64_t SiriusContext::next_distributed_query(ClientContext& context)
+uint64_t SiriusContext::next_distributed_query(ClientContext& context, uint64_t assigned)
 {
   std::lock_guard lock{exchange_mutex_};
   auto const connection = context.GetConnectionId();
@@ -1303,7 +1303,14 @@ uint64_t SiriusContext::next_distributed_query(ClientContext& context)
       *distributed_connection_,
       connection);
   }
-  auto const query = ++distributed_queries_;
+  if (assigned != 0 && assigned <= distributed_queries_) {
+    throw sirius::invalid_input_exception(
+      "sirius_distributed_query_id {} must exceed the last distributed query, {}",
+      assigned,
+      distributed_queries_);
+  }
+  auto const query     = assigned != 0 ? assigned : distributed_queries_ + 1;
+  distributed_queries_ = query;
   if (auto state = get_sirius_connection_state(context)) {
     if (state->active_window != 0) {
       distributed_by_window_[state->active_window] = query;
