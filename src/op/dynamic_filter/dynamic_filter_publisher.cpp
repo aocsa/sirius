@@ -208,14 +208,13 @@ std::size_t bloom_keys_within_cap(std::uint64_t cap, std::size_t key_count) noex
 }
 
 /**
- * @brief Distributed: the keys each rank's Bloom is sized for, whether its build arrives whole or
- * accumulated, so that every rank's Blooms have one size and merge: the plan's estimate, cut to the
- * per-GPU cap shared by every admitted key.
+ * @brief The plan's fixed Bloom size cut to the per-GPU cap shared by every admitted key: alike for
+ * every build of the plan, whole or accumulated, so their Blooms have one size and merge.
  */
 std::size_t merged_bloom_keys(dynamic_filter_publish_plan const& plan) noexcept
 {
   return std::min(
-    plan.distributed()->bloom_keys(),
+    plan.fixed_bloom_keys(),
     bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), plan.admitted_keys().size()));
 }
 
@@ -665,12 +664,11 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    // Distributed, every rank sizes it alike from the plan, cut to the cap, so the ranks' filters
-    // merge.
-    auto const* distributed = plan.distributed();
-    auto const wanted       = distributed ? distributed->bloom_keys() : rows;
-    auto const sized_for    = distributed ? merged_bloom_keys(plan) : rows;
-    auto const geometry     = detail::accumulated_bloom_geometry::try_create(
+    // A fixed size is cut alike by every build of the plan, so their filters merge.
+    auto const fixed     = plan.fixed_bloom_keys();
+    auto const wanted    = fixed != 0 ? fixed : rows;
+    auto const sized_for = fixed != 0 ? merged_bloom_keys(plan) : rows;
+    auto const geometry  = detail::accumulated_bloom_geometry::try_create(
       sized_for, keys.size(), plan.max_bloom_bytes_per_gpu());
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
@@ -1035,11 +1033,11 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       "[publish_dynamic_filters] publication requires one right per target");
   }
   dynamic_filter_publication_outcome outcome;
-  auto* const distributed = plan.distributed();
-
-  // Distributed, neither shortcut applies: the other ranks wait on this rank's share of the merge.
-  // An empty build contributes an empty Bloom, and this rank still publishes the others' keys.
-  if (build_view.num_rows() == 0 && !distributed) {
+  // A fixed Bloom size makes this build one share of a merged filter, which the other builds wait
+  // on: neither shortcut applies. An empty build contributes an empty Bloom, and this one still
+  // publishes the others' keys.
+  bool const merges = plan.fixed_bloom_keys() != 0;
+  if (build_view.num_rows() == 0 && !merges) {
     SIRIUS_LOG_DEBUG("[publish_dynamic_filters] Skipping dynamic filter push: empty build table.");
     return outcome;
   }
@@ -1050,7 +1048,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   auto const& probe_targets = plan.probe_targets();
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
     outcome.publications_skipped_targets_drained = 1;
-    if (!distributed) {
+    if (!merges) {
       SIRIUS_LOG_DEBUG(
         "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
       return outcome;
@@ -1165,7 +1163,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       // carrier the build arrived at and then restored to the recorded type: two scalars, not the
       // whole column, so a narrowed build publishes the same zone map a native one does.
       filters.zone_map_type = admitted_key.storage_type;
-      if (plan.emit_zone_map_filters() && !distributed &&
+      if (plan.emit_zone_map_filters() &&
           sirius::op::sirius_dynamic_zone_map_filter::supports(admitted_key.storage_type)) {
         nvtx_scoped_range vr{"dynfilter::build_zone_map"};
         auto min_s = cudf::reduce(col,
@@ -1223,8 +1221,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
            fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
          .supports_bloom =
            fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
-      // Distributed: a Bloom of the size every rank builds, so the ranks' filters can be merged.
-      if (distributed) {
+      if (merges) {
         chosen = fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())
                    ? membership_filter_kind::bloom
                    : membership_filter_kind::none;
@@ -1249,7 +1246,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         case membership_filter_kind::bloom: {
           nvtx_scoped_range vr{"dynfilter::build_bloom"};
           filters.membership = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
-            col, distributed ? merged_bloom_keys(plan) : std::size_t{0}, stream, allocator_ref);
+            col, merges ? merged_bloom_keys(plan) : std::size_t{0}, stream, allocator_ref);
           choice = "bloom";
           break;
         }
@@ -1271,7 +1268,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         choice);
     }
 
-    if (distributed) { distributed->merge(per_key, stream); }
+    if (auto* merge = plan.distributed()) { merge->merge(per_key, stream); }
 
     // Finish construction and replication before publishing to independent consumer streams.
     if (std::ranges::any_of(per_key, [](key_filters const& filters) {

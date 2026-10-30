@@ -54,6 +54,7 @@
  * `test_dynamic_filter_source_policy.cpp`.
  */
 
+#include "op/dynamic_filter/cross_rank_filter_merge.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -1691,6 +1692,64 @@ TEST_CASE("dynamic-filter publisher serves a live target beside a drained one",
 
   REQUIRE(filters_on_column(*live_channel, 5).size() == 1);
   REQUIRE(drained_channel->snapshot().empty());
+}
+
+namespace {
+// Keeps what each publication hands the merge, and merges nothing.
+class recording_merge final : public sirius::op::cross_rank_filter_merge {
+ public:
+  [[nodiscard]] std::size_t bloom_keys() const noexcept override { return 4096; }
+  void merge(std::vector<sirius::op::key_filters>& per_key, ::cuda::stream_ref) override
+  {
+    merged.push_back(per_key);
+  }
+  void leave(std::size_t) noexcept override {}
+
+  std::vector<std::vector<sirius::op::key_filters>> merged;
+};
+}  // namespace
+
+TEST_CASE("dynamic-filter publisher hands a cross-rank merge a fixed-size Bloom alone",
+          "[dynamic_filter][publisher]")
+{
+  // Another build's share of the merge waits on this one's, even when it is empty or its own
+  // targets have drained.
+  bool const empty_build = GENERATE(false, true);
+  bool const drained     = GENERATE(false, true);
+  CAPTURE(empty_build, drained);
+  publisher_fixture fixture;
+  fixture.add_key_column(empty_build ? 0 : 3);
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  if (drained) { channel->close_for_new_filters(); }
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
+                                   std::move(targets),
+                                   std::move(fixture.replica_spaces),
+                                   {.emit_zone_map_filters = true}};
+  auto merge = std::make_shared<recording_merge>();
+  plan.set_distributed(merge);
+
+  publish_for_test(plan, fixture.build_view(), fixture.stream);
+
+  REQUIRE(merge->merged.size() == 1);
+  REQUIRE(merge->merged[0].size() == 1);
+  auto const& key = merge->merged[0][0];
+  CHECK(key.zone_map == nullptr);
+  auto const* bloom =
+    dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(key.membership.get());
+  REQUIRE(bloom != nullptr);
+  sirius::op::sirius_dynamic_bloom_filter const sized{fixture.columns[0]->view(),
+                                                      merge->bloom_keys(),
+                                                      fixture.stream,
+                                                      cudf::get_current_device_resource_ref()};
+  CHECK(bloom->storage_bytes() == sized.storage_bytes());
 }
 
 TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",

@@ -17,6 +17,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 
 #include "log/logging.hpp"
+#include "op/dynamic_filter/cross_rank_filter_merge.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -141,6 +142,13 @@ void dynamic_filter_publish_plan::restrict_replicas_to(std::vector<int> const& a
       _probe_targets.size());
     _probe_targets.clear();
   }
+}
+
+void dynamic_filter_publish_plan::set_distributed(std::shared_ptr<cross_rank_filter_merge> merge)
+{
+  _policy.emit_zone_map_filters = false;
+  _policy.fixed_bloom_keys      = merge->bloom_keys();
+  _distributed                  = std::move(merge);
 }
 
 bool dynamic_filter_publish_plan::has_replica_on_device(int gpu_device_id) const noexcept

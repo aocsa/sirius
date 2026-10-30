@@ -61,6 +61,11 @@ struct dynamic_filter_publication_policy {
   double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
   bool enable_multi_partition           = false;
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Nonzero: every key's membership filter is a Bloom sized for this many keys, cut to the per-GPU
+  /// cap shared by every admitted key, and built even from an empty build or with every target
+  /// drained. Each build of the plan then holds one share of a filter that cross_rank_filter_merge
+  /// ORs together.
+  std::size_t fixed_bloom_keys = 0;
 };
 
 /**
@@ -158,6 +163,7 @@ class dynamic_filter_publish_plan final {
   {
     return _policy.max_bloom_bytes_per_gpu;
   }
+  [[nodiscard]] std::size_t fixed_bloom_keys() const noexcept { return _policy.fixed_bloom_keys; }
 
   /**
    * @brief Retains replicas on the listed GPUs
@@ -166,11 +172,9 @@ class dynamic_filter_publish_plan final {
    */
   void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
 
-  /// Distributed execution only: see cross_rank_filter_merge.
-  void set_distributed(std::shared_ptr<cross_rank_filter_merge> merge)
-  {
-    _distributed = std::move(merge);
-  }
+  /// Distributed execution only: see cross_rank_filter_merge. The merge carries only Blooms of the
+  /// size it names, so the plan publishes no zone maps and fixes its Bloom size to that.
+  void set_distributed(std::shared_ptr<cross_rank_filter_merge> merge);
   [[nodiscard]] cross_rank_filter_merge* distributed() const noexcept { return _distributed.get(); }
 
  private:
