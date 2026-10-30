@@ -663,11 +663,13 @@ TEST_CASE("an ungrouped aggregate over rank 0's rows makes its row on rank 0 alo
           "[exchange][operators]")
 {
   // Every rank's merge would make a row, even from none (a COUNT of 0). The input stays where it
-  // is, so rank 0 merges its own partials as on one GPU, and the other ranks' merges make none.
+  // is, so rank 0 merges its own partials as on one GPU, and the other ranks filter theirs out.
+  using type = sirius::op::SiriusPhysicalOperatorType;
   ranks c(2);
   sirius::exec::query_lifecycle_registry lifecycle;
-  std::vector<sirius::op::SiriusPhysicalOperatorType> below_merge(c.world());
-  std::vector<int> outside_result(c.world(), -1);
+  std::vector<type> top(c.world());
+  std::vector<type> below_merge(c.world());
+  cudf::size_type rank1_rows_kept = -1;
   std::vector<std::string> errors(c.world());
   std::vector<std::thread> threads;
   for (rank_t r = 0; r < c.world(); ++r) {
@@ -683,9 +685,19 @@ TEST_CASE("an ungrouped aggregate over rank 0's rows makes its row on rank 0 alo
             key_value_types(), duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, 1, validity);
         plan->children.push_back(std::move(partial));
         sirius::planner::distribute_plan(plan, c.all[r].service, *env().gpu, 4, lifecycle);
-        below_merge[r] = plan->children.at(0)->type;
-        outside_result[r] =
-          plan->Cast<sirius::op::sirius_physical_ungrouped_aggregate_merge>().outside_result();
+        top[r]         = plan->type;
+        auto& merge    = r == 0 ? *plan : *plan->children.at(0);
+        below_merge[r] = merge.children.at(0)->type;
+        if (r == 1) {
+          sirius::op::sirius_physical_gpu_values one_row(
+            key_value_types(), 1, /*produce_single_row=*/true);
+          auto input = one_row.get_next_task_input_data();
+          input->prepare_for_processing(env().gpu, utils::default_stream());
+          auto row            = one_row.execute(*input, utils::default_stream());
+          auto out            = plan->execute(*row, utils::default_stream());
+          auto const& batches = dynamic_cast<pipelineable_operator_data&>(*out).get_data_batches();
+          rank1_rows_kept = sirius::get_cudf_table_view(batches.at(0)->to_read_only()).num_rows();
+        }
       } catch (std::exception const& e) {
         errors[r] = e.what();
       }
@@ -695,8 +707,7 @@ TEST_CASE("an ungrouped aggregate over rank 0's rows makes its row on rank 0 alo
     t.join();
   }
   CHECK(errors == std::vector<std::string>(c.world()));
-  for (auto const type : below_merge) {
-    CHECK(type == sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
-  }
-  CHECK(outside_result == std::vector<int>{0, 1});
+  CHECK(top == std::vector<type>{type::MERGE_AGGREGATE, type::FILTER});
+  CHECK(below_merge == std::vector<type>{type::UNGROUPED_AGGREGATE, type::UNGROUPED_AGGREGATE});
+  CHECK(rank1_rows_kept == 0);
 }

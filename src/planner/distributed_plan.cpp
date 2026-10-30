@@ -24,13 +24,13 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
-#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "planner/gpu_admission.hpp"
 #include "sirius/exception.hpp"
 
@@ -354,17 +354,22 @@ struct rewriter {
 
       case T::MERGE_AGGREGATE: {
         // MERGE_AGGREGATE → UNGROUPED_AGGREGATE: partial results gathered to rank 0, unless the
-        // input is on rank 0 alone. An aggregate makes a row even from no rows (a COUNT of 0), so
-        // every other rank's merge makes none: what reads a rank0 subtree takes its other copies
-        // to be empty. Not gathering a rank0 input also keeps the other ranks' partials of nothing
-        // away from rank 0's merge, where a FIRST could pick their NULL.
-        auto& partial       = expect(*node.children[0], T::UNGROUPED_AGGREGATE);
-        auto const gathered = exchange_spec{.routing = exchange_spec::mode::gather};
-        if (service->rank() != gathered.target) {
-          node.Cast<op::sirius_physical_ungrouped_aggregate_merge>().set_outside_result();
+        // input is there already. A merge makes a row even from no rows (a COUNT of 0), and what
+        // reads a rank0 subtree takes the other ranks' copies to be empty, so the other ranks
+        // drop it with a FILTER of false. The FILTER keeps the merge's estimate: a join above
+        // chooses broadcast or hash from it, and every rank must choose alike.
+        auto& partial = expect(*node.children[0], T::UNGROUPED_AGGREGATE);
+        if (service->rank() != 0) {
+          auto none = duckdb::make_uniq<op::sirius_physical_filter>(
+            node.types,
+            std::make_unique<ast::node>(
+              ast::constant{value{false}, logical_type::make(type_id::BOOLEAN)}),
+            node.estimated_cardinality);
+          none->children.push_back(std::move(slot));
+          slot = std::move(none);
         }
         if (visit(partial.children[0]) == placement::rank0) { return done(placement::rank0); }
-        insert(node.children[0], gathered, false);
+        insert(node.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
         return done(placement::rank0);
       }
 

@@ -657,7 +657,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  if (aggregates.empty() || _outside_result) {
+  if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }

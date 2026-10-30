@@ -75,18 +75,11 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  /// Distributed, on a rank other than the one that makes the result: this copy makes no row,
-  /// whatever its input. Otherwise it would make one even from no input (a COUNT of 0), and that
-  /// row would reach whatever reads this rank's copy.
-  void set_outside_result() { _outside_result = true; }
-  [[nodiscard]] bool outside_result() const { return _outside_result; }
-
  private:
   [[nodiscard]] std::size_t empty_input_size_estimate() const;
 
   std::atomic<bool> _task_claimed{false};
   std::atomic<bool> _input_handed_out{false};
-  bool _outside_result = false;
 };
 
 }  // namespace op
