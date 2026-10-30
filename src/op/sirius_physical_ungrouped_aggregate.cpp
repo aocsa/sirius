@@ -404,6 +404,9 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     if (!space) { continue; }
 
     auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    // No rows, no partial: its partial would only add a NULL, which a FIRST could pick over
+    // another partial's value. With no partial at all, the merge makes the row of no input.
+    if (view.num_rows() == 0) { continue; }
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -659,9 +662,22 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
+  cucascade::memory::memory_space* no_rows_space = nullptr;
   if (auto const* empty = dynamic_cast<input_free_operator_data const*>(&input_data)) {
+    no_rows_space = &empty->get_gpu_memory_space();
+  } else {
+    // An exchange hands on one batch of no rows when no rank sent a partial: no input either.
+    auto const batches =
+      dynamic_cast<pipelineable_operator_data const&>(input_data).get_read_only_batches();
+    if (!batches.empty() && std::all_of(batches.begin(), batches.end(), [](auto const& batch) {
+          return get_cudf_table_view(batch).num_rows() == 0;
+        })) {
+      no_rows_space = batches.front().get_memory_space();
+    }
+  }
+  if (no_rows_space != nullptr) {
     auto const layout = build_aggregate_layout(aggregates);
-    auto& space       = empty->get_gpu_memory_space();
+    auto& space       = *no_rows_space;
     auto const mr     = space.get_default_allocator();
     std::vector<std::unique_ptr<cudf::column>> columns;
     columns.reserve(layout.aggregates.size());

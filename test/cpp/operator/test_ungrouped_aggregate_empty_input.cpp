@@ -188,9 +188,9 @@ TEST_CASE("ungrouped merge outside the result makes no row, from partials or fro
   if (with_partial) {
     sirius_physical_ungrouped_aggregate local(
       {bigint}, count_star(), 1, duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
-    auto partial = local.execute(
-      pipelineable_operator_data({make_numeric_batch<int64_t>(*space, {}, cudf::type_id::INT64)}),
-      default_stream());
+    auto partial = local.execute(pipelineable_operator_data({make_numeric_batch<int64_t>(
+                                   *space, {1, 2, 3}, cudf::type_id::INT64)}),
+                                 default_stream());
     fixture.merge.push_data_batch("default", only_batch(*partial));
   }
   fixture.close_input();
@@ -316,12 +316,10 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
                      ? make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32)
                      : make_numeric_batch<int64_t>(*space, {}, cudf::type_id::INT64);
     auto partial = local.execute(pipelineable_operator_data({input}), default_stream());
-    auto batch   = only_batch(*partial);
-    auto view    = sirius::get_cudf_table_view(*batch);
-    CHECK(view.column(3).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
-    CHECK(view.column(7).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
-    CHECK(view.column(10).type() == cudf::data_type{cudf::type_id::STRUCT});
-    fixture.merge.push_data_batch("default", std::move(batch));
+    // No rows, no partial.
+    CHECK(dynamic_cast<pipelineable_operator_data const&>(*partial).get_data_batches().empty());
+    // An exchange still hands on one batch of no rows, which the merge takes as no input.
+    fixture.merge.push_data_batch("default", input);
   }
   fixture.close_input();
   REQUIRE(fixture.merge.get_next_task_hint()->hint == TaskCreationHint::READY);
@@ -342,6 +340,39 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
       CHECK(view.column(i).null_count() == 1);
     }
   }
+}
+
+TEST_CASE("ungrouped FIRST takes a value over a batch of no rows",
+          "[ungrouped_empty_input][physical_ungrouped_aggregate]")
+{
+  // An uncorrelated scalar subquery is a FIRST: a batch with no rows must not supply its NULL.
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto make_aggregates = [] {
+    expressions result;
+    result.push_back(aggregate(aggregate_id::first, bigint, bigint));
+    return result;
+  };
+  merge_fixture fixture({bigint}, make_aggregates());
+  sirius_physical_ungrouped_aggregate local(
+    {bigint}, make_aggregates(), 1, duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  auto partial = local.execute(
+    pipelineable_operator_data({make_numeric_batch<int64_t>(*space, {}, cudf::type_id::INT64),
+                                make_numeric_batch<int64_t>(*space, {7}, cudf::type_id::INT64)}),
+    default_stream());
+  for (auto const& batch :
+       dynamic_cast<pipelineable_operator_data const&>(*partial).get_data_batches()) {
+    fixture.merge.push_data_batch("default", batch);
+  }
+  fixture.close_input();
+  REQUIRE(fixture.merge.get_next_task_hint()->hint == TaskCreationHint::READY);
+  auto input  = fixture.merge.get_next_task_input_data();
+  auto output = fixture.merge.execute(*input, default_stream());
+  auto view   = sirius::get_cudf_table_view(*only_batch(*output));
+  REQUIRE(view.num_rows() == 1);
+  CHECK(view.column(0).null_count() == 0);
+  CHECK(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>{7});
 }
 
 TEST_CASE("ungrouped merge combines ordinary AVG and distinct-count partials once",
