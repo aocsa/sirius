@@ -44,6 +44,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
@@ -499,8 +500,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     const auto& op_params      = *options;
     auto* const stats          = &sirius_context->get_dynamic_filter_stats();
     bool const multi_partition = op_params.enable_dynamic_filter_multi_partition;
-    // Distributed: no BUILD_FILTER is planned, so right semi and anti joins publish nothing.
-    bool const early_publication = multi_partition && op_params.exchange_peers.empty();
+    // Right semi and anti joins publish only through a BUILD_FILTER, which distribute_plan()
+    // does not support: distributed, they publish nothing.
+    bool const early_publication = multi_partition && !sirius::planner::is_distributed(op_params);
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();

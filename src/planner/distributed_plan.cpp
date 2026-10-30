@@ -36,6 +36,7 @@
 #include "op/sirius_physical_sort_sample.hpp"
 #include "planner/gpu_admission.hpp"
 #include "sirius/exception.hpp"
+#include "sirius_config.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -458,6 +459,8 @@ void require_same_shape(rewriter& r)
 }
 
 }  // namespace
+
+bool is_distributed(operator_params const& params) { return !params.exchange_peers.empty(); }
 
 void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,

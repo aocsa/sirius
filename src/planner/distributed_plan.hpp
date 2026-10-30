@@ -36,7 +36,15 @@ namespace sirius::exec {
 class query_lifecycle_registry;
 }
 
+namespace sirius {
+struct operator_params;
+}
+
 namespace sirius::planner {
+
+/// Whether @p params run the query on the ranks of `exchange_peers`: distribute_plan() then
+/// rewrites its plan.
+[[nodiscard]] bool is_distributed(operator_params const& params);
 
 /**
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of

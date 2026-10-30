@@ -1619,8 +1619,7 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
             (join.join_type == duckdb::JoinType::RIGHT_SEMI ||
              join.join_type == duckdb::JoinType::RIGHT_ANTI) &&
             join.publishes_dynamic_filters() &&
-            join.dynamic_filter_plan().multi_partition_enabled() &&
-            op_params.exchange_peers.empty()) {
+            join.dynamic_filter_plan().multi_partition_enabled()) {
           auto publish = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
             child_types, est_card, join.dynamic_filter_session());
           if (!child_physical.empty()) { publish->set_physical_types(child_physical); }
@@ -2283,7 +2282,7 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_iceberg_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
-  if (sirius_ctx && !op_params.exchange_peers.empty()) {
+  if (sirius_ctx && sirius::planner::is_distributed(op_params)) {
     auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
     sirius::planner::distribute_plan(plan,
                                      sirius_ctx->get_exchange_service(op_params),
