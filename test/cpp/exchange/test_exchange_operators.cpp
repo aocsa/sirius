@@ -28,6 +28,7 @@
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
+#include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/distributed_plan.hpp"
@@ -656,4 +657,46 @@ TEST_CASE("a VALUES source keeps its rows on rank 0 alone", "[exchange][operator
   CHECK(errors == std::vector<std::string>(c.world()));
   CHECK(rows[0] == 1);
   CHECK(rows[1] == 0);
+}
+
+TEST_CASE("an ungrouped aggregate over rank 0's rows makes its row on rank 0 alone",
+          "[exchange][operators]")
+{
+  // Every rank's merge would make a row, even from none (a COUNT of 0). The input stays where it
+  // is, so rank 0 merges its own partials as on one GPU, and the other ranks' merges make none.
+  ranks c(2);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  std::vector<sirius::op::SiriusPhysicalOperatorType> below_merge(c.world());
+  std::vector<int> outside_result(c.world(), -1);
+  std::vector<std::string> errors(c.world());
+  std::vector<std::thread> threads;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    threads.emplace_back([&, r] {
+      try {
+        constexpr auto validity = duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES;
+        auto partial = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate>(
+          key_value_types(), duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, 1, validity);
+        partial->children.push_back(duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+          key_value_types(), 1, /*produce_single_row=*/true));
+        duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan =
+          duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate_merge>(
+            key_value_types(), duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, 1, validity);
+        plan->children.push_back(std::move(partial));
+        sirius::planner::distribute_plan(plan, c.all[r].service, *env().gpu, 4, lifecycle);
+        below_merge[r] = plan->children.at(0)->type;
+        outside_result[r] =
+          plan->Cast<sirius::op::sirius_physical_ungrouped_aggregate_merge>().outside_result();
+      } catch (std::exception const& e) {
+        errors[r] = e.what();
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  CHECK(errors == std::vector<std::string>(c.world()));
+  for (auto const type : below_merge) {
+    CHECK(type == sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+  }
+  CHECK(outside_result == std::vector<int>{0, 1});
 }

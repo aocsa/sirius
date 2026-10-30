@@ -175,6 +175,39 @@ TEST_CASE("ungrouped merge rejects empty ordinary input descriptors",
                            "arrive as input_free_operator_data"));
 }
 
+TEST_CASE("ungrouped merge outside the result makes no row, from partials or from none",
+          "[ungrouped_empty_input][physical_ungrouped_aggregate]")
+{
+  auto const outside      = GENERATE(false, true);
+  auto const with_partial = GENERATE(false, true);
+  auto manager            = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space             = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  merge_fixture fixture;
+  if (outside) { fixture.merge.set_outside_result(); }
+  if (with_partial) {
+    sirius_physical_ungrouped_aggregate local(
+      {bigint}, count_star(), 1, duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+    auto partial = local.execute(
+      pipelineable_operator_data({make_numeric_batch<int64_t>(*space, {}, cudf::type_id::INT64)}),
+      default_stream());
+    fixture.merge.push_data_batch("default", only_batch(*partial));
+  }
+  fixture.close_input();
+  REQUIRE(fixture.merge.get_next_task_hint()->hint == TaskCreationHint::READY);
+  auto input = fixture.merge.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  input->prepare_for_processing(space, default_stream());
+  auto result         = fixture.merge.execute(*input, default_stream());
+  auto const& batches = dynamic_cast<pipelineable_operator_data const&>(*result).get_data_batches();
+  if (outside) {
+    CHECK(batches.empty());
+  } else {
+    REQUIRE(batches.size() == 1);
+    CHECK(sirius::get_cudf_table_view(*batches.front()).num_rows() == 1);
+  }
+}
+
 TEST_CASE("ungrouped merge claims one task after zero-batch input closes",
           "[ungrouped_empty_input][scheduling]")
 {

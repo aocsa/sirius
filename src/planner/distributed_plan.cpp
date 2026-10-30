@@ -30,6 +30,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "planner/gpu_admission.hpp"
 #include "sirius/exception.hpp"
 
@@ -352,10 +353,18 @@ struct rewriter {
       }
 
       case T::MERGE_AGGREGATE: {
-        // MERGE_AGGREGATE → UNGROUPED_AGGREGATE: partial results gathered to rank 0.
-        auto& partial = expect(*node.children[0], T::UNGROUPED_AGGREGATE);
+        // MERGE_AGGREGATE → UNGROUPED_AGGREGATE: partial results gathered to rank 0, unless the
+        // input is on rank 0 alone. An aggregate makes a row even from no rows (a COUNT of 0), so
+        // every other rank's merge makes none: what reads a rank0 subtree takes its other copies
+        // to be empty. Not gathering a rank0 input also keeps the other ranks' partials of nothing
+        // away from rank 0's merge, where a FIRST could pick their NULL.
+        auto& partial       = expect(*node.children[0], T::UNGROUPED_AGGREGATE);
+        auto const gathered = exchange_spec{.routing = exchange_spec::mode::gather};
+        if (service->rank() != gathered.target) {
+          node.Cast<op::sirius_physical_ungrouped_aggregate_merge>().set_outside_result();
+        }
         if (visit(partial.children[0]) == placement::rank0) { return done(placement::rank0); }
-        insert(node.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
+        insert(node.children[0], gathered, false);
         return done(placement::rank0);
       }
 

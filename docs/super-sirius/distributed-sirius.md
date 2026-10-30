@@ -197,7 +197,10 @@ single-process plan already partitions:
 `GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. A `CTE`
 places nothing itself: each rank materializes its share, and the `CTE_SCAN`s under the consumer side
 take the materialization's placement. A hash exchange may start from an input on rank 0 alone (a
-gathered scalar): rank 0 sends its rows by key, and the other ranks' copies of it hold none.
+gathered scalar): rank 0 sends its rows by key, and the other ranks' copies of it hold none, since
+a `MERGE_AGGREGATE` makes its row on rank 0 alone (elsewhere it would make one even from no rows).
+Its input is not gathered when it is on rank 0 alone already: rank 0 then merges only its own
+partials, as on one GPU.
 A `GPU_VALUES` (a `VALUES` list, or a `count(*)` DuckDB answered from Parquet metadata) is on
 rank 0 the same way: every rank planned the same rows, so the other ranks' copies emit none.
 
