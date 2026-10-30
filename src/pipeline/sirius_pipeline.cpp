@@ -409,6 +409,9 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
+          for (auto const& next : get_next_ports_after_sink()) {
+            next.next_operator->on_input_finished(next.next_operator_port_name);
+          }
           end_nvtx_range_if_finished();
           should_notify = true;
         }

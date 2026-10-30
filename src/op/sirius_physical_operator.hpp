@@ -794,6 +794,10 @@ class sirius_physical_operator {
   //! True after finalize_operator() has been called on this operator.
   std::atomic<bool> finalized = false;
 
+  //! Called when the pipeline feeding input port @p port_id finishes, after that pipeline's
+  //! operators are finalized.
+  virtual void on_input_finished(std::string_view /*port_id*/) {}
+
  protected:
   //! Override this instead of finalize_operator() to perform cleanup when a pipeline finishes.
   virtual void on_finalize_operator() {}

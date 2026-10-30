@@ -31,11 +31,14 @@
 #include "op/sirius_physical_distributed_sort_sample.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <cudf/table/table.hpp>
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -344,6 +347,67 @@ TEST_CASE("a rank with no Bloom for a key does not wait for the others' filters"
   merges[0]->merge(mine, stream);
   // Rank 0's Bloom would miss rank 1's keys.
   CHECK(mine[0].membership == nullptr);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+}
+
+TEST_CASE("a join whose build ends empty leaves the filter merge before its probe ends",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  cudf::data_type const int64{cudf::type_id::INT64};
+  auto const bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
+  std::vector<duckdb::unique_ptr<sirius::op::sirius_physical_hash_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    duckdb::vector<sirius::join_condition> conditions(1);
+    conditions[0].left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint});
+    conditions[0].right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint});
+    sirius::op::dynamic_filter_publish_plan plan{
+      {{.build_key_ordinal = 0, .storage_type = int64}},
+      {{std::make_shared<sirius::op::sirius_dynamic_filter_set>(),
+        sirius::op::dynamic_filter_route_class::scan,
+        false,
+        {{0, 0, int64}}}},
+      {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}}};
+    auto side = [&] {
+      return duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+        sirius::op::SiriusPhysicalOperatorType::PROJECTION,
+        duckdb::vector<sirius::logical_type>{bigint},
+        0);
+    };
+    joins.push_back(duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+      stub,
+      side(),
+      side(),
+      std::move(conditions),
+      duckdb::JoinType::INNER,
+      duckdb::vector<std::size_t>{},
+      duckdb::vector<std::size_t>{},
+      duckdb::vector<sirius::logical_type>{},
+      1000,
+      sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+      std::move(plan)));
+    joins[r]->operator_id = 0;
+    joins[r]->add_port("build", std::make_unique<sirius::op::sirius_physical_operator::port>());
+    joins[r]->set_build_arrives_whole(true);
+    joins[r]->set_distributed_dynamic_filters(
+      std::make_shared<sirius::exchange::all_gather_filter_merge>(
+        sirius::exchange::all_gather_filter_merge::options{.service      = c.all[r].service,
+                                                           .first_stream = 81,
+                                                           .gpu          = env().gpu,
+                                                           .bloom_keys   = 4096,
+                                                           .timeout = std::chrono::seconds{30}}));
+  }
+  // Rank 1's build pipeline ends with no batch; its probe never does.
+  sirius::pipeline::sirius_pipeline build(sirius::pipeline::pipeline_build_context{nullptr});
+  sirius::op::sirius_physical_operator sink;
+  sink.add_next_port_after_sink({joins[1].get(), "build"});
+  sirius::pipeline::sirius_pipeline_build_state{}.set_pipeline_sink(build, &sink, 0);
+  auto const start = std::chrono::steady_clock::now();
+  on_every_rank(2, [&](rank_t r) {
+    if (r == 0) { joins[0]->push_data_batch_partitioned("build", keys_batch(0, 2, 2000), 0); }
+    if (r == 1) { build.update_pipeline_status(false); }
+  });
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
 }
 

@@ -658,6 +658,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   }
 
   void on_finalize_operator() override;
+  void on_input_finished(std::string_view port_id) override;
 
  protected:
   bool _is_delim_join_inner = false;

@@ -2400,5 +2400,15 @@ void sirius_physical_hash_join::on_finalize_operator()
   }
 }
 
+void sirius_physical_hash_join::on_input_finished(std::string_view port_id)
+{
+  // A rank whose build did not arrive as one whole batch (an empty one, say) owes its peers its
+  // share of each filter merge; left to on_finalize_operator, after the probe side, that share
+  // would wait on probe rows from a peer whose publication waits on it.
+  if (port_id == "build" && _dynamic_filter_session.plan().distributed() != nullptr) {
+    _dynamic_filter_session.finish_input();
+  }
+}
+
 }  // namespace op
 }  // namespace sirius
