@@ -317,6 +317,36 @@ TEST_CASE("a rank whose whole-build publication fails does not hold up the other
   CHECK(outcomes[0].filters_pushed == 0);
 }
 
+TEST_CASE("a rank with no Bloom for a key does not wait for the others' filters",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  std::vector<std::unique_ptr<sirius::exchange::all_gather_filter_merge>> merges;
+  for (rank_t r = 0; r < 2; ++r) {
+    merges.push_back(std::make_unique<sirius::exchange::all_gather_filter_merge>(
+      sirius::exchange::all_gather_filter_merge::options{.service      = c.all[r].service,
+                                                         .first_stream = 71,
+                                                         .gpu          = env().gpu,
+                                                         .bloom_keys   = 4096,
+                                                         .timeout = std::chrono::seconds{30}}));
+  }
+  auto const stream = utils::default_stream();
+  auto const start  = std::chrono::steady_clock::now();
+  // Rank 1 merges before rank 0 starts: it has no Bloom for the key, so it has nothing to wait for.
+  std::vector<sirius::op::key_filters> none(1);
+  merges[1]->merge(none, stream);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+
+  std::vector<sirius::op::key_filters> mine(1);
+  auto const keys    = numeric_column(cudf::data_type{cudf::type_id::INT64}, sequence(0, 2, 2000));
+  mine[0].membership = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+    keys->view(), 4096, stream, env().gpu->get_default_allocator());
+  merges[0]->merge(mine, stream);
+  // Rank 0's Bloom would miss rank 1's keys.
+  CHECK(mine[0].membership == nullptr);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+}
+
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
 {
   ranks c(2);

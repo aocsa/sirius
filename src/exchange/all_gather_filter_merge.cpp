@@ -84,6 +84,11 @@ void all_gather_filter_merge::merge(std::vector<op::key_filters>& per_key,
     }
     std::vector<std::shared_ptr<cucascade::data_batch>> all;
     next_key = k + 1;
+    if (!bloom) {
+      // Nothing to send or keep: take part without waiting for the other ranks.
+      leave_keys(k, k + 1);
+      continue;
+    }
     try {
       all = exchange::all_gather(
         *d.service, d.first_stream + k, std::move(mine), *d.gpu, stream.get(), d.timeout);
@@ -93,7 +98,6 @@ void all_gather_filter_merge::merge(std::vector<op::key_filters>& per_key,
       membership.reset();
       continue;
     }
-    if (!bloom) { continue; }
     std::vector<std::uint32_t const*> others;
     bool mergeable = true;
     for (exchange::rank_t r = 0; r < all.size() && mergeable; ++r) {
