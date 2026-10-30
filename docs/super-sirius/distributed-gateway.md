@@ -261,10 +261,25 @@ quack_base_port := 9500)`:
 
    ```sql
    SET enable_duckdb_fallback = false;         -- a rank falling back alone gives a wrong answer
-   SET sirius_exchange_peers = '127.0.0.1:27000,127.0.0.1:27001,...';
+   SET sirius_exchange_peers = '<host 0>:27000,<host 1>:27001,...';   -- hosts default to 127.0.0.1
    SET sirius_exchange_rank = <i>;            -- connects NIXL: waits for every rank
    <sirius_gateway_rank_init>
    ```
+
+**Ranks on other hosts.** `hosts := '10.0.0.1,10.0.0.2'` gives each rank's exchange address, as the
+other ranks reach it. A rank whose host is not an address of one of the gateway's interfaces
+starts through `sirius_gateway_rank_launcher` instead of `posix_spawn` of the binary:
+
+```bash
+<launcher> <host> <gpu> <9500 + i> sirius-duckdb/build/release/duckdb rank_<i>.init.sql
+```
+
+`scripts/sirius_gateway_ssh_rank.sh` is that launcher. It copies the init file over SSH, runs
+the rank under pixi with the gateway's `UCX_*`, `NIXL_*` and `SIRIUS_*` variables, and forwards
+the gateway's `127.0.0.1:<9500 + i>` to the rank's own `127.0.0.1`. So `uri` stays local, Quack
+needs no certificate, and the SSH session carries stdin: the rank still exits when the pipe
+closes, `waitpid` on the `ssh` process sees it exit, and recovery restarts it like a local rank.
+A watchdog on the remote box kills the rank if the SSH session dies without closing stdin.
 
 Health is checked lazily: before each statement, `waitpid` finds ranks that exited. A rank that
 hangs is caught by the statement timeout instead.
@@ -302,14 +317,15 @@ rank (`exchange_service::abort`).
 
 | Function / setting | Purpose |
 |---|---|
-| `sirius_gateway_start(ranks, gpus, exchange_base_port, quack_base_port)` | Start the ranks (above); returns the status |
+| `sirius_gateway_start(ranks, gpus, hosts, exchange_base_port, quack_base_port)` | Start the ranks (above); returns the status |
 | `sirius_gateway_stop()`, `sirius_gateway_restart()` | Stop them; restart and replay |
 | `sirius_gateway_run(sql)` | The fan-out; the router calls it, and the console can call it directly |
 | `sirius_gateway_route(connection_id, sql)` | The router, for `quack_authorization_function` |
-| `sirius_gateway_status()` | One row per rank: index, pid, GPU, URI, state, error, last K, statements queued |
+| `sirius_gateway_status()` | One row per rank: index, pid, GPU, host, URI, state, error, last K, statements queued |
 | `sirius_gateway_log()` | The DDL log |
 | `sirius_gateway_duckdb_binary`, `sirius_gateway_sirius_extension` | Paths used to start ranks; no extension starts CPU ranks |
 | `sirius_gateway_rank_init` | Extra SQL every rank's session runs, after the exchange settings |
+| `sirius_gateway_rank_launcher` | Program that starts a rank on another host (`scripts/sirius_gateway_ssh_rank.sh`) |
 | `sirius_gateway_log_dir` | Rank init files and logs; default a temporary directory |
 | `sirius_gateway_statement_timeout` | Seconds one fan-out may run before it is cancelled on every rank; 0 is none |
 | `sirius_gateway_query_id_setting` | Setting that carries K (default `sirius_distributed_query_id`); tests use `VARIABLE ...` |

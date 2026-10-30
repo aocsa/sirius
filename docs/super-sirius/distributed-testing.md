@@ -9,8 +9,8 @@ How to bring up and test [distributed Sirius](distributed-sirius.md) and the
 
 | | One box, several GPUs | Several boxes, one GPU each |
 |---|---|---|
-| Distributed Sirius (NIXL exchange) | Tested on 4 × GB200 | Untested. Nothing in the code is tied to one host, but every run so far used one |
-| Gateway | Built; tested with CPU ranks only | Not supported yet: the gateway starts its ranks itself, on its own host (see [What the gateway needs](#what-the-gateway-needs-for-several-boxes)) |
+| Distributed Sirius (NIXL exchange) | Tested on 4 × GB200 | Tested: TPC-H Q12 SF100, 2 × GB200, TCP on bond0 ([runbook](two-box-q12-sf100.md)) |
+| Gateway | Tested: TPC-H Q12 SF100, 2 × GB200 ([runbook](gateway-q12-sf100-2gpu.md)) | Tested: TPC-H Q12 SF100, 2 × GB200, ranks on other boxes started over SSH ([4. The same query through the gateway](#4-the-same-query-through-the-gateway-1)) |
 
 ## Contents
 
@@ -180,6 +180,9 @@ answer from [Test data](#test-data). Rank logs are in `/tmp/distributed_rank_<i>
 
 ### 4. The same query through the gateway
 
+A copy-paste run of TPC-H Q12 SF100 through the gateway on gcn-17 with 2 GPUs is in
+[gateway-q12-sf100-2gpu.md](gateway-q12-sf100-2gpu.md).
+
 Start the gateway and 4 ranks. Its terminal becomes the gateway's console:
 
 ```bash
@@ -221,10 +224,11 @@ The gateway writes each rank's output to `/tmp/sirius_gateway/rank_<i>.log`.
 
 ## Several boxes, one GPU each
 
-The gateway cannot drive these yet. It starts every rank as its own child process and gives the
-ranks `127.0.0.1` addresses (`gateway/src/gateway_state.cpp`, `start_locked`). Distributed Sirius
-itself takes any `host:port` in `sirius_exchange_peers`, so start one rank per box and send every
-rank the same SQL.
+Distributed Sirius takes any `host:port` in `sirius_exchange_peers`, so either start one rank per
+box and send every rank the same SQL ([3. A query across boxes](#3-a-query-across-boxes)), or let
+the gateway start them over SSH ([4](#4-the-same-query-through-the-gateway-1)). A copy-paste run of
+TPC-H Q12 SF100 on the Presto GB200 pair (gcn-17 + gcn-18) without the gateway is in
+[two-box-q12-sf100.md](two-box-q12-sf100.md).
 
 ### 1. Network
 
@@ -300,19 +304,33 @@ Rank 0's result should match DuckDB's answer. Every rank must get the same state
 order, which is what the script does. So run interactive sessions this way, not by typing into each
 box separately.
 
-### What the gateway needs for several boxes
+### 4. The same query through the gateway
 
-Not built yet. Two changes would let `sirius_gateway_start` drive ranks on other boxes:
+Run the gateway on one box. `SIRIUS_GATEWAY_HOSTS` gives each rank's exchange address and
+`SIRIUS_GATEWAY_GPUS` its GPU; ranks whose address is not one of this box's start over SSH with
+`scripts/sirius_gateway_ssh_rank.sh`:
 
-- **Per-rank hosts.** A `hosts` argument giving each rank's exchange address, used in
-  `sirius_exchange_peers` instead of `127.0.0.1`.
-- **Remote ranks.** Either start each rank over SSH (the SSH session's stdin plays the role of the
-  held-open pipe, so the rank still exits with the gateway), or attach to ranks already serving
-  Quack on their boxes. The second cannot restart a rank, so recovery would stop the cluster
-  instead.
+```bash
+export UCX_NET_DEVICES=bond0     # the interface the boxes reach each other on; passed to every rank
+SIRIUS_GATEWAY_TOKEN=my_token SIRIUS_GATEWAY_HOSTS=10.0.0.1,10.0.0.2 SIRIUS_GATEWAY_GPUS=0,0 \
+  pixi run scripts/sirius_gateway.sh 2
+```
 
-Ranks on other hosts serve Quack over TLS with a self-signed certificate. The gateway would pin
-each one with `ssl_fingerprint`, which a rank's `quack_server_list()` shows in its `info` map.
+Then connect a client and run Q12 as on one box. `sirius_gateway_status()` shows each rank's host.
+
+- **Requirements.** Passwordless SSH from the gateway's box to the others, and pixi, this checkout
+  and its build at the same paths on every box. The rank's init file is copied over SSH, so the
+  log directory can stay in `/tmp`.
+- **Environment.** The launcher passes on the gateway's `UCX_*`, `NIXL_*` and `SIRIUS_*` variables
+  and sources `scripts/nixl_env.sh` on the remote box. `sirius_gateway.sh` defaults
+  `SIRIUS_EXCHANGE_HOST_STAGING` to `never` when hosts are set.
+- **Quack.** A remote rank serves Quack on its own `127.0.0.1`; the SSH session forwards the
+  gateway's `127.0.0.1:<9500 + i>` to it, so there is no TLS certificate to pin. While the rank
+  starts, its log shows `channel 2: open failed: connect failed: Connection refused` once per
+  ATTACH retry; that is expected.
+- **Exit.** SSH carries the rank's stdin, so the rank exits when the gateway closes it, and
+  recovery restarts remote ranks like local ones. If the SSH session dies without closing stdin, a
+  watchdog on the remote box kills the rank within about 5 s.
 
 ## Troubleshooting
 
