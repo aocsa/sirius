@@ -16,10 +16,12 @@
 
 #include "planner/distributed_plan.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/all_gather_filter_merge.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/wire.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -52,6 +54,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -133,9 +136,22 @@ struct rewriter {
                                             bool ordered)
   {
     auto child       = std::move(slot);
-    auto const id    = stream();
     auto const types = child->types;
-    auto const rows  = child->estimated_cardinality;
+    // Refused here, on every rank alike, rather than by the first batch sent, once scans run.
+    for (std::size_t i = 0; i < types.size(); ++i) {
+      auto const type = child->has_physical_overrides()
+                          ? std::optional{child->get_physical_types()[i]}
+                          : get_cudf_type(types[i]);
+      if (type && !exchange::carries(type->id())) {
+        throw sirius::not_implemented_exception(
+          "distributed execution: {} column {} is {}, which the exchange does not carry",
+          child->get_name(),
+          i,
+          types[i].to_string());
+      }
+    }
+    auto const id   = stream();
+    auto const rows = child->estimated_cardinality;
     std::set<exchange::rank_t> senders;
     if (spec.routing != exchange_spec::mode::gather || service->rank() == spec.target) {
       for (exchange::rank_t r = 0; r < service->world_size(); ++r) {

@@ -38,6 +38,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -717,6 +718,45 @@ TEST_CASE("an ungrouped aggregate over rank 0's rows makes its row on rank 0 alo
   CHECK(top == std::vector<type>{type::MERGE_AGGREGATE, type::FILTER});
   CHECK(below_merge == std::vector<type>{type::UNGROUPED_AGGREGATE, type::UNGROUPED_AGGREGATE});
   CHECK(rank1_rows_kept == 0);
+}
+
+TEST_CASE("a partial result the exchange cannot carry is refused while planning",
+          "[exchange][operators]")
+{
+  // STDDEV_SAMP's partials are STRUCT states, which only its merge turns into a DOUBLE.
+  using type = sirius::op::SiriusPhysicalOperatorType;
+  ranks c(2);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  std::vector<std::string> errors(c.world());
+  std::vector<std::thread> threads;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    threads.emplace_back([&, r] {
+      try {
+        constexpr auto validity = duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES;
+        auto partial = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate>(
+          key_value_types(), duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, 1, validity);
+        partial->types = {sirius::logical_type::make(sirius::type_id::STRUCT)};
+        // A DELIM_SCAN's rows are spread across the ranks, so the partials are gathered.
+        partial->children.push_back(duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+          type::DELIM_SCAN, key_value_types(), 1));
+        duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan =
+          duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate_merge>(
+            key_value_types(), duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, 1, validity);
+        plan->children.push_back(std::move(partial));
+        sirius::planner::distribute_plan(plan, c.all[r].service, *env().gpu, 6, lifecycle);
+      } catch (sirius::not_implemented_exception const& e) {
+        errors[r] = e.what();
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  for (auto const& error : errors) {
+    CHECK_THAT(error,
+               Catch::Matchers::ContainsSubstring(
+                 "UNGROUPED_AGGREGATE column 0 is STRUCT, which the exchange does not carry"));
+  }
 }
 
 TEST_CASE("a join merging its filters across ranks gives each admitted key its own stream",

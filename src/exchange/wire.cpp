@@ -152,7 +152,7 @@ void check_column(column_metadata const& c, std::uint64_t rows, std::uint64_t st
   require(c.type_id >= 0 && c.type_id < static_cast<std::int32_t>(cudf::type_id::NUM_TYPE_IDS),
           "type id out of range");
   auto const id = static_cast<cudf::type_id>(c.type_id);
-  require(is_string(id) || is_fixed_width(id), "type is neither fixed-width nor STRING");
+  require(carries(id), "type is neither fixed-width nor STRING");
   require(c.num_rows >= 0 && static_cast<std::uint64_t>(c.num_rows) == rows,
           "column rows differ from the batch's");
   require(c.null_count >= 0 && c.null_count <= c.num_rows, "null count out of range");
@@ -212,6 +212,8 @@ void walk(column_metadata const& c, std::vector<stream_buffer>& out)
 }
 
 }  // namespace
+
+bool carries(cudf::type_id id) { return is_string(id) || is_fixed_width(id); }
 
 std::vector<std::uint8_t> encode_header(batch_header const& header)
 {
@@ -302,7 +304,7 @@ std::vector<column_metadata> plan_stream(cudf::table_view const& table,
   columns.reserve(table.num_columns());
   for (auto const& col : table) {
     auto const id = col.type().id();
-    if (!is_string(id) && !is_fixed_width(id)) {
+    if (!carries(id)) {
       throw sirius::invalid_input_exception("exchange cannot send type id {}",
                                             static_cast<std::int32_t>(id));
     }

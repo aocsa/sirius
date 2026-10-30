@@ -41,6 +41,9 @@
  */
 namespace sirius::exchange {
 
+/// Whether the wire carries columns of type @p id: fixed-width or STRING.
+[[nodiscard]] bool carries(cudf::type_id id);
+
 /// The header of one batch on the wire.
 struct batch_header {
   std::uint64_t rows{0};
