@@ -462,7 +462,7 @@ void require_same_shape(rewriter& r)
 
 }  // namespace
 
-bool is_distributed(operator_params const& params) { return !params.exchange_peers.empty(); }
+bool is_distributed(operator_params const& params) { return params.exchange_peers.size() > 1; }
 
 void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,
@@ -508,12 +508,12 @@ void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
                           std::vector<std::string> files,
                           const sirius::operator_params& op_params)
 {
-  auto const world = op_params.exchange_peers.size();
-  auto const rank  = op_params.exchange_rank;
-  if (world <= 1) {
+  if (!is_distributed(op_params)) {
     info.resolved_file_paths = std::move(files);
     return;
   }
+  auto const world  = op_params.exchange_peers.size();
+  auto const rank   = op_params.exchange_rank;
   auto const remote = std::any_of(
     files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
   if (remote) {

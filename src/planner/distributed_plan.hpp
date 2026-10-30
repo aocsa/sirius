@@ -48,7 +48,7 @@ class parquet_ingestible_table_info;
 namespace sirius::planner {
 
 /// Whether @p params run the query on the ranks of `exchange_peers`: distribute_plan() then
-/// rewrites its plan.
+/// rewrites its plan. One peer runs it locally, as none does.
 [[nodiscard]] bool is_distributed(operator_params const& params);
 
 /**

@@ -78,6 +78,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/unsupported_optimizers.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -2628,7 +2629,7 @@ static void SetExchangeRank(ClientContext& context, SetScope scope, Value& param
   params->exchange_rank = static_cast<uint32_t>(UBigIntValue::Get(parameter));
   // Peers set first: connect now, during session setup, rather than inside the first
   // distributed query, which would otherwise wait for every peer's process to reach it.
-  if (params->exchange_peers.empty()) { return; }
+  if (!sirius::planner::is_distributed(*params)) { return; }
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     static_cast<void>(sirius_ctx->get_exchange_service(*params));
   }
@@ -3428,7 +3429,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   config.AddExtensionOption("sirius_exchange_peers",
                             "Distributed execution: host:port of every rank's exchange listener, "
-                            "comma-separated in rank order; empty runs in one process",
+                            "comma-separated in rank order; empty or one runs in one process",
                             LogicalType::VARCHAR,
                             Value(""),
                             SetExchangePeers);

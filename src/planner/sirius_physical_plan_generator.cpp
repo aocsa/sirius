@@ -1281,7 +1281,7 @@ void lower_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& 
         sirius::op::scan::eligibility_verdict::supported) {
     throw std::logic_error("scan lowering requires a supported verdict");
   }
-  if (params.exchange_peers.size() > 1 && !entry->splits_across_ranks) {
+  if (sirius::planner::is_distributed(params) && !entry->splits_across_ranks) {
     throw sirius::not_implemented_exception(
       "distributed execution does not split {} scans across ranks: every rank would read the "
       "whole table. Read it from Parquet files instead",
