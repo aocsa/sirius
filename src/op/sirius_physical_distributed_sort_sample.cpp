@@ -152,10 +152,13 @@ void sirius_physical_distributed_sort_sample::compute_boundaries(cudf::table_vie
   }
 
   // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
-  auto gathered =
-    exchange::all_gather(*_sampling.service, _sampling.stream, summary, gpu, stream.get());
+  // A retried task reuses the result: the peers have closed the all-gather's stream.
+  if (!_gathered) {
+    _gathered =
+      exchange::all_gather(*_sampling.service, _sampling.stream, summary, gpu, stream.get());
+  }
   std::vector<::cucascade::read_only_data_batch> parts;
-  for (auto const& g : gathered) {
+  for (auto const& g : *_gathered) {
     if (g) { parts.push_back(g->to_read_only()); }
   }
   _num_partitions = 1;

@@ -24,6 +24,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius::exchange {
@@ -83,6 +84,7 @@ class sirius_physical_distributed_sort_sample : public sirius_physical_sort_samp
 
  private:
   distributed_sampling _sampling;
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _gathered;
   std::vector<cudf::order> _column_order;
   std::vector<cudf::null_order> _null_precedence;
 };

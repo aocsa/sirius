@@ -384,6 +384,42 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   CHECK(samples[0]->get_num_partitions() > 1);
 }
 
+TEST_CASE("a retried distributed SORT_SAMPLE does not join the all-gather again",
+          "[exchange][collectives]")
+{
+  // Exposes the boundary computation, so the test can run it a second time as a retry does.
+  struct retried : sirius_physical_distributed_sort_sample {
+    using sirius_physical_distributed_sort_sample::compute_boundaries;
+    using sirius_physical_distributed_sort_sample::sirius_physical_distributed_sort_sample;
+  };
+  rank_t const world = 2;
+  ranks c(world);
+  std::vector<std::unique_ptr<retried>> samples;
+  std::vector<std::shared_ptr<cudf::table const>> boundaries(world);
+  for (rank_t r = 0; r < world; ++r) {
+    samples.push_back(std::make_unique<retried>(
+      *make_sample(),
+      sirius_physical_distributed_sort_sample::distributed_sampling{
+        c.all[r].service, 41, env().gpu, [&boundaries, r](std::shared_ptr<cudf::table const> b) {
+          boundaries[r] = std::move(b);
+        }}));
+  }
+  auto const input = keys_batch(0, 1, 20'000);
+  auto const ro    = input->to_read_only();
+  auto const keys  = sirius::get_cudf_table_view(ro);
+  on_every_rank(world, [&](rank_t r) {
+    samples[r]->compute_boundaries(keys, 4, *env().gpu, utils::default_stream());
+  });
+  REQUIRE(boundaries[0] != nullptr);
+  auto const first = keys_of(*boundaries[0]);
+
+  // The peers have left the gather: joining it again fails the exchange or waits out the timeout.
+  auto const start = std::chrono::steady_clock::now();
+  samples[0]->compute_boundaries(keys, 4, *env().gpu, utils::default_stream());
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+  CHECK(keys_of(*boundaries[0]) == first);
+}
+
 TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted range",
           "[exchange][collectives]")
 {
