@@ -23,10 +23,15 @@
 #include "exchange/loopback_fabric.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
+#include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
@@ -38,9 +43,11 @@
 #include <cudf/table/table.hpp>
 
 #include <cucascade/data/data_repository.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
@@ -710,4 +717,90 @@ TEST_CASE("an ungrouped aggregate over rank 0's rows makes its row on rank 0 alo
   CHECK(top == std::vector<type>{type::MERGE_AGGREGATE, type::FILTER});
   CHECK(below_merge == std::vector<type>{type::UNGROUPED_AGGREGATE, type::UNGROUPED_AGGREGATE});
   CHECK(rank1_rows_kept == 0);
+}
+
+TEST_CASE("a join merging its filters across ranks gives each admitted key its own stream",
+          "[exchange][operators][dynamic_filter]")
+{
+  constexpr std::size_t keys = 70;
+  ranks c(2);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  cudf::data_type const int64{cudf::type_id::INT64};
+  std::vector<std::vector<stream_id>> streams(c.world());
+  std::vector<std::string> errors(c.world());
+  std::vector<std::thread> threads;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    threads.emplace_back([&, r] {
+      try {
+        std::vector<sirius::op::dynamic_filter_publish_plan::admitted_key> admitted(keys);
+        for (std::size_t k = 0; k < keys; ++k) {
+          admitted[k].planner_condition_index = k;
+          admitted[k].storage_type            = int64;
+        }
+        sirius::op::dynamic_filter_publish_plan filters{
+          std::move(admitted),
+          {{std::make_shared<sirius::op::sirius_dynamic_filter_set>(),
+            sirius::op::dynamic_filter_route_class::scan,
+            false,
+            {{0, 0, int64}}}},
+          {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}}};
+        auto side = [&](std::size_t rows) {
+          duckdb::vector<sirius::logical_type> const types{bigint};
+          auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
+            types, rows, sirius::op::partition_spec({0}));
+          partition->children.push_back(
+            duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(types, rows, false));
+          auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(types, rows, false);
+          concat->children.push_back(std::move(partition));
+          return concat;
+        };
+        duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
+        stub.types = {duckdb::LogicalType::BIGINT};
+        duckdb::vector<sirius::join_condition> conditions(1);
+        conditions[0].left = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint});
+        conditions[0].right =
+          std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint});
+        // A build too large to broadcast: both sides are hashed and the filters merged.
+        duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan =
+          duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+            stub,
+            side(1),
+            side(1'000'000),
+            std::move(conditions),
+            duckdb::JoinType::INNER,
+            duckdb::vector<std::size_t>{},
+            duckdb::vector<std::size_t>{},
+            duckdb::vector<sirius::logical_type>{},
+            1000,
+            sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+            std::move(filters));
+        sirius::planner::distribute_plan(plan, c.all[r].service, *env().gpu, 5, lifecycle);
+        std::function<void(sirius::op::sirius_physical_operator&)> collect =
+          [&](sirius::op::sirius_physical_operator& node) {
+            if (node.type == sirius::op::SiriusPhysicalOperatorType::EXCHANGE_SINK) {
+              streams[r].push_back(node.Cast<sirius_physical_exchange_sink>().stream());
+            }
+            for (auto& child : node.children) {
+              collect(*child);
+            }
+          };
+        collect(*plan);
+      } catch (std::exception const& e) {
+        errors[r] = e.what();
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  REQUIRE(errors == std::vector<std::string>(c.world()));
+  // The merge is the plan's first use of a stream: keys on streams 1 to 70 of query 5.
+  auto const first_after_keys = (stream_id{5} << sirius::exchange::query_stream_bits) | (keys + 1);
+  for (auto const& mine : streams) {
+    REQUIRE(mine.size() == 3);
+    for (auto const s : mine) {
+      CHECK(s >= first_after_keys);
+    }
+  }
 }
