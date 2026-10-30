@@ -806,7 +806,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
   if (connection_state_) {
     connection_state_->execution_window_active = true;
     connection_state_->active_window           = sirius::value_of(window_id_);
-    if (auto const planned = std::exchange(connection_state_->planned_distributed_query, 0)) {
+    if (auto const planned = connection_state_->planned_distributed_query) {
       ctx_.distributed_.open_window(window_id_, planned);
     }
   }
@@ -1277,10 +1277,13 @@ void SiriusContext::terminate()
 
 uint64_t SiriusContext::next_distributed_query(ClientContext& context)
 {
-  auto state        = get_sirius_connection_state(context);
+  auto state = get_sirius_connection_state(context);
+  // A statement planned again (e.g. rebuilt at execute) keeps its number: the other ranks may
+  // plan it once.
+  if (state && state->planned_distributed_query != 0) { return state->planned_distributed_query; }
   auto const window = state ? state->active_window : 0;
   auto const query  = distributed_.next_query(context.GetConnectionId(), window);
-  if (state && window == 0) { state->planned_distributed_query = query; }
+  if (state) { state->planned_distributed_query = query; }
   return query;
 }
 

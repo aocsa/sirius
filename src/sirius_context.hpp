@@ -137,9 +137,9 @@ class SiriusConnectionState : public ClientContextState {
   bool execution_window_active{false};
   /// Distributed execution only: the execution window open on this connection, 0 when none.
   uint64_t active_window{0};
-  /// Distributed execution only: the distributed query this connection planned before its
-  /// execution window opened; the window adopts it. Cleared at each statement's start, so a plan
-  /// that never ran leaves nothing.
+  /// Distributed execution only: the distributed query this connection's statement planned, 0
+  /// when none; its execution window adopts it. Cleared at each statement's start, so a plan that
+  /// never ran leaves nothing.
   uint64_t planned_distributed_query{0};
 
   /// \brief Report @p error, not the interrupt it raised, when the CPU replay failed.
@@ -806,8 +806,9 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] std::shared_ptr<sirius::exchange::exchange_service> get_exchange_service(
     sirius::operator_params const& params);
 
-  /// \brief See exchange::distributed_session::next_query; a query planned before the
-  /// connection's execution window opens is tied to that window when it opens.
+  /// \brief See exchange::distributed_session::next_query, once per statement: planning the
+  /// statement again returns the same number. A query planned before the connection's execution
+  /// window opens is tied to that window when it opens.
   [[nodiscard]] uint64_t next_distributed_query(ClientContext& context);
 
   /// \brief See exchange::distributed_session::release_connection.

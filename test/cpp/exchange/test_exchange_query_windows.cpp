@@ -25,6 +25,15 @@
 
 using window = duckdb::SiriusContext::StandaloneQueryScope;
 
+namespace {
+
+void begin_statement(duckdb::Connection& connection)
+{
+  duckdb::get_sirius_connection_state(*connection.context)->QueryBegin(*connection.context);
+}
+
+}  // namespace
+
 TEST_CASE("distributed queries are numbered on one connection and tied to their window",
           "[exchange][query_windows]")
 {
@@ -38,6 +47,7 @@ TEST_CASE("distributed queries are numbered on one connection and tied to their 
   REQUIRE(ctx);
 
   // Planned before its window opens, as transparent execution does: the window adopts it.
+  begin_statement(*owner);
   auto const first = ctx->next_distributed_query(*owner->context);
   sirius::query_id_t first_window{};
   {
@@ -48,6 +58,7 @@ TEST_CASE("distributed queries are numbered on one connection and tied to their 
   CHECK(ctx->distributed_query_of(first_window) == 0);
 
   // Planned while its window is open: tied to that window at once.
+  begin_statement(*owner);
   {
     window w(*ctx, *owner->context, "distributed_second");
     auto const second = ctx->next_distributed_query(*owner->context);
@@ -65,4 +76,28 @@ TEST_CASE("distributed queries are numbered on one connection and tied to their 
   auto later =
     std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
   CHECK_THROWS_AS(ctx->next_distributed_query(*later->context), sirius::invalid_input_exception);
+}
+
+TEST_CASE("a statement planned twice keeps its distributed query number",
+          "[exchange][query_windows]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto connection =
+    std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+  auto ctx = connection->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(ctx);
+
+  begin_statement(*connection);
+  auto const first = ctx->next_distributed_query(*connection->context);
+  CHECK(ctx->next_distributed_query(*connection->context) == first);
+  {
+    window w(*ctx, *connection->context, "distributed_rebuilt");
+    // Rebuilt at execute, as transparent execution does when this rank's pin registry moved.
+    CHECK(ctx->next_distributed_query(*connection->context) == first);
+    CHECK(ctx->distributed_query_of(w.query_id()) == first);
+  }
+
+  begin_statement(*connection);
+  CHECK(ctx->next_distributed_query(*connection->context) == first + 1);
 }
