@@ -26,6 +26,8 @@
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_scan_core.hpp"
 #include "op/scan/parquet_scan_types.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_distributed_sort_sample.hpp"
@@ -39,6 +41,7 @@
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/gpu_admission.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
@@ -228,7 +231,20 @@ struct rewriter {
       return p;
     };
     switch (node.type) {
-      case T::GPU_SCAN: return done(placement::spread);
+      case T::GPU_SCAN: {
+        auto const& source =
+          node.Cast<op::scan::sirius_gpu_scan_operator>().scan_contract().view->identity->source;
+        auto const connectors = registered_connectors();
+        auto const entry =
+          std::ranges::find(connectors, source.registry_profile, &connector::registry_profile);
+        if (entry == connectors.end() || !entry->splits_across_ranks) {
+          throw sirius::not_implemented_exception(
+            "distributed execution does not split {} scans across ranks: every rank would read "
+            "the whole table. Read it from Parquet files instead",
+            source.function_name);
+        }
+        return done(placement::spread);
+      }
       case T::FILTER:
       case T::PROJECTION:
       // A join-edge dynamic filter: its filter holds every rank's keys (see HASH_JOIN).

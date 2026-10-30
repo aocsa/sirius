@@ -23,6 +23,9 @@
  *        every operator's `_parent_op` matches its position in the final tree.
  */
 
+#include "exchange/exchange_service.hpp"
+#include "exchange/loopback_fabric.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
 
@@ -46,6 +49,7 @@
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
@@ -474,13 +478,29 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                           sirius::test::sql_literal(parquet.string()) + " (FORMAT PARQUET)")
                   ->HasError());
 
-  // Both plans are refused while their scans are lowered, before planning would connect.
-  REQUIRE_FALSE(con->Query("SET sirius_exchange_peers = '127.0.0.1:1,127.0.0.1:2'")->HasError());
+  // A DuckDB table: every rank would read all of it. Planned as one GPU's, distributing it is
+  // refused.
+  {
+    auto ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(ctx);
+    auto& gpu =
+      *ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, /*device_id=*/0);
+    sirius::test::exchange_utils::loopback_hub hub(1);
+    sirius::exchange::frame_ring send(4, 64 * 1024);
+    sirius::exchange::frame_ring recv(8, 64 * 1024);
+    auto fab = hub.attach(0, send, recv);
+    auto service =
+      std::make_shared<sirius::exchange::exchange_service>(*fab, send, recv, gpu, /*host=*/nullptr);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    // Declared after the service, whose fabric a distributed plan's exchanges would use.
+    auto plan = generate_sirius_plan(*con, "SELECT val FROM big_left WHERE id > 5");
+    REQUIRE_THROWS_WITH(
+      sirius::planner::distribute_plan(plan, service, gpu, 1, lifecycle),
+      Catch::Matchers::ContainsSubstring("does not split seq_scan scans across ranks"));
+  }
 
-  // A DuckDB table: every rank would read all of it.
-  REQUIRE_THROWS_WITH(
-    generate_sirius_plan(*con, "SELECT val FROM big_left WHERE id > 5"),
-    Catch::Matchers::ContainsSubstring("does not split seq_scan scans across ranks"));
+  // Refused while its files are assigned to ranks, before planning would connect.
+  REQUIRE_FALSE(con->Query("SET sirius_exchange_peers = '127.0.0.1:1,127.0.0.1:2'")->HasError());
 
   // Sirius's own reader plans its URI as one file. A URI with a scheme counts as remote, and
   // ranks share remote files whole, so one file cannot serve two ranks.
