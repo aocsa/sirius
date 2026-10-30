@@ -59,6 +59,7 @@ target_sources(
           sirius_physical_column_data_scan.cpp
           sirius_physical_exchange_sink.cpp
           sirius_physical_exchange_source.cpp
+          sirius_physical_distributed_sort_sample.cpp
           sirius_physical_streaming_sink.cpp
           sirius_physical_streaming_source.cpp
           sirius_physical_concat.cpp

@@ -161,11 +161,13 @@ before the stream's source is planned, and replays it when the source attaches.
 `all_gather()` sends one small table from every rank to every rank and blocks until all have
 arrived. It is used three ways:
 
-- **`SORT_SAMPLE` in distributed mode.** Each rank shares up to 1024 evenly spaced rows of its
-  sorted sample, and every rank merges them all in rank order. From the same global sample each
-  rank derives the same world − 1 range boundaries for the exchange after it, and its own
-  `SORT_PARTITION` boundaries from inside its range. A rank with no input still runs its boundary
-  task (`runs_without_input()`), since the others wait for it.
+- **`sirius_physical_distributed_sort_sample`** (`src/op/sirius_physical_distributed_sort_sample.*`),
+  the `SORT_SAMPLE` that `distribute_plan()` puts in place of the local one. It overrides
+  `compute_boundaries()`: each rank shares up to 1024 evenly spaced rows of its sorted sample, and
+  every rank merges them all in rank order. From the same global sample each rank derives the same
+  world − 1 range boundaries for the exchange after it, and its own `SORT_PARTITION` boundaries
+  from inside its range. A rank with no input still runs its boundary task
+  (`runs_without_input()`), since the others wait for it.
 - **The plan-shape check** (below).
 - **The Bloom merge** (below).
 
@@ -378,7 +380,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/exchange/fabric.*`, `nixl_fabric.*` | Rings; the NIXL fabric and its start-up |
 | `src/exchange/exchange_service.*`, `exchange_runtime.*`, `all_gather.*` | A process's exchange; collectives |
 | `src/op/sirius_physical_exchange_{sink,source}.*` | The operators |
-| `src/op/sirius_physical_sort_sample.*` | Distributed sampling |
+| `src/op/sirius_physical_distributed_sort_sample.*` | Distributed sampling |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check |
 | `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | Bloom merge across ranks |
 | `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh`, `nixl_env.sh` | Launchers and runtime paths |

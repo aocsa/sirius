@@ -22,6 +22,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_distributed_sort_sample.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_filter.hpp"
@@ -30,6 +31,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_sort_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "planner/gpu_admission.hpp"
 #include "sirius/exception.hpp"
@@ -402,10 +404,16 @@ struct rewriter {
           spec.column_order.push_back(op::to_cudf_order(o.type));
           spec.null_precedence.push_back(op::to_cudf_null_order(o.type, o.null_order));
         }
-        auto* sink = &insert(partition.children[0], std::move(spec), false);
-        sample.set_distributed({service, stream(), gpu, [sink](auto boundaries) {
-                                  sink->set_range_boundaries(std::move(boundaries));
-                                }});
+        auto* sink       = &insert(partition.children[0], std::move(spec), false);
+        auto distributed = duckdb::make_uniq<op::sirius_physical_distributed_sort_sample>(
+          sample,
+          op::sirius_physical_distributed_sort_sample::distributed_sampling{
+            service, stream(), gpu, [sink](auto boundaries) {
+              sink->set_range_boundaries(std::move(boundaries));
+            }});
+        distributed->children = std::move(sample.children);
+        partition.Cast<op::sirius_physical_sort_partition>().set_sample_op(distributed.get());
+        sink->children[0] = std::move(distributed);
         return done(placement::ranged);
       }
 

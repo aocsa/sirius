@@ -910,8 +910,8 @@ class sirius_physical_operator {
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
 
-  //! Whether the task creator may hand this operator a task with no input batches. A distributed
-  //! collective needs one on a rank whose input is empty, since the other ranks wait for it.
+  //! Whether the task creator may hand this operator a task with no input batches: true for an
+  //! operator that owes a task even when its input is empty.
   [[nodiscard]] virtual bool runs_without_input() const { return false; }
   //! Check if the pipeline is finished
   bool check_pipeline_finished();

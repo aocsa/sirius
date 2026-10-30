@@ -27,6 +27,7 @@
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_distributed_sort_sample.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
@@ -49,6 +50,7 @@ using namespace sirius::test::exchange_utils;
 using sirius::exchange::exchange_service;
 using sirius::op::exchange_spec;
 using sirius::op::pipelineable_operator_data;
+using sirius::op::sirius_physical_distributed_sort_sample;
 using sirius::op::sirius_physical_sort_sample;
 
 /// Ranks in one process, each with an exchange service over the loopback fabric.
@@ -344,14 +346,15 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
 {
   rank_t const world = 3;
   ranks c(world);
-  std::vector<std::unique_ptr<sirius_physical_sort_sample>> samples;
+  std::vector<std::unique_ptr<sirius_physical_distributed_sort_sample>> samples;
   std::vector<std::shared_ptr<cudf::table const>> boundaries(world);
   for (rank_t r = 0; r < world; ++r) {
-    samples.push_back(make_sample());
-    samples[r]->set_distributed(
-      {c.all[r].service, 21, env().gpu, [&boundaries, r](std::shared_ptr<cudf::table const> b) {
-         boundaries[r] = std::move(b);
-       }});
+    samples.push_back(std::make_unique<sirius_physical_distributed_sort_sample>(
+      *make_sample(),
+      sirius_physical_distributed_sort_sample::distributed_sampling{
+        c.all[r].service, 21, env().gpu, [&boundaries, r](std::shared_ptr<cudf::table const> b) {
+          boundaries[r] = std::move(b);
+        }}));
   }
   // Skewed inputs: rank 0 holds low keys, rank 1 spread ones, rank 2 none at all.
   std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> inputs(world);
@@ -405,11 +408,12 @@ TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted ra
   // As in a plan: SORT_SAMPLE's boundaries go to the EXCHANGE_SINK after it.
   on_every_rank(world, [&](rank_t r) {
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 31, spec);
-    auto sample = make_sample();
-    sample->set_distributed(
-      {c.all[r].service, 32, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
-         sink.set_range_boundaries(std::move(b));
-       }});
+    auto sample = std::make_unique<sirius_physical_distributed_sort_sample>(
+      *make_sample(),
+      sirius_physical_distributed_sort_sample::distributed_sampling{
+        c.all[r].service, 32, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
+          sink.set_range_boundaries(std::move(b));
+        }});
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
