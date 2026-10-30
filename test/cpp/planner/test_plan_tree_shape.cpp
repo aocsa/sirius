@@ -503,6 +503,12 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   auto plan = generate_sirius_plan(*con, "SELECT val FROM big_left WHERE id > 5");
   INFO(tree_to_string(plan.get()));
   CHECK(collect(plan.get(), SiriusPhysicalOperatorType::EXCHANGE_SINK).empty());
+
+  // Nor does running it make a distributed session, which a standalone query would then lock.
+  REQUIRE_FALSE(con->Query("SELECT count(*) FROM big_left WHERE id > 5")->HasError());
+  auto ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(ctx);
+  CHECK(ctx->distributed() == nullptr);
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

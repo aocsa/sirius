@@ -806,10 +806,11 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] std::shared_ptr<sirius::exchange::exchange_service> get_exchange_service(
     sirius::operator_params const& params);
 
-  /// \brief This process's part in distributed execution.
-  [[nodiscard]] sirius::exchange::distributed_session& distributed() noexcept
+  /// \brief This process's part in distributed execution, or null before its first distributed
+  /// query or exchange connect.
+  [[nodiscard]] sirius::exchange::distributed_session* distributed() noexcept
   {
-    return distributed_;
+    return distributed_.load();
   }
 
   /// \brief See exchange::distributed_session::next_query, once per statement: planning the
@@ -1037,8 +1038,14 @@ class SiriusContext : public ClientContextState {
   std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
     semantic_decline_counts_{};
 
-  // Last, so it goes first: its transport uses the memory spaces above.
-  sirius::exchange::distributed_session distributed_;
+  sirius::exchange::distributed_session& ensure_distributed();
+
+  // Last, so it goes first: its transport uses the memory spaces above. Null in a single
+  // process, so a standalone query neither locks nor looks up anything for it; created once, by
+  // the first distributed query or exchange connect.
+  std::mutex distributed_mutex_;
+  std::unique_ptr<sirius::exchange::distributed_session> distributed_owner_;
+  std::atomic<sirius::exchange::distributed_session*> distributed_{nullptr};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

@@ -2633,7 +2633,7 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
     peers.push_back(std::move(peer));
   }
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-    sirius_ctx->distributed().require_peers(peers);
+    if (auto* distributed = sirius_ctx->distributed()) { distributed->require_peers(peers); }
   }
   params->exchange_peers = std::move(peers);
 }
@@ -2643,7 +2643,9 @@ static void SetExchangeRank(ClientContext& context, SetScope scope, Value& param
   auto* params    = get_operator_params(context, scope);
   auto const rank = static_cast<uint32_t>(UBigIntValue::Get(parameter));
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (sirius_ctx) { sirius_ctx->distributed().require_rank(rank); }
+  if (auto* distributed = sirius_ctx ? sirius_ctx->distributed() : nullptr) {
+    distributed->require_rank(rank);
+  }
   params->exchange_rank = rank;
   // Peers set first: connect now, during session setup, rather than inside the first
   // distributed query, which would otherwise wait for every peer's process to reach it.
