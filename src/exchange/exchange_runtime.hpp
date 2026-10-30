@@ -33,10 +33,16 @@ namespace sirius::exchange {
 class exchange_service;
 
 struct nixl_exchange_options {
-  std::size_t frame_bytes            = std::size_t{8} << 20;
-  std::uint32_t send_frames          = 16;
+  std::size_t frame_bytes   = std::size_t{8} << 20;
+  std::uint32_t send_frames = 16;
+  /// The frames a peer may have in flight to this rank; SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER
+  /// overrides it. Over TCP lanes a peer keeps one frame per lane in flight.
   std::uint32_t recv_frames_per_peer = 8;
 };
+
+/// SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER, or @p fallback when unset.
+/// @throws sirius::invalid_input_exception on a value that is not a count from 1 to 256.
+[[nodiscard]] std::uint32_t recv_frames_per_peer_from_env(std::uint32_t fallback);
 
 /**
  * @brief This process's exchange over NIXL: its rings, its fabric, connected to every peer, and

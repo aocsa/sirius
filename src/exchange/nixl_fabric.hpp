@@ -51,22 +51,44 @@ namespace sirius::exchange {
  * is a device-to-host copy into that peer's mirror, followed by a notification naming the bytes;
  * the peer copies them host-to-device into its receive ring and only then hands the write's own
  * notification on. One PCIe crossing each way, no copy through the CPU.
+ *
+ * **TCP lanes.** UCX's TCP transport moves host memory directly but emulates a put of GPU
+ * memory, about a hundred times slower, and one TCP connection is bound by the core that copies
+ * its socket. Writes to a peer on another host (another boot id) therefore go host to host over
+ * lanes: extra NIXL agents, each with its own UCX worker, connection and thread pinned to this
+ * GPU's CPUs, whose metadata travels in notifications of the main agent. Each lane owns pinned
+ * send slots. A write is a device-to-host copy into a free slot, after which the send-ring
+ * bytes are free again; the lane then writes the slot into the peer's receive mirror, and the
+ * peer lands it as a host-staged write.
  */
 class nixl_fabric : public fabric {
  public:
-  enum class host_staging { automatic, always, never };
+  /// never: NIXL to every peer. remote: TCP lanes to every peer, even on this host.
+  enum class host_staging { automatic, always, never, remote };
 
-  /// SIRIUS_EXCHANGE_HOST_STAGING: auto (or unset), always or never.
+  /// How writes reach a peer.
+  enum class path { nixl, shared_memory, tcp_lanes };
+
+  /// SIRIUS_EXCHANGE_HOST_STAGING: auto (or unset), always, never or remote.
   /// @throws sirius::invalid_input_exception on any other value.
   [[nodiscard]] static host_staging staging_from_env();
+
+  /// SIRIUS_EXCHANGE_TCP_LANES, or 0 (unset) for 16 shared by the ranks on this host.
+  /// @throws sirius::invalid_input_exception on a value that is not a count up to 64.
+  [[nodiscard]] static std::uint32_t lanes_from_env();
 
   struct config {
     rank_t rank{0};
     /// "host:port" of every rank's listener, indexed by rank; its size is the world size.
     std::vector<std::string> peers;
     std::chrono::milliseconds connect_timeout{std::chrono::minutes{2}};
-    /// automatic: host-stage writes to peers whose GPU lacks peer access to this one (NVML).
+    /// automatic: TCP lanes to peers on other hosts; on this host, host-stage writes to peers
+    /// whose GPU lacks peer access to this one (NVML). always: host-stage on this host too.
     host_staging staging{host_staging::automatic};
+    /// TCP lanes per rank; 0 shares 16 among the ranks whose listener host is this one's.
+    std::uint32_t lanes{0};
+    /// Pinned send slots of a frame each, per lane.
+    std::uint32_t slots_per_lane{2};
   };
 
   /// @throws sirius::invalid_input_exception on a bad config.
@@ -93,9 +115,14 @@ class nixl_fabric : public fabric {
   void poll(std::vector<fabric_notification>& out) override;
 
   /// Whether writes to @p peer go through its host mirror rather than NIXL.
-  [[nodiscard]] bool host_staged(rank_t peer) const { return _peers.at(peer).staged; }
+  [[nodiscard]] bool host_staged(rank_t peer) const { return _peers.at(peer).route != path::nixl; }
+  [[nodiscard]] path path_to(rank_t peer) const { return _peers.at(peer).route; }
+  /// The TCP lanes to @p peer (0 unless its path is tcp_lanes).
+  [[nodiscard]] std::uint32_t lanes_to(rank_t peer) const { return _peers.at(peer).lanes; }
 
  private:
+  struct lane;
+
   struct peer {
     std::string host;
     int port{0};
@@ -105,10 +132,29 @@ class nixl_fabric : public fabric {
     std::uint32_t device{0};
     std::uint32_t pid{0};
     std::string pci_bus_id;
+    std::string boot_id;
     bool hello{false};
-    /// Writes go through the peer's receive mirror, mapped here at mirror.
-    bool staged{false};
+    path route{path::nixl};
+    /// shared_memory: the peer's receive mirror, mapped here.
     std::byte* mirror{nullptr};
+    /// tcp_lanes: the lanes both ranks have, the peer's lanes whose metadata is loaded, and its
+    /// receive mirror's address in its process.
+    std::uint32_t lanes{0};
+    std::uint32_t lanes_loaded{0};
+    std::uintptr_t mirror_base{0};
+    std::uint32_t next_lane{0};
+  };
+
+  /// A write over TCP lanes: waits for a free send slot, then for its device-to-host copy.
+  struct lane_write {
+    rank_t peer;
+    std::size_t src;
+    std::size_t dst;
+    std::size_t bytes;
+    std::string notification;
+    std::uint32_t lane{0};
+    std::uint32_t slot{0};
+    CUevent_st* copied{nullptr};
   };
 
   /// A host-staged write: its device-to-host copy, then the notification that says it landed.
@@ -129,8 +175,21 @@ class nixl_fabric : public fabric {
   void map_mirror(rank_t r);
   CUevent_st* take_event();
 
+  /// Picks @p r's path once its hello is in; for TCP lanes, sends it every lane's metadata.
+  void choose_path(rank_t r, host_staging staging);
+  /// Creates this rank's lanes (their agents; threads start with start_lanes).
+  void make_lanes();
+  void start_lanes();
+  void stop_lanes() noexcept;
+  /// Starts @p w's device-to-host copy if one of its peer's lanes has a free slot.
+  bool start_lane_write(lane_write& w);
+  /// Throws if a lane failed.
+  void check_lanes() const;
+
   /// Receives notifications into _backlog, taking hellos out.
   void receive();
+  /// Handles one notification from @p from; lane notifications come here too.
+  void take(rank_t from, std::string body);
 
   rank_t _rank;
   frame_ring& _send;
@@ -152,6 +211,14 @@ class nixl_fabric : public fabric {
   std::vector<CUevent_st*> _free_events;
   std::map<std::uint64_t, staged_write> _staged;
   std::vector<landing> _landings;
+
+  host_staging _staging{host_staging::automatic};
+  /// CPUs near this GPU (empty when NVML cannot tell): lane threads and pinned memory use them.
+  std::vector<int> _near_cpus;
+  std::uint32_t _lane_count{0};
+  std::uint32_t _slots_per_lane{2};
+  std::vector<std::unique_ptr<lane>> _lanes;
+  std::map<std::uint64_t, lane_write> _lane_writes;
 };
 
 }  // namespace sirius::exchange

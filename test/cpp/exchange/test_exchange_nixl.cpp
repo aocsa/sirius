@@ -18,6 +18,7 @@
 // scripts/distributed_test_nixl.sh) one rank per process and GPU.
 
 #include "catch.hpp"
+#include "exchange/exchange_runtime.hpp"
 #include "exchange/nixl_fabric.hpp"
 #include "exchange/transport_test_utils.hpp"
 
@@ -106,13 +107,14 @@ int free_port()
 
 /// Two ranks in this process, both on its GPU, connected with @p staging.
 std::pair<std::unique_ptr<nixl_rank>, std::unique_ptr<nixl_rank>> two_ranks(
-  nixl_fabric::host_staging staging)
+  nixl_fabric::host_staging staging, std::uint32_t lanes = 0)
 {
   std::vector<std::string> const peers{"127.0.0.1:" + std::to_string(free_port()),
                                        "127.0.0.1:" + std::to_string(free_port())};
   auto config = [&](rank_t rank) {
     nixl_fabric::config cfg{rank, peers};
     cfg.staging = staging;
+    cfg.lanes   = lanes;
     return cfg;
   };
   // Each constructor waits for the other's hello.
@@ -167,6 +169,23 @@ TEST_CASE("two ranks in one process exchange batches through host staging", "[ex
   check_all(r1->got, 1, 2, {1, 2}, 2, 20'000);
 }
 
+TEST_CASE("two ranks in one process exchange batches over TCP lanes", "[exchange][nixl]")
+{
+  // Frames go device to host into a lane's send slot, host to host over the lane into the
+  // peer's mirror, then host to device: the path to a rank on another host.
+  auto [r0, r1] = two_ranks(nixl_fabric::host_staging::remote, 3);
+  REQUIRE(r0->fab->path_to(1) == nixl_fabric::path::tcp_lanes);
+  REQUIRE(r1->fab->path_to(0) == nixl_fabric::path::tcp_lanes);
+  REQUIRE(r0->fab->lanes_to(1) == 3);
+  r0->start();
+  r1->start();
+
+  send_all(*r0->t, {1, 2}, 2, 20'000);
+  send_all(*r1->t, {1, 2}, 2, 20'000);
+  check_all(r0->got, 0, 2, {1, 2}, 2, 20'000);
+  check_all(r1->got, 1, 2, {1, 2}, 2, 20'000);
+}
+
 TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multiprocess]")
 {
   auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
@@ -181,6 +200,7 @@ TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multipro
   }
   auto const world = static_cast<rank_t>(cfg.peers.size());
   cfg.staging      = nixl_fabric::staging_from_env();
+  cfg.lanes        = nixl_fabric::lanes_from_env();
 
   // 1 MiB frames; batches of about 7 MiB take several.
   nixl_rank r(cfg, KiB * KiB);
@@ -194,7 +214,9 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
 {
   // Every rank sends the same number of large batches to every other rank at once, as a shuffle
   // does, through the transport with the runtime's ring sizes, and reports what it received per
-  // second. SIRIUS_EXCHANGE_HOST_STAGING picks the path.
+  // second. SIRIUS_EXCHANGE_HOST_STAGING picks the path, SIRIUS_EXCHANGE_TCP_LANES and
+  // SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER size it as in the runtime, and
+  // SIRIUS_EXCHANGE_BW_BATCHES (default 96) sets the batches to each peer.
   auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
   auto const* peers = std::getenv("SIRIUS_EXCHANGE_PEERS");
   REQUIRE(rank != nullptr);
@@ -206,9 +228,10 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
     cfg.peers.push_back(peer);
   }
   cfg.staging      = nixl_fabric::staging_from_env();
+  cfg.lanes        = nixl_fabric::lanes_from_env();
   auto const world = static_cast<rank_t>(cfg.peers.size());
   frame_ring send(16, 8 * KiB * KiB);
-  frame_ring recv(8 * (world - 1), 8 * KiB * KiB);
+  frame_ring recv(sirius::exchange::recv_frames_per_peer_from_env(8) * (world - 1), 8 * KiB * KiB);
   nixl_fabric fab(cfg, send, recv);
 
   std::mutex mutex;
@@ -247,8 +270,17 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   for (cudf::size_type c = 0; c < table->num_columns(); ++c) {
     batch_b += table->get_column(c).alloc_size();
   }
-  int const per_peer = 96;
-  auto const start   = std::chrono::steady_clock::now();
+  auto const* batches_env = std::getenv("SIRIUS_EXCHANGE_BW_BATCHES");
+  int const per_peer      = batches_env != nullptr ? std::stoi(batches_env) : 96;
+  // Start the clocks together: a rank that starts first would count its wait for the others.
+  for (rank_t to = 0; to < world; ++to) {
+    t.close(98, to);
+  }
+  {
+    std::unique_lock lock{mutex};
+    REQUIRE(changed.wait_for(lock, std::chrono::minutes{2}, [&] { return ended[98] == world; }));
+  }
+  auto const start = std::chrono::steady_clock::now();
   for (int i = 0; i < per_peer; ++i) {
     for (rank_t to = 0; to < world; ++to) {
       if (to == cfg.rank) { continue; }
@@ -267,18 +299,28 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   }
   auto const seconds =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  double const gb = static_cast<double>(batch_b) * per_peer * (world - 1) / 1e9;
+  double const gb       = static_cast<double>(batch_b) * per_peer * (world - 1) / 1e9;
+  auto const next       = (cfg.rank + 1) % world;
+  auto const route      = fab.path_to(next);
+  std::string const how = route == nixl_fabric::path::nixl ? "NIXL"
+                          : route == nixl_fabric::path::shared_memory
+                            ? "host-staged"
+                            : std::to_string(fab.lanes_to(next)) + " TCP lanes";
   std::printf("BANDWIDTH rank %u: received %.2f GB from %u peers in %.2f s: %.2f GB/s (%s)\n",
               cfg.rank,
               gb,
               world - 1,
               seconds,
               gb / seconds,
-              fab.host_staged((cfg.rank + 1) % world) ? "host-staged" : "NIXL");
+              how.c_str());
   // Every rank must have taken its batches before any tears down its fabric.
   for (rank_t to = 0; to < world; ++to) {
     t.close(99, to);
   }
   std::unique_lock lock{mutex};
   REQUIRE(changed.wait_for(lock, std::chrono::minutes{2}, [&] { return ended[99] == world; }));
+  // The last end this rank sent may still be queued in UCX: tearing down now could drop it and
+  // leave a slower peer waiting.
+  lock.unlock();
+  std::this_thread::sleep_for(std::chrono::seconds{2});
 }

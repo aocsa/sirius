@@ -248,10 +248,19 @@ list is the same on every box; rank i is the i-th address.
   ```
 
   `ucx_info -d` (in `~/tools/ucx-install/bin`) lists the devices, and `ibv_devinfo` the RDMA ports.
-- **Host staging off.** Staging through shared memory only works between processes on one box. Set
-  `SIRIUS_EXCHANGE_HOST_STAGING=never` on every box. The automatic choice looks a peer's GPU up
-  by PCI bus id on the local box, so on a box with several GPUs a remote GPU could be mistaken
-  for a local one without peer access.
+- **TCP lanes.** Ranks tell boxes apart by boot id. Over TCP, UCX moves GPU memory about a hundred
+  times slower than host memory, and one connection is bound by one core. So writes to a rank on
+  another box go device to host into pinned memory, then host to host over *lanes*: extra NIXL
+  agents, each with its own connection and thread on the GPU's CPUs. Ranks on the same box keep
+  NIXL (or shared-memory staging). The rank logs name each peer's path.
+
+  | Variable | Default | Effect |
+  |---|---|---|
+  | `SIRIUS_EXCHANGE_HOST_STAGING` | `auto` | `auto`: lanes to other boxes. `never`: NIXL to every peer, the old slow path. `remote`: lanes to every peer, also on one box (tests) |
+  | `SIRIUS_EXCHANGE_TCP_LANES` | 16 / ranks on this box, at least 2 | Lanes per rank. About 16 per box fill a 200 Gb/s port |
+  | `SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER` | 8 | Frames of 8 MiB a peer may have in flight to a rank. A lane carries one, so raise it to the lane count |
+
+  Every rank must use the same `SIRIUS_EXCHANGE_HOST_STAGING`.
 - **Start together.** A rank waits up to 2 minutes for every peer to connect, then fails.
 
 ### 2. Transport test
@@ -260,12 +269,13 @@ Run the exchange's multiprocess test with one rank per box. On box i (0 or 1):
 
 ```bash
 cd ~/sirius && source scripts/nixl_env.sh
-export SIRIUS_EXCHANGE_HOST_STAGING=never
 SIRIUS_EXCHANGE_RANK=<i> SIRIUS_EXCHANGE_PEERS=10.0.0.1:27000,10.0.0.2:27000 \
   pixi run build/release/test/cpp/sirius_unittest "[nixl_multiprocess]"
 ```
 
-Both should pass. Then run `"[nixl_bandwidth]"` the same way to measure the link.
+Both should pass. Then run `"[nixl_bandwidth]"` the same way to measure the link, with
+`SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER=16`; `SIRIUS_EXCHANGE_HOST_STAGING=never` measures the old
+path.
 
 ### 3. A query across boxes
 
@@ -276,7 +286,6 @@ Save this as `~/run_rank.sh` on every box:
 # run_rank.sh <rank> <peers> <file.sql>: runs the file as one rank, printing its output.
 set -euo pipefail
 cd ~/sirius && source scripts/nixl_env.sh
-export SIRIUS_EXCHANGE_HOST_STAGING=never
 build=sirius-duckdb/build/release
 {
   echo "LOAD '$build/extension/sirius/sirius.duckdb_extension';"
@@ -322,8 +331,7 @@ Then connect a client and run Q12 as on one box. `sirius_gateway_status()` shows
   and its build at the same paths on every box. The rank's init file is copied over SSH, so the
   log directory can stay in `/tmp`.
 - **Environment.** The launcher passes on the gateway's `UCX_*`, `NIXL_*` and `SIRIUS_*` variables
-  and sources `scripts/nixl_env.sh` on the remote box. `sirius_gateway.sh` defaults
-  `SIRIUS_EXCHANGE_HOST_STAGING` to `never` when hosts are set.
+  and sources `scripts/nixl_env.sh` on the remote box.
 - **Quack.** A remote rank serves Quack on its own `127.0.0.1`; the SSH session forwards the
   gateway's `127.0.0.1:<9500 + i>` to it, so there is no TLS certificate to pin. While the rank
   starts, its log shows `channel 2: open failed: connect failed: Connection refused` once per
@@ -342,7 +350,7 @@ Then connect a client and run Q12 as on one box. `sirius_gateway_status()` shows
 | A query fails on every rank with a plan-shape mismatch | The boxes run different builds, or see different files or file sizes |
 | Wrong answer, no error | A rank fell back to the CPU; check that every rank set `enable_duckdb_fallback = false` |
 | Exchange slow between GPUs on one box | `nvidia-smi topo -p2p r` shows `NS`, so it stages through host memory; the rank logs say which path each peer uses |
-| Exchange slow between boxes | UCX chose TCP; check `UCX_TLS` and `UCX_NET_DEVICES` |
-| `shm_open` fails between boxes | Host staging chosen for a remote peer; set `SIRIUS_EXCHANGE_HOST_STAGING=never` |
+| Exchange slow between boxes | The rank logs do not say "TCP lanes" (`SIRIUS_EXCHANGE_HOST_STAGING=never`?), or too few lanes or frames in flight; check `UCX_NET_DEVICES` too |
+| "offers TCP lanes, but this rank reaches it another way" | The ranks set `SIRIUS_EXCHANGE_HOST_STAGING` differently |
 | Gateway: "ranks disagree on query K" | One rank failed where the others succeeded; the gateway restarts and replays before the next statement. The rank logs show why |
 | Gateway: a rank exits at start | Its log, named in the error, under the gateway's log directory |

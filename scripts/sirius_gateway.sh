@@ -5,7 +5,7 @@
 #   pixi run scripts/sirius_gateway.sh <ranks> [client port=9494] [log dir=/tmp/sirius_gateway]
 # SIRIUS_GATEWAY_GPUS (e.g. 0,0) picks each rank's GPU. SIRIUS_GATEWAY_HOSTS (e.g.
 # 10.0.0.1,10.0.0.2) gives each rank's exchange address; ranks on other hosts start over SSH with
-# sirius_gateway_ssh_rank.sh, and SIRIUS_EXCHANGE_HOST_STAGING defaults to never.
+# sirius_gateway_ssh_rank.sh.
 # Clients: ATTACH 'quack:<host>:<port>' AS sirius (TOKEN '<token>'); CONNECT sirius;
 # The token is SIRIUS_GATEWAY_TOKEN, or a random one printed at start. The gateway listens on
 # SIRIUS_GATEWAY_HOST (default 127.0.0.1); on any other host Quack serves TLS with a self-signed
@@ -23,10 +23,6 @@ host=${SIRIUS_GATEWAY_HOST:-127.0.0.1}
 token=${SIRIUS_GATEWAY_TOKEN:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}
 gpus=${SIRIUS_GATEWAY_GPUS:-}
 hosts=${SIRIUS_GATEWAY_HOSTS:-}
-# Shared-memory staging only works between processes on one host.
-if [ -n "$hosts" ]; then
-  export SIRIUS_EXCHANGE_HOST_STAGING=${SIRIUS_EXCHANGE_HOST_STAGING:-never}
-fi
 mkdir -p "$logs"
 
 init="$logs/gateway.init.sql"

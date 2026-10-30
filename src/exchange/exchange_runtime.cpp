@@ -23,9 +23,26 @@
 #include "exchange/nixl_fabric.hpp"
 #endif
 
+#include <charconv>
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 
 namespace sirius::exchange {
+
+std::uint32_t recv_frames_per_peer_from_env(std::uint32_t fallback)
+{
+  char const* value = std::getenv("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER");
+  std::string_view const v{value != nullptr ? value : ""};
+  if (v.empty()) { return fallback; }
+  std::uint32_t frames = 0;
+  auto const [end, ec] = std::from_chars(v.data(), v.data() + v.size(), frames);
+  if (ec != std::errc{} || end != v.data() + v.size() || frames == 0 || frames > 256) {
+    throw sirius::invalid_input_exception(
+      "SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER must be a count from 1 to 256, not '{}'", v);
+  }
+  return frames;
+}
 
 std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
                                                      std::vector<std::string> peers,
@@ -46,12 +63,14 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
       fabric.reset();
     }
   };
-  auto const peer_count = static_cast<std::uint32_t>(peers.size() > 1 ? peers.size() - 1 : 1);
-  auto b                = std::make_shared<bundle>();
-  b->send               = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes);
-  b->recv = std::make_unique<frame_ring>(opts.recv_frames_per_peer * peer_count, opts.frame_bytes);
+  auto const peer_count  = static_cast<std::uint32_t>(peers.size() > 1 ? peers.size() - 1 : 1);
+  auto b                 = std::make_shared<bundle>();
+  b->send                = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes);
+  auto const recv_frames = recv_frames_per_peer_from_env(opts.recv_frames_per_peer);
+  b->recv                = std::make_unique<frame_ring>(recv_frames * peer_count, opts.frame_bytes);
   nixl_fabric::config cfg{rank, std::move(peers)};
   cfg.staging = nixl_fabric::staging_from_env();
+  cfg.lanes   = nixl_fabric::lanes_from_env();
   b->fabric   = std::make_unique<nixl_fabric>(std::move(cfg), *b->send, *b->recv);
   b->service  = std::make_unique<exchange_service>(*b->fabric, *b->send, *b->recv, gpu, host);
   return std::shared_ptr<exchange_service>(b, b->service.get());
