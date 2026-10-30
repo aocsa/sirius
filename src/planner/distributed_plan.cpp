@@ -21,6 +21,7 @@
 #include "exchange/all_gather_filter_merge.hpp"
 #include "exchange/exchange_service.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/scan/parquet_scan_types.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_distributed_sort_sample.hpp"
@@ -47,6 +48,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -500,6 +502,43 @@ std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const>
     if (from < to) { mine.push_back({f, from - offset, to - from}); }
   }
   return mine;
+}
+
+void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
+                          std::vector<std::string> files,
+                          const sirius::operator_params& op_params)
+{
+  auto const world = op_params.exchange_peers.size();
+  auto const rank  = op_params.exchange_rank;
+  if (world <= 1) {
+    info.resolved_file_paths = std::move(files);
+    return;
+  }
+  auto const remote = std::any_of(
+    files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
+  if (remote) {
+    if (files.size() < world) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
+        "Split it into at least {} files, or read it from local files, which split by byte range",
+        files.size(),
+        world,
+        world);
+    }
+    for (std::size_t i = rank; i < files.size(); i += world) {
+      info.resolved_file_paths.push_back(std::move(files[i]));
+    }
+    return;
+  }
+  std::vector<std::uint64_t> bytes;
+  bytes.reserve(files.size());
+  for (auto const& f : files) {
+    bytes.push_back(std::filesystem::file_size(f));
+  }
+  for (auto const& r : sirius::planner::byte_ranges_for_rank(bytes, rank, world)) {
+    info.resolved_file_paths.push_back(std::move(files[r.file]));
+    info.resolved_file_ranges.push_back({{r.start, r.length}});
+  }
 }
 
 }  // namespace sirius::planner
