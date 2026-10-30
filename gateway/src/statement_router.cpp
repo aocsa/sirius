@@ -19,10 +19,11 @@ using namespace duckdb;
 namespace {
 
 /// Set on each rank by the gateway; a client changing one would desynchronize the ranks.
-constexpr std::array<char const*, 4> rank_settings{"sirius_distributed_query_id",
+constexpr std::array<char const*, 5> rank_settings{"sirius_distributed_query_id",
                                                    "sirius_exchange_peers",
                                                    "sirius_exchange_rank",
-                                                   "enable_duckdb_fallback"};
+                                                   "enable_duckdb_fallback",
+                                                   "gpu_execution"};
 
 bool is_gateway_name(std::string const& name)
 {

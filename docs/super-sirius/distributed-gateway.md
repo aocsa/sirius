@@ -196,7 +196,7 @@ statement:
 |---|---|
 | `sirius_gateway_status()`, `sirius_gateway_log()` | Run on the gateway |
 | Other `sirius_gateway_*` or `quack_*` calls, and `SET` of `sirius_gateway_*` settings | Refused: only the gateway's console runs them, so a client cannot stop the ranks or make the gateway call other servers |
-| `SET` of `sirius_distributed_query_id`, `sirius_exchange_peers`, `sirius_exchange_rank`, `enable_duckdb_fallback` | Refused: the gateway sets these on every rank |
+| `SET` of `sirius_distributed_query_id`, `sirius_exchange_peers`, `sirius_exchange_rank`, `enable_duckdb_fallback`, `gpu_execution` | Refused: the gateway sets these on every rank |
 | Everything else: queries, DDL, `SET`, `ATTACH`, `PRAGMA`, and Quack's own catalog reads on `ATTACH` | Rewritten to `FROM sirius_gateway_run('<statement text>')` |
 
 The statement text is the original substring (`stmt_location`), so ranks see what the client
@@ -757,6 +757,9 @@ Checked on the CPU build:
   statement and sends its text (`ClientContext::SubmitStatement`).
 - **Quack's own statements.** On `ATTACH` it reads the catalog (`duckdb_schemas()`,
   `duckdb_tables()`). These are forwarded like any read, so the client sees rank 0's catalog.
+  Sirius cannot plan some of them (the schema read sorts a `VARCHAR[]`), and with fallback off
+  that fails the `ATTACH`, so a statement that reads only `duckdb_*()` or `pragma_*()` table
+  functions runs on every rank with `gpu_execution = false`, which is then set back to `true`.
 - **One bind.** The server runs a client statement once (`quack_server.cpp`, `DriveQuery`).
 - **Ranks.** A CLI started with `-init` and a held-open stdin keeps `quack_serve` running, and
   exits when the pipe closes. `SET` and DDL come back through `CONNECT` as empty `Success` and

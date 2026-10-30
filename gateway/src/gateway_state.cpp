@@ -1,14 +1,22 @@
 #include "gateway_state.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <random>
+#include <set>
 #include <thread>
 
 namespace sirius_gateway {
@@ -57,6 +65,68 @@ bool changes_state(std::string const& sql)
       default: return true;
     }
   });
+}
+
+/// Whether @p sql only reads the catalog: SELECTs whose every table, at any depth, is a
+/// `duckdb_*()` or `pragma_*()` table function or one of the statement's top-level CTEs. Quack
+/// sends such reads on every client's ATTACH.
+bool reads_only_catalog(std::string const& sql)
+{
+  using namespace duckdb;
+  Parser parser{ParserOptions::Builtin()};
+  try {
+    parser.ParseQuery(sql);
+  } catch (std::exception&) {
+    return false;
+  }
+  if (parser.statements.empty()) { return false; }
+  for (auto& stmt : parser.statements) {
+    if (stmt->type != StatementType::SELECT_STATEMENT) { return false; }
+    auto& node = *stmt->Cast<SelectStatement>().node;
+    std::set<std::string> ctes;
+    for (auto const& kv : node.cte_map.map) {
+      ctes.insert(StringUtil::Lower(kv.first.GetIdentifierName()));
+    }
+    bool only = true;
+    std::function<void(TableRef&)> on_ref = [&](TableRef& ref) {
+      switch (ref.type) {
+        case TableReferenceType::BASE_TABLE:
+          only = only && ctes.count(StringUtil::Lower(
+                           ref.Cast<BaseTableRef>().Table().GetIdentifierName())) > 0;
+          break;
+        case TableReferenceType::TABLE_FUNCTION: {
+          auto& f = *ref.Cast<TableFunctionRef>().function;
+          auto const name =
+            f.GetExpressionClass() == ExpressionClass::FUNCTION
+              ? StringUtil::Lower(f.Cast<FunctionExpression>().FunctionName().GetIdentifierName())
+              : std::string{};
+          only = only && (StringUtil::StartsWith(name, "duckdb_") ||
+                          StringUtil::StartsWith(name, "pragma_"));
+          break;
+        }
+        case TableReferenceType::JOIN:
+        case TableReferenceType::SUBQUERY:
+        case TableReferenceType::EMPTY_FROM:
+        case TableReferenceType::EXPRESSION_LIST: break;
+        default: only = false;
+      }
+    };
+    std::function<void(unique_ptr<ParsedExpression>&)> on_expr =
+      [&](unique_ptr<ParsedExpression>& e) {
+        if (e->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+          ParsedExpressionIterator::EnumerateQueryNodeChildren(
+            *e->Cast<SubqueryExpression>().SubqueryMutable()->node, on_expr, on_ref);
+        }
+        ParsedExpressionIterator::EnumerateChildren(*e, on_expr);
+      };
+    try {
+      ParsedExpressionIterator::EnumerateQueryNodeChildren(node, on_expr, on_ref);
+    } catch (std::exception&) {
+      return false;
+    }
+    if (!only) { return false; }
+  }
+  return true;
 }
 
 /// The error to report when every rank failed: the first one not caused by a peer's abort.
@@ -301,6 +371,10 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     query = ++query_id_;
   }
 
+  // Catalog reads run on DuckDB alone: Sirius cannot plan some of them, and with fallback off
+  // that would fail every client's ATTACH. The ranks' catalogs are the same, so rank 0's answer
+  // is still everyone's.
+  bool const on_cpu = !options_.sirius_extension.empty() && reads_only_catalog(sql);
   auto const id_setting =
     setting(context, "sirius_gateway_query_id_setting", "sirius_distributed_query_id");
   std::vector<std::vector<std::string>> statements(ranks_.size());
@@ -308,10 +382,26 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     if (!id_setting.empty()) {
       sql_of_rank.push_back("SET " + id_setting + " = " + std::to_string(query));
     }
+    if (on_cpu) { sql_of_rank.push_back("SET gpu_execution = false"); }
     sql_of_rank.push_back(sql);
   }
   std::string cancelled;
   auto outcomes = fan_out(context, statements, cancelled);
+  if (on_cpu) {
+    std::string ignored;
+    auto const restored = fan_out(
+      context,
+      std::vector<std::vector<std::string>>(ranks_.size(), {"SET gpu_execution = true"}),
+      ignored);
+    for (uint32_t i = 0; i < restored.size(); ++i) {
+      if (!restored[i].error) { continue; }
+      std::lock_guard lock{state_mutex_};
+      if (broken_.empty()) {
+        broken_ = "rank " + std::to_string(i) +
+                  " could not turn gpu_execution back on: " + restored[i].error->RawMessage();
+      }
+    }
+  }
 
   std::vector<std::optional<duckdb::ErrorData>> errors;
   std::string failed_ranks;
