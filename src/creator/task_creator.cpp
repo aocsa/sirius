@@ -37,7 +37,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <limits>
+#include <string_view>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -226,6 +228,12 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   }
   const exec::queue_priority stride = static_cast<exec::queue_priority>(max_branch_len) + 1;
 
+  // Downstream-first reverses the final ranking, so a shared endpoint must then rank after every
+  // branch that feeds it (the max), or it would land behind its own probe-side scan.
+  static const bool downstream_first = [] {
+    auto const* env = std::getenv("SIRIUS_PRIORITY_DOWNSTREAM_FIRST");
+    return env != nullptr && std::string_view{env} == "1";
+  }();
   const std::size_t num_branches = branches.size();
   for (std::size_t b = 0; b < num_branches; ++b) {
     const auto& chain               = branches[b];
@@ -239,7 +247,10 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
                                               : static_cast<exec::queue_priority>(pos);
       const exec::queue_priority priority = base + within;
       auto [it, inserted]                 = priorities.try_emplace(chain[pos], priority);
-      if (!inserted) { it->second = std::min(it->second, priority); }
+      if (!inserted) {
+        it->second =
+          downstream_first ? std::max(it->second, priority) : std::min(it->second, priority);
+      }
     }
   }
 
@@ -261,8 +272,9 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   // range-checking contract that keeps the packed value non-negative.
   const exec::queue_priority query_bits = sirius::query_priority_bits(query.query_id());
   for (auto& [pipeline, priority] : priorities) {
-    const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
-    priority        = query_bits | static_cast<exec::queue_priority>(rank);
+    auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
+    if (downstream_first) { rank = static_cast<decltype(rank)>(sorted.size()) - 1 - rank; }
+    priority = query_bits | static_cast<exec::queue_priority>(rank);
   }
   return priorities;
 }

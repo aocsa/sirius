@@ -182,11 +182,18 @@ class dynamic_filter_publish_plan final {
    * filters cannot all be merged publishes nothing; other filter kinds are not published.
    */
   struct distributed_merge {
+    /// A Bloom crosses in at most this many chunks, each of at least `min_chunk_bytes`, so the
+    /// gathered copies of one chunk are all a merge holds beyond the Bloom itself.
+    static constexpr std::size_t max_chunks      = 64;
+    static constexpr std::size_t min_chunk_bytes = std::size_t{512} << 20;
+
     std::shared_ptr<exchange::exchange_service> service;
-    /// Admitted key i merges on stream first_stream + i, the same on every rank.
+    /// Chunk c of admitted key i merges on stream first_stream + i * max_chunks + c, the same on
+    /// every rank.
     exchange::stream_id first_stream     = 0;
     cucascade::memory::memory_space* gpu = nullptr;
-    /// Every rank's Bloom is sized for this many keys.
+    /// Every rank's Bloom is sized for this many keys, or fewer if the per-GPU cap shared by the
+    /// admitted keys holds fewer.
     std::size_t bloom_keys = 0;
     /// A rank that has not sent its filter by then is given up on: the key publishes nothing.
     std::chrono::milliseconds timeout{std::chrono::minutes{2}};

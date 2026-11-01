@@ -450,17 +450,33 @@ void sirius_dynamic_bloom_filter::merge_from(void const* words,
   if (bytes != storage_bytes() || bytes % sizeof(std::uint32_t) != 0) {
     throw std::invalid_argument("[sirius_dynamic_bloom_filter] merging a filter of another size");
   }
-  auto* into         = static_cast<std::uint32_t*>(const_cast<void*>(storage()));
-  auto const count   = bytes / sizeof(std::uint32_t);
+  merge_from(static_cast<std::uint32_t const*>(words), 0, bytes / sizeof(std::uint32_t), stream);
+}
+
+void sirius_dynamic_bloom_filter::merge_from(std::uint32_t const* words,
+                                             std::size_t first_word,
+                                             std::size_t count,
+                                             ::cuda::stream_ref stream)
+{
+  auto const total = storage_bytes() / sizeof(std::uint32_t);
+  if (first_word > total || count > total - first_word) {
+    throw std::invalid_argument("[sirius_dynamic_bloom_filter] merging words past the filter");
+  }
+  if (count == 0) { return; }
+  auto* into         = static_cast<std::uint32_t*>(const_cast<void*>(storage())) + first_word;
   auto constexpr per = 256;
   auto const blocks  = static_cast<unsigned>((count + per - 1) / per);
-  or_words<<<blocks, per, 0, stream.get()>>>(into, static_cast<std::uint32_t const*>(words), count);
+  or_words<<<blocks, per, 0, stream.get()>>>(into, words, count);
   CUDF_CUDA_TRY(cudaGetLastError());
   // An accumulated filter is already replicated: every other GPU's copy takes the merged bits.
   for (auto const& replica : _impl->accumulated_replicas) {
     if (replica->device_id == _impl->source_device) { continue; }
-    CUDF_CUDA_TRY(cudaMemcpyPeerAsync(
-      replica->bits->data(), replica->device_id, into, _impl->source_device, bytes, stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyPeerAsync(static_cast<std::uint32_t*>(replica->bits->data()) + first_word,
+                                      replica->device_id,
+                                      into,
+                                      _impl->source_device,
+                                      count * sizeof(std::uint32_t),
+                                      stream.get()));
   }
 }
 

@@ -21,6 +21,7 @@
 #include "cudf/concatenate.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/filling.hpp"
+#include "cudf/groupby.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
@@ -49,6 +50,7 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/key_preparation.hpp"
+#include "op/right_join_build_matches.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -851,7 +853,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         duckdb::JoinType join_type,
                                                         HASH_JOIN_MODE join_mode,
                                                         double estimated_probe_to_build_ratio,
-                                                        std::optional<uint64_t> resident_bytes)
+                                                        std::optional<uint64_t> resident_bytes,
+                                                        bool right_may_stream)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
   int const num_gpus = std::max(1, static_cast<int>(active_gpu_ids.size()));
@@ -876,14 +879,18 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                join_type == duckdb::JoinType::RIGHT_ANTI;
   bool const is_mixed      = join_mode == HASH_JOIN_MODE::MIXED_JOIN;
   bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
+  // A build-driven RIGHT join streams its probe and emits unmatched build rows once per partition,
+  // so its build must not be replicated.
+  bool const streams_right = right_may_stream && join_type == duckdb::JoinType::RIGHT;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
   // Broadcast candidacy. A build is a candidate when it is below the small-table threshold, OR
   // below max_broadcast_join_size while the probe side is large relative to the build (replicating
   // the build avoids shuffling a much larger probe across GPUs).
   bool const broadcast_candidate =
-    total_bytes < small || (total_bytes < max_broadcast_join_size &&
-                            estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
+    !streams_right &&
+    (total_bytes < small || (total_bytes < max_broadcast_join_size &&
+                             estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
 
   // Admission sizes one folded build per GPU. Broadcast charges the whole build; otherwise use
   // rounded-up averages. Hash skew and cuco capacity rounding can exceed these estimates.
@@ -903,7 +910,7 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
     total_rows && *total_rows <= static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
   bool build_probe = fold_rows_fit && per_gpu_table_bytes_est < max_build_hash_table_bytes &&
                      per_gpu_build_bytes < max_build_probe_resident_bytes && build_foldable &&
-                     !is_right_family && !is_mixed && !is_full_outer;
+                     (streams_right || !is_right_family) && !is_mixed && !is_full_outer;
 
   bool const broadcast = broadcast_candidate && build_probe;
 
@@ -914,7 +921,16 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
     return partition_strategy{
       static_cast<int>(placement.num_partitions()), broadcast, build_probe, std::move(placement)};
   }
-  int const num_partitions = build_probe ? build_probe_partitions : natural;
+  int num_partitions = build_probe ? build_probe_partitions : natural;
+  if (streams_right && !build_probe) {
+    // A STANDARD RIGHT join folds each probe partition whole, so size it for the planned probe.
+    double const probe_bytes =
+      std::min(static_cast<double>(total_bytes) * std::max(estimated_probe_to_build_ratio, 1.0),
+               static_cast<double>(std::numeric_limits<uint64_t>::max() / 2));
+    num_partitions = std::max(
+      num_partitions,
+      natural_num_partitions(static_cast<uint64_t>(probe_bytes), hash_partition_bytes, num_gpus));
+  }
   // A lone BUILD_PROBE partition picks its GPU by rotation so several small joins in one query
   // spread across GPUs instead of all landing on the first. STANDARD builds its hash table
   // within each task, so a lone partition can follow input locality.
@@ -971,7 +987,8 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              join_type,
                                                              _join_mode,
                                                              estimated_probe_to_build_ratio,
-                                                             in.resident_bytes);
+                                                             in.resident_bytes,
+                                                             _right_may_stream);
 
   // A hash-partitioned MARK build: marks use the join-wide build observation.
   if (join_type == duckdb::JoinType::MARK && in.is_build_side) {
@@ -1047,6 +1064,21 @@ void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
   _build_arrives_whole = arrives_whole;
 }
 
+void sirius_physical_hash_join::enable_build_counts(
+  build_count_spec spec, duckdb::vector<sirius::logical_type> output_types)
+{
+  if (join_type != duckdb::JoinType::RIGHT || is_mixed_join() ||
+      output_types.size() != 2 || spec.build_key < 0 ||
+      static_cast<std::size_t>(spec.build_key) >= children[1]->get_types().size()) {
+    throw std::logic_error("only a streamable equi RIGHT hash join can count its build matches");
+  }
+  lhs_output_columns = {};
+  rhs_output_columns = {{spec.build_key}, {children[1]->get_types()[spec.build_key]}};
+  types              = std::move(output_types);
+  set_physical_types({});
+  _build_counts = spec;
+}
+
 bool sirius_physical_hash_join::build_probe_can_chunk() const noexcept
 {
   return join_type == duckdb::JoinType::MARK || join_type == duckdb::JoinType::SEMI ||
@@ -1118,6 +1150,43 @@ void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool 
   }
 }
 
+std::optional<std::size_t> sirius_physical_hash_join::next_unmatched_partition(bool probe_finished)
+{
+  if (!probe_finished) { return std::nullopt; }
+  auto* build_port = get_port("build");
+  auto* probe_port = get_port("default");
+  for (std::size_t p = 0; p < _partition_build_states.size(); ++p) {
+    auto const& slot = _partition_build_states[p];
+    if (slot.unmatched_issued.load(std::memory_order_acquire) || probe_port->repo->size(p) > 0) {
+      continue;
+    }
+    auto const state = slot.build_state.load(std::memory_order_acquire);
+    if ((state == BUILD_HASH_TABLE_STATE::BUILT &&
+         slot.probes_in_flight.load(std::memory_order_acquire) == 0) ||
+        (state == BUILD_HASH_TABLE_STATE::NOT_BUILT && build_port->repo->size(p) > 0)) {
+      return p;
+    }
+  }
+  return std::nullopt;
+}
+
+bool sirius_physical_hash_join::unmatched_rows_pending() const
+{
+  return std::any_of(
+    _partition_build_states.begin(), _partition_build_states.end(), [](auto const& slot) {
+      auto const state = slot.build_state.load(std::memory_order_acquire);
+      return state == BUILD_HASH_TABLE_STATE::BUILT || state == BUILD_HASH_TABLE_STATE::SCHEDULED ||
+             state == BUILD_HASH_TABLE_STATE::SCHEDULING;
+    });
+}
+
+bool sirius_physical_hash_join::all_ports_empty()
+{
+  if (!sirius_physical_operator::all_ports_empty()) { return false; }
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  return !(streams_right_join() && unmatched_rows_pending());
+}
+
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
@@ -1164,8 +1233,19 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
 
     bool const probe_finished =
       probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
-    reclaim_build_only_slots_if_probe_complete(probe_finished);
+    if (streams_right_join()) {
+      if (next_unmatched_partition(probe_finished)) {
+        return task_creation_hint{TaskCreationHint::READY, this};
+      }
+    } else {
+      reclaim_build_only_slots_if_probe_complete(probe_finished);
+    }
     auto const decision = select_build_probe_action(snapshot_build_probe_slots(), probe_finished);
+    if (decision.action == build_probe_action::none && streams_right_join() &&
+        unmatched_rows_pending()) {
+      auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
     switch (decision.action) {
       case build_probe_action::schedule_build:
         // Claim this partition's slot so exactly one build task is issued for it. The paired
@@ -1231,6 +1311,51 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   // p's device from the placement, so it lands on the GPU holding p's hash table.
   auto const placement = this->placement();
 
+  if (streams_right_join()) {
+    bool const probe_finished =
+      probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+    if (auto const p = next_unmatched_partition(probe_finished)) {
+      auto& slot    = _partition_build_states[*p];
+      bool unissued = false;
+      if (!slot.unmatched_issued.compare_exchange_strong(unissued, true)) { return nullptr; }
+      std::shared_ptr<cucascade::data_batch> build;
+      if (slot.build_state.load(std::memory_order_acquire) == BUILD_HASH_TABLE_STATE::NOT_BUILT) {
+        // Never probed: every build row is unmatched.
+        build = build_port->repo->pop_next_data_batch(*p);
+        slot.build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED, std::memory_order_release);
+      } else {
+        build = std::move(slot.build_batch);
+      }
+      if (!build) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no build batch "
+          "to emit the unmatched rows of partition " +
+          std::to_string(*p) + " in operator " + std::to_string(this->get_operator_id()));
+      }
+      cucascade::memory::memory_space* ms = nullptr;
+      {
+        auto build_ro = build->to_read_only();
+        ms            = build_ro.get_memory_space();
+      }
+      if (!ms) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: build batch has "
+          "no memory space in operator " +
+          std::to_string(this->get_operator_id()));
+      }
+      rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
+      auto const& probe_child = *children[0];
+      auto empty_probe        = probe_child.has_physical_overrides()
+                                  ? sirius::make_empty_table(probe_child.get_physical_types())
+                                  : sirius::make_empty_table(probe_child.get_types());
+      std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+      input_batch.push_back(
+        make_data_batch(std::move(empty_probe), *ms, cudf::get_default_stream(), batch_telemetry()));
+      input_batch.push_back(std::move(build));
+      return std::make_unique<partitioned_operator_data>(std::move(input_batch), *p, *placement);
+    }
+  }
+
   // Prefer a partition awaiting its build (SCHEDULING, claimed by get_next_task_hint): issue a task
   // carrying that partition's single folded build batch plus its first probe batch. Concurrent
   // input-data calls each claim a distinct SCHEDULING slot because we advance it to SCHEDULED here
@@ -1255,6 +1380,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     for (std::size_t i = 0; i < num_build_batches; ++i) {
       input_batch.push_back(build_port->repo->pop_next_data_batch(p));
     }
+    if (streams_right_join()) {
+      _partition_build_states[p].build_batch = input_batch.back();
+      _partition_build_states[p].probes_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    }
     // Count in execute() with a blocking accessor because this batch is not observed after pop.
     _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED,
                                                  std::memory_order_release);
@@ -1274,6 +1403,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     auto batch = probe_port->repo->pop_next_data_batch(p);
     if (batch) {
       input_batch.push_back(std::move(batch));
+      if (streams_right_join()) {
+        _partition_build_states[p].probes_in_flight.fetch_add(1, std::memory_order_acq_rel);
+      }
     } else {
       SIRIUS_LOG_WARN(
         "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected to pop a "
@@ -2072,6 +2204,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   cudf::table_view left_full, right_full;
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
+  per_partition_build_state* streamed_right_probe = nullptr;
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // Each partition owns one hash table. The incoming batch carries its partition index
@@ -2100,6 +2233,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::to_string(this->get_operator_id()));
     }
     auto& slot = _partition_build_states[partition];
+
+    if (streams_right_join() && slot.unmatched_issued.load(std::memory_order_acquire)) {
+      return emit_unmatched_build_rows(slot, input_batches, stream);
+    }
 
     // BUILD_PROBE sees each popped probe once, so count it through this blocking accessor. Dedup
     // handles OOM rescheduling. Take only _probe_bytes_mutex to avoid inverting the batch-lock /
@@ -2184,6 +2321,22 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                         partition,
                         slot.chunks.size());
       }
+      if (streams_right_join()) {
+        auto const build_rows =
+          static_cast<std::size_t>(get_cudf_table_view(input_batches[1]).num_rows());
+        if (_build_counts) {
+          slot.build_match_counts =
+            std::make_unique<rmm::device_uvector<std::int64_t>>(build_rows, stream);
+          CUDF_CUDA_TRY(cudaMemsetAsync(slot.build_match_counts->data(),
+                                        0,
+                                        build_rows * sizeof(std::int64_t),
+                                        stream.get()));
+        } else {
+          slot.build_matched =
+            std::make_unique<rmm::device_uvector<std::uint8_t>>(build_rows, stream);
+          CUDF_CUDA_TRY(cudaMemsetAsync(slot.build_matched->data(), 0, build_rows, stream.get()));
+        }
+      }
       stream.sync();  // Ensure the hash tables are fully built before we allow any probe
                       // batches to proceed.
       slot.build_state.store(BUILD_HASH_TABLE_STATE::BUILT, std::memory_order_release);
@@ -2266,6 +2419,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
             auto result   = chunk.hash_table->full_join(probe_keys, {}, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
+          } else if (streams_right_join() && (slot.build_matched || slot.build_match_counts)) {
+            // Matched pairs now; the partition's final task emits the build rows none matched.
+            auto result   = chunk.hash_table->inner_join(probe_keys, {}, stream);
+            left_indices  = std::move(result.first);
+            right_indices = std::move(result.second);
+            if (slot.build_match_counts) {
+              count_probe_matches(*slot.build_match_counts, left_full, *left_indices, *right_indices, stream);
+            } else {
+              mark_build_matches(*slot.build_matched, *right_indices, stream);
+            }
+            streamed_right_probe = &slot;
           } else {
             throw std::runtime_error("Unsupported join type in BUILD_PROBE mode: " +
                                      duckdb::JoinTypeToString(join_type));
@@ -2440,6 +2604,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       auto join_result = cudf::left_join(right_keys, left_keys, compare_nulls(), stream);
       right_indices    = std::move(join_result.first);
       left_indices     = std::move(join_result.second);
+      if (_build_counts) {
+        // This task holds the whole probe of its build rows, so their counts are final.
+        rmm::device_uvector<std::int64_t> counts(static_cast<std::size_t>(right_full.num_rows()),
+                                                 stream);
+        CUDF_CUDA_TRY(
+          cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(std::int64_t), stream.get()));
+        count_probe_matches(counts, left_full, *left_indices, *right_indices, stream);
+        auto out = build_count_table(std::move(counts), right_full, stream);
+        return std::make_unique<pipelineable_operator_data>(
+          std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
+            std::move(out), *input_batches[0].get_memory_space(), stream, batch_telemetry())});
+      }
     } else if (join_type == duckdb::JoinType::SEMI) {
       auto filtered_join_object = make_right_filtered_join(right_keys, compare_nulls(), stream);
       left_indices              = filtered_join_object.semi_join(left_keys, stream);
@@ -2531,6 +2707,47 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                         batch_telemetry());
   }
 
+  if (streamed_right_probe != nullptr) {
+    auto& slot = *streamed_right_probe;
+    std::unique_ptr<cudf::table> out;
+    if (!_build_counts) {
+      out = gather_join_table(join_type,
+                              left_full,
+                              right_full,
+                              lhs_output_columns.col_idxs,
+                              rhs_output_columns.col_idxs,
+                              std::move(left_indices),
+                              std::move(right_indices),
+                              stream);
+    }
+    // Unmatched rows may be read only once this probe's marks have landed.
+    stream.sync();
+    bool const last_probe = slot.probes_in_flight.fetch_sub(1, std::memory_order_acq_rel) == 1;
+    // Task completion schedules only downstream operators, so when the probe side has already
+    // finished, the last probe of a partition emits its unmatched rows itself.
+    auto* probe_port  = get_port("default");
+    bool unissued     = false;
+    auto const parted = dynamic_cast<const partitioned_operator_data*>(&input_data);
+    if (last_probe && probe_port->src_pipeline &&
+        probe_port->src_pipeline->is_pipeline_finished() &&
+        probe_port->repo->size(parted->get_partition_idx().value()) == 0 &&
+        slot.unmatched_issued.compare_exchange_strong(unissued, true)) {
+      auto unmatched = unmatched_build_table(slot, left_full, right_full, stream);
+      out            = out ? cudf::concatenate(
+                    std::vector<cudf::table_view>{out->view(), unmatched->view()}, stream)
+                           : std::move(unmatched);
+      stream.sync();
+      release_streamed_slot(slot);
+    }
+    if (!out) {
+      out = build_count_table(
+        rmm::device_uvector<std::int64_t>(0, stream), cudf::slice(right_full, {0, 0})[0], stream);
+    }
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
+        std::move(out), *input_batches[0].get_memory_space(), stream, batch_telemetry())});
+  }
+
   return gather_join_output(join_type,
                             left_full,
                             right_full,
@@ -2541,6 +2758,106 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             *input_batches[0].get_memory_space(),
                             stream,
                             batch_telemetry());
+}
+
+void sirius_physical_hash_join::count_probe_matches(
+  rmm::device_uvector<std::int64_t>& counts,
+  cudf::table_view const& probe_view,
+  rmm::device_uvector<cudf::size_type> const& probe_rows,
+  rmm::device_uvector<cudf::size_type> const& build_rows,
+  ::cuda::stream_ref stream) const
+{
+  cudf::bitmask_type const* mask = nullptr;
+  cudf::size_type offset         = 0;
+  if (auto const value = _build_counts->probe_value) {
+    auto const column = probe_view.column(*value);
+    if (column.nullable()) {
+      mask   = column.null_mask();
+      offset = column.offset();
+    }
+  }
+  count_build_matches(counts, probe_rows, build_rows, mask, offset, stream);
+}
+
+std::unique_ptr<cudf::table> sirius_physical_hash_join::build_count_table(
+  rmm::device_uvector<std::int64_t>&& counts,
+  cudf::table_view const& build_view,
+  ::cuda::stream_ref stream) const
+{
+  fill_unmatched_counts(counts, _build_counts->unmatched_fill, stream);
+  auto const rows = static_cast<cudf::size_type>(counts.size());
+  auto values     = std::make_unique<cudf::column>(
+    cudf::data_type{cudf::type_id::INT64}, rows, counts.release(), rmm::device_buffer{}, 0);
+  // Equal build keys, NULLs among them, make one group: P build rows each carry the key's count.
+  cudf::groupby::groupby grouped(cudf::table_view({build_view.column(_build_counts->build_key)}),
+                                 cudf::null_policy::INCLUDE);
+  std::vector<cudf::groupby::aggregation_request> requests(1);
+  requests[0].values = values->view();
+  requests[0].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  auto [keys, results] = grouped.aggregate(requests, stream);
+  auto columns         = keys->release();
+  columns.push_back(std::move(results[0].results[0]));
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+std::unique_ptr<cudf::table> sirius_physical_hash_join::unmatched_build_table(
+  per_partition_build_state& slot,
+  cudf::table_view const& probe_view,
+  cudf::table_view const& build_view,
+  ::cuda::stream_ref stream)
+{
+  if (_build_counts) {
+    auto const rows = static_cast<std::size_t>(build_view.num_rows());
+    if (!slot.build_match_counts) {
+      slot.build_match_counts = std::make_unique<rmm::device_uvector<std::int64_t>>(rows, stream);
+      CUDF_CUDA_TRY(cudaMemsetAsync(
+        slot.build_match_counts->data(), 0, rows * sizeof(std::int64_t), stream.get()));
+    }
+    auto counts = std::move(*slot.build_match_counts);
+    slot.build_match_counts.reset();
+    return build_count_table(std::move(counts), build_view, stream);
+  }
+  auto build_rows = unmatched_build_rows(slot.build_matched.get(), build_view.num_rows(), stream);
+  auto probe_rows = no_match_rows(build_rows->size(), stream);
+  return gather_join_table(duckdb::JoinType::RIGHT,
+                           probe_view,
+                           build_view,
+                           lhs_output_columns.col_idxs,
+                           rhs_output_columns.col_idxs,
+                           std::move(probe_rows),
+                           std::move(build_rows),
+                           stream);
+}
+
+void sirius_physical_hash_join::release_streamed_slot(per_partition_build_state& slot)
+{
+  slot.chunks.clear();
+  slot.build_matched.reset();
+  slot.build_match_counts.reset();
+  slot.build_batch.reset();
+  slot.build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED, std::memory_order_release);
+}
+
+std::unique_ptr<operator_data> sirius_physical_hash_join::emit_unmatched_build_rows(
+  per_partition_build_state& slot,
+  std::vector<::cucascade::read_only_data_batch> const& input_batches,
+  ::cuda::stream_ref stream)
+{
+  if (input_batches.size() != 2) {
+    throw std::runtime_error(
+      "In sirius_physical_hash_join::emit_unmatched_build_rows: expected an empty probe and the "
+      "build batch, got " +
+      std::to_string(input_batches.size()) + " batches in operator " +
+      std::to_string(this->get_operator_id()));
+  }
+  auto unmatched = unmatched_build_table(
+    slot, get_cudf_table_view(input_batches[0]), get_cudf_table_view(input_batches[1]), stream);
+  auto output = std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
+      std::move(unmatched), *input_batches[1].get_memory_space(), stream, batch_telemetry())});
+  stream.sync();
+  release_streamed_slot(slot);
+  return output;
 }
 
 void sirius_physical_hash_join::push_data_batch_partitioned(
@@ -2594,6 +2911,9 @@ void sirius_physical_hash_join::on_finalize_operator()
       std::optional<rmm::cuda_set_device_raii> device_guard;
       if (slot.device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{slot.device_id}); }
       slot.chunks.clear();
+      slot.build_matched.reset();
+      slot.build_match_counts.reset();
+      slot.build_batch.reset();
       slot.build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED, std::memory_order_release);
     }
   }

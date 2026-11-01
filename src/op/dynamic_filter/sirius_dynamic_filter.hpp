@@ -515,6 +515,17 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    */
   void merge_from(void const* words, std::size_t bytes, ::cuda::stream_ref stream);
 
+  /**
+   * @brief ORs @p count words of another filter of this size and domain, its words from
+   * @p first_word on, into the same words of this one; merge_from() a piece at a time.
+   *
+   * @throw std::invalid_argument when the words run past this filter's storage
+   */
+  void merge_from(std::uint32_t const* words,
+                  std::size_t first_word,
+                  std::size_t count,
+                  ::cuda::stream_ref stream);
+
  private:
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
     cudf::column_view const& probe,

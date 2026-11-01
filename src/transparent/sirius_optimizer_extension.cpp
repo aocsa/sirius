@@ -20,6 +20,7 @@
 #include "planner/connector_registry.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/narrow_outer_join_counts.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -153,7 +154,9 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    auto copy = copy_logical_plan(*captured, context);
+    narrow_outer_join_counts(*copy, input.optimizer.binder);
+    conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
     // indistinguishable from "GPU ran and was slow": the query still returns correct

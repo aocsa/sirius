@@ -283,6 +283,10 @@ struct operator_params {
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
+  /// Size RIGHT hash joins from their build side so a build that fits runs BUILD_PROBE, streaming
+  /// the probe instead of folding each probe partition whole.
+  bool stream_right_joins = true;
+
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;

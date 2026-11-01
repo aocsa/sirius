@@ -91,4 +91,5 @@ target_sources(
           sirius_physical_union.cpp
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
+          right_join_build_matches.cu
           scan/equality_delete_mask.cu)

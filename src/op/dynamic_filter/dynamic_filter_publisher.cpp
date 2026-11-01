@@ -221,6 +221,19 @@ std::size_t bloom_keys_within_cap(std::uint64_t cap, std::size_t key_count) noex
   return blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
 }
 
+/**
+ * @brief Distributed: the keys every rank's Bloom is sized for, the plan's estimate cut to the
+ * per-GPU cap shared by the admitted keys. A whole build and an accumulated one size alike, or
+ * the ranks' filters would not merge.
+ */
+std::size_t distributed_bloom_keys(dynamic_filter_publish_plan const& plan) noexcept
+{
+  return std::max<std::size_t>(
+    1,
+    std::min(plan.distributed()->bloom_keys,
+             bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), plan.admitted_keys().size())));
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -681,9 +694,9 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     auto const* distributed = plan.distributed();
     auto const wanted       = distributed ? distributed->bloom_keys : rows;
     auto const sized_for =
-      std::min(wanted,
-               bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(),
-                                     distributed ? plan.admitted_keys().size() : keys.size()));
+      distributed
+        ? distributed_bloom_keys(plan)
+        : std::min(wanted, bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), keys.size()));
     auto const geometry = detail::accumulated_bloom_geometry::try_create(
       sized_for, keys.size(), plan.max_bloom_bytes_per_gpu());
     if (!geometry) {
@@ -1038,74 +1051,100 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
                         std::vector<key_filters>& per_key,
                         ::cuda::stream_ref stream)
 {
-  // A rank's contribution: rep | family | scale | storage bytes | the Bloom's words, as UINT32.
-  constexpr std::size_t header = 4;
+  // The first chunk leads with rep | family | scale | the Bloom's words (low, high), as UINT32.
+  // Every rank sees every header, so every rank decides alike whether the remaining chunks follow;
+  // a rank without a Bloom takes part in the first chunk only.
+  using merge                  = dynamic_filter_publish_plan::distributed_merge;
+  constexpr std::size_t header = 5;
   auto const mr                = d.gpu->get_default_allocator();
   for (std::size_t k = 0; k < per_key.size(); ++k) {
     auto& membership = per_key[k].membership;
     auto* bloom      = dynamic_cast<sirius_dynamic_bloom_filter*>(membership.get());
+    auto const words = bloom ? bloom->storage_bytes() / sizeof(std::uint32_t) : std::size_t{0};
+    auto const chunk_words = std::max(merge::min_chunk_bytes / sizeof(std::uint32_t),
+                                      (words + merge::max_chunks - 1) / merge::max_chunks);
+    auto const chunks      = std::max<std::size_t>(1, (words + chunk_words - 1) / chunk_words);
     std::array<std::uint32_t, header> head{};
-    std::shared_ptr<cucascade::data_batch> mine;
     if (bloom) {
-      auto const bytes = bloom->storage_bytes();
-      head             = {static_cast<std::uint32_t>(bloom->domain().rep),
-                          static_cast<std::uint32_t>(bloom->domain().family),
-                          static_cast<std::uint32_t>(bloom->domain().scale),
-                          static_cast<std::uint32_t>(bytes)};
-      auto column      = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT32},
-                                              static_cast<cudf::size_type>(header + bytes / 4),
-                                              cudf::mask_state::UNALLOCATED,
-                                              stream,
-                                              mr);
-      auto* words      = column->mutable_view().data<std::uint32_t>();
-      RMM_CUDA_TRY(
-        cudaMemcpyAsync(words, head.data(), sizeof(head), cudaMemcpyHostToDevice, stream.get()));
-      RMM_CUDA_TRY(cudaMemcpyAsync(
-        words + header, bloom->storage(), bytes, cudaMemcpyDeviceToDevice, stream.get()));
-      std::vector<std::unique_ptr<cudf::column>> columns;
-      columns.push_back(std::move(column));
-      mine = sirius::make_data_batch(
-        std::make_unique<cudf::table>(std::move(columns)), *d.gpu, stream, {});
+      head = {static_cast<std::uint32_t>(bloom->domain().rep),
+              static_cast<std::uint32_t>(bloom->domain().family),
+              static_cast<std::uint32_t>(bloom->domain().scale),
+              static_cast<std::uint32_t>(words),
+              static_cast<std::uint32_t>(words >> 32)};
     }
-    std::vector<std::shared_ptr<cucascade::data_batch>> all;
-    try {
-      all = exchange::all_gather(
-        *d.service, d.first_stream + k, std::move(mine), *d.gpu, stream.get(), d.timeout);
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[publish_dynamic_filters] key {}: filters not merged across ranks: {}", k, e.what());
-      membership.reset();
-      continue;
-    }
-    if (!bloom) { continue; }
     std::vector<std::uint32_t const*> others;
-    bool mergeable = true;
-    for (exchange::rank_t r = 0; r < all.size() && mergeable; ++r) {
-      if (!all[r]) {
-        mergeable = false;
+    for (std::size_t chunk = 0; chunk < chunks; ++chunk) {
+      auto const lead  = chunk == 0 ? header : std::size_t{0};
+      auto const first = chunk * chunk_words;
+      auto const count = std::min(chunk_words, words - std::min(words, first));
+      std::shared_ptr<cucascade::data_batch> mine;
+      if (bloom) {
+        auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT32},
+                                                static_cast<cudf::size_type>(lead + count),
+                                                cudf::mask_state::UNALLOCATED,
+                                                stream,
+                                                mr);
+        auto* out   = column->mutable_view().data<std::uint32_t>();
+        if (lead != 0) {
+          RMM_CUDA_TRY(
+            cudaMemcpyAsync(out, head.data(), sizeof(head), cudaMemcpyHostToDevice, stream.get()));
+        }
+        RMM_CUDA_TRY(cudaMemcpyAsync(out + lead,
+                                     static_cast<std::uint32_t const*>(bloom->storage()) + first,
+                                     count * sizeof(std::uint32_t),
+                                     cudaMemcpyDeviceToDevice,
+                                     stream.get()));
+        std::vector<std::unique_ptr<cudf::column>> columns;
+        columns.push_back(std::move(column));
+        mine = sirius::make_data_batch(
+          std::make_unique<cudf::table>(std::move(columns)), *d.gpu, stream, {});
+      }
+      std::vector<std::shared_ptr<cucascade::data_batch>> all;
+      try {
+        all = exchange::all_gather(*d.service,
+                                   d.first_stream + k * merge::max_chunks + chunk,
+                                   std::move(mine),
+                                   *d.gpu,
+                                   stream.get(),
+                                   d.timeout);
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_WARN(
+          "[publish_dynamic_filters] key {}: filters not merged across ranks: {}", k, e.what());
+        membership.reset();
         break;
       }
-      auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
-      std::array<std::uint32_t, header> their_head{};
-      RMM_CUDA_TRY(cudaMemcpyAsync(
-        their_head.data(), theirs, sizeof(their_head), cudaMemcpyDeviceToHost, stream.get()));
+      if (!bloom) { break; }
+      others.clear();
+      bool mergeable = true;
+      for (exchange::rank_t r = 0; r < all.size() && mergeable; ++r) {
+        if (!all[r]) {
+          mergeable = false;
+          break;
+        }
+        auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
+        if (lead != 0) {
+          std::array<std::uint32_t, header> their_head{};
+          RMM_CUDA_TRY(cudaMemcpyAsync(
+            their_head.data(), theirs, sizeof(their_head), cudaMemcpyDeviceToHost, stream.get()));
+          stream.sync();
+          mergeable = their_head == head;
+        }
+        if (r != d.service->rank()) { others.push_back(theirs + lead); }
+      }
+      if (!mergeable) {
+        SIRIUS_LOG_DEBUG(
+          "[publish_dynamic_filters] key {}: a rank sent no filter or another kind; "
+          "nothing published for it.",
+          k);
+        membership.reset();
+        break;
+      }
+      for (auto const* theirs : others) {
+        bloom->merge_from(theirs, first, count, stream);
+      }
+      // The gathered chunks are freed with `all`, after the merges have read them.
       stream.sync();
-      mergeable = their_head == head;
-      if (r != d.service->rank()) { others.push_back(theirs + header); }
     }
-    if (!mergeable) {
-      SIRIUS_LOG_DEBUG(
-        "[publish_dynamic_filters] key {}: a rank sent no filter or another kind; "
-        "nothing published for it.",
-        k);
-      membership.reset();
-      continue;
-    }
-    for (auto const* words : others) {
-      bloom->merge_from(words, bloom->storage_bytes(), stream);
-    }
-    // The gathered filters are freed with `all`, after the merges have read them.
-    stream.sync();
   }
 }
 
@@ -1361,7 +1400,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
           nvtx_scoped_range vr{"dynfilter::build_bloom"};
           filters.membership = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
             col,
-            plan.distributed() ? plan.distributed()->bloom_keys : std::size_t{0},
+            plan.distributed() ? distributed_bloom_keys(plan) : std::size_t{0},
             stream,
             allocator_ref);
           choice = "bloom";

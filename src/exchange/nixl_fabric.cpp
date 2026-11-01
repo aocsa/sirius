@@ -32,15 +32,19 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <charconv>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string_view>
@@ -179,9 +183,43 @@ std::mutex& creating_backends()
   return m;
 }
 
+/// UCX hooks every cuMemFreeAsync to invalidate its registration cache through an interval tree
+/// under a spinlock, so freeing many small GPU batches grows quadratically slow. The rings stay
+/// registered for the agent's life and NIXL names every memory type, so neither the hooks nor the
+/// memory-type cache built on them are needed. Must run before UCX loads; explicit settings win.
+void disable_ucx_cuda_hooks()
+{
+  ::setenv("UCX_MEM_CUDA_HOOK_MODE", "none", /*overwrite=*/0);
+  ::setenv("UCX_MEMTYPE_CACHE", "n", /*overwrite=*/0);
+}
+
 std::string mirror_name(std::uint32_t pid, rank_t rank)
 {
   return "/sirius-exchange-" + std::to_string(pid) + "-" + std::to_string(rank);
+}
+
+/// Unlinks this user's receive mirrors whose process is gone. Only the destructor unlinks a
+/// mirror, so every killed rank leaves its whole receive ring in /dev/shm, where it holds host
+/// memory until reboot.
+void unlink_dead_mirrors()
+{
+  std::string_view constexpr prefix = "sirius-exchange-";
+  std::error_code ec;
+  for (auto const& entry : std::filesystem::directory_iterator("/dev/shm", ec)) {
+    auto const file = entry.path().filename().string();
+    if (!file.starts_with(prefix)) { continue; }
+    std::uint32_t pid     = 0;
+    auto const* first     = file.data() + prefix.size();
+    auto const [end, err] = std::from_chars(first, file.data() + file.size(), pid);
+    struct stat st{};
+    if (err != std::errc{} || end == first || *end != '-' ||
+        ::stat(entry.path().c_str(), &st) != 0 || st.st_uid != ::getuid()) {
+      continue;
+    }
+    if (::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) {
+      ::shm_unlink(("/" + file).c_str());
+    }
+  }
 }
 
 /// Whether the GPUs at PCI bus ids @p a and @p b can reach each other's memory directly, by
@@ -471,12 +509,14 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   // The mirror exists before the hello names it, so a peer that hears the hello can map it.
   if (cfg.staging != host_staging::never && _peers.size() > 1) {
     pinned_scope near{_near_cpus};
+    unlink_dead_mirrors();
     _mirror_name = mirror_name(_peers[_rank].pid, _rank);
     _mirror      = map_shared(_mirror_name, _recv.bytes(), true);
   }
 
   require_free_port(_peers[_rank].port);
   std::unique_lock create_lock{creating_backends()};
+  disable_ucx_cuda_hooks();
   nixlAgentConfig agent_cfg(/*use_prog_thread=*/false,
                             /*use_listen_thread=*/true,
                             static_cast<std::uint16_t>(_peers[_rank].port),
