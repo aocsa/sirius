@@ -94,16 +94,6 @@ struct ring_inbox : inbound {
     slices.erase(it);
     return slice;
   }
-
-  void wait_end(std::chrono::steady_clock::time_point deadline)
-  {
-    std::unique_lock lock{mutex};
-    if (!changed.wait_until(lock, deadline, [&] { return error || ended; })) {
-      throw sirius::internal_exception(
-        "exchange ring on stream {}: rank {} did not end", stream, from);
-    }
-    if (error) { std::rethrow_exception(error); }
-  }
 };
 
 }  // namespace
@@ -206,9 +196,9 @@ void ring_all_reduce(exchange_service& service,
       // The slice is freed when the next step takes its place.
       cuda_stream.synchronize();
     }
+    // The previous rank's end may still be on its way; once detached, the stream drops it.
     closed = true;
     service.close(stream, next);
-    inbox->wait_end(std::chrono::steady_clock::now() + timeout);
   } catch (...) {
     // The next rank waits on this one: tell it now, rather than at its timeout.
     if (!closed) {
