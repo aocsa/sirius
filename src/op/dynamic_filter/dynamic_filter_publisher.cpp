@@ -1096,19 +1096,65 @@ merge_decision decide(std::vector<std::vector<merge_header>> const& headers, std
   return out;
 }
 
-/// Distributed: takes this rank's part, with nothing, in the rings of keys [first, count) that
-/// @p run marks.
-void leave_rings(dynamic_filter_publish_plan::distributed_merge const& d,
-                 std::size_t first,
-                 std::vector<bool> const& run) noexcept
+/// Distributed: takes this rank's part, with nothing, in the merges of keys [first, count) that
+/// @p run marks. Leaving an all-gather closes the stream to every rank, which also ends a ring: the
+/// next rank, waiting on this one, fails at once.
+void leave_merges(dynamic_filter_publish_plan::distributed_merge const& d,
+                  std::size_t first,
+                  std::vector<bool> const& run) noexcept
 {
   try {
     for (auto k = first; k < run.size(); ++k) {
-      if (run[k]) { exchange::leave_ring(*d.service, d.first_stream + 1 + k); }
+      if (run[k]) { exchange::leave_all_gather(*d.service, d.first_stream + 1 + k); }
     }
   } catch (std::exception const& e) {
     SIRIUS_LOG_WARN("[publish_dynamic_filters] leaving the remaining merges: {}", e.what());
   }
+}
+
+/// Distributed: below this many bytes sent per rank, one all-gather of a key's Bloom is faster than
+/// the ring's 2 x (world - 1) steps, whose cost is then each step's latency, not its bytes.
+constexpr std::size_t small_merge_bytes = std::size_t{16} << 20;
+
+/// Distributed: ORs every rank's Bloom into @p bloom with one all-gather on @p stream_id.
+void gather_and_or(dynamic_filter_publish_plan::distributed_merge const& d,
+                   exchange::stream_id stream_id,
+                   sirius_dynamic_bloom_filter& bloom,
+                   ::cuda::stream_ref stream)
+{
+  auto const count = bloom.storage_bytes() / sizeof(std::uint32_t);
+  auto column      = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT32},
+                                          static_cast<cudf::size_type>(count),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          d.gpu->get_default_allocator());
+  RMM_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<std::uint32_t>(),
+                               bloom.storage(),
+                               bloom.storage_bytes(),
+                               cudaMemcpyDeviceToDevice,
+                               stream.get()));
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(column));
+  auto const all = exchange::all_gather(
+    *d.service,
+    stream_id,
+    sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)), *d.gpu, stream, {}),
+    *d.gpu,
+    stream.get(),
+    d.timeout);
+  for (exchange::rank_t r = 0; r < all.size(); ++r) {
+    if (r == d.service->rank()) { continue; }
+    if (!all[r]) {
+      throw sirius::internal_exception("rank {} sent no Bloom after agreeing to merge", r);
+    }
+    auto const theirs = sirius::get_cudf_table_view(*all[r]).column(0);
+    if (static_cast<std::size_t>(theirs.size()) != count) {
+      throw sirius::internal_exception("rank {} sent {} words, not {}", r, theirs.size(), count);
+    }
+    bloom_or_words(bloom.mutable_storage(), theirs.data<std::uint32_t>(), count, stream);
+  }
+  // The gathered Blooms are freed with `all`, after the ORs have read them.
+  stream.sync();
 }
 
 /**
@@ -1119,9 +1165,9 @@ void leave_rings(dynamic_filter_publish_plan::distributed_merge const& d,
  * First every rank all-gathers a small header per key on first_stream: whether it has a Bloom, its
  * domain and size, and its build's key count. From the same headers every rank decides the same
  * thing for each key: drop it, or fold its Bloom to the size the cluster's real key count needs
- * (planner estimates can be far off either way). Then each kept key's Blooms are ORed in a ring on
- * first_stream + 1 + k, in place: about 2 Bloom sizes sent per rank and one slice held, whatever
- * the world size.
+ * (planner estimates can be far off either way). Then each kept key's Blooms are ORed on
+ * first_stream + 1 + k: in a ring, in place, for about 2 Bloom sizes sent per rank and one slice
+ * held whatever the world size; or, when every rank's Bloom together is small, in one all-gather.
  */
 void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
                         std::vector<key_filters>& per_key,
@@ -1135,7 +1181,7 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
     for (auto k = from; k < admitted; ++k) {
       per_key[k].membership.reset();
     }
-    leave_rings(d, entered, run);
+    leave_merges(d, entered, run);
   };
   bool gathered = false;
   try {
@@ -1173,12 +1219,12 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
         *d.service, d.first_stream, std::move(header), *d.gpu, stream.get(), d.timeout);
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN("[publish_dynamic_filters] filters not merged across ranks: {}", e.what());
-      // Another rank may have gathered every header: it runs the rings this rank now leaves.
+      // Another rank may have gathered every header: it runs the merges this rank now leaves.
       give_up(0);
       return;
     }
     if (std::ranges::any_of(all, [](auto const& t) { return t == nullptr; })) {
-      // Every rank sees the same missing header, so no rank runs a ring.
+      // Every rank sees the same missing header, so no rank merges.
       SIRIUS_LOG_DEBUG("[publish_dynamic_filters] a rank took no part; nothing published.");
       for (auto& key : per_key) {
         key.membership.reset();
@@ -1232,6 +1278,11 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
       bloom->fold_to(decision.blocks, stream, mr);
       entered = k + 1;
       try {
+        // Every rank picks the same way, from the same decision.
+        if (decision.blocks * bloom_bytes_per_block * (all.size() - 1) <= small_merge_bytes) {
+          gather_and_or(d, d.first_stream + 1 + k, *bloom, stream);
+          continue;
+        }
         exchange::ring_all_reduce(
           *d.service,
           d.first_stream + 1 + k,

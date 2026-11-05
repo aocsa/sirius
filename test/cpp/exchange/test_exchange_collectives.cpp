@@ -383,7 +383,8 @@ TEST_CASE("ranks drop a key whose plan leaves too few bits per real key",
   CHECK(joins[1]->bloom() == nullptr);
 }
 
-TEST_CASE("three ranks merge their Blooms in a ring", "[exchange][collectives][dynamic_filter]")
+TEST_CASE("three ranks merge small Blooms in one all-gather",
+          "[exchange][collectives][dynamic_filter]")
 {
   ranks c(3);
   std::vector<std::unique_ptr<accumulating_join>> joins;
@@ -398,6 +399,26 @@ TEST_CASE("three ranks merge their Blooms in a ring", "[exchange][collectives][d
     REQUIRE(bloom != nullptr);
     CHECK(members(*bloom, sequence(0, 1, 90'000)) == 90'000);
     CHECK(members(*bloom, sequence(10'000'000, 1, 10'000)) < 300);
+  }
+}
+
+TEST_CASE("three ranks merge large Blooms in a ring", "[exchange][collectives][dynamic_filter]")
+{
+  // 9M real keys need 562500 blocks, so the 2^20 planned blocks stay unfolded: 32 MiB, and 64 MiB
+  // sent per rank by an all-gather, past the small-merge bound.
+  ranks c(3);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 3; ++r) {
+    joins.push_back(std::make_unique<accumulating_join>(
+      c.all[r].service, std::size_t{1} << 24, std::uint64_t{64} << 20));
+  }
+  on_every_rank(3, [&](rank_t r) { joins[r]->build(keys_batch(r, 3, 3'000'000)); });
+  for (rank_t r = 0; r < 3; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == std::size_t{32} << 20);
+    CHECK(members(*bloom, sequence(0, 1, 9'000'000)) == 9'000'000);
+    CHECK(members(*bloom, sequence(100'000'000, 1, 100'000)) < 2'000);
   }
 }
 
