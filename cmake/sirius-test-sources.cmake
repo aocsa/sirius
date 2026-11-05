@@ -271,6 +271,7 @@ set(TEST_SOURCES
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
+    test/cpp/planner/test_distributed_scan_refusals.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
