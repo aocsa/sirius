@@ -7,5 +7,6 @@ target_sources(
           fabric.cpp
           messages.cpp
           nixl_fabric.cpp
+          ring_all_reduce.cpp
           transport.cpp
           wire.cpp)
