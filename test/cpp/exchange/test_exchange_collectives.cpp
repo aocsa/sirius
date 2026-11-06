@@ -23,6 +23,7 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
+#include "exchange/ring_all_reduce.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
@@ -325,7 +326,8 @@ std::vector<std::int64_t> sequence(std::int64_t first, std::int64_t step, int co
 TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
           "[exchange][collectives][dynamic_filter]")
 {
-  // Planned for 32Ki keys at 2 bytes each.
+  // Planned for 32Ki keys (2048 blocks), then folded to what the 4000 real keys need: 256 blocks
+  // of 32 bytes.
   ranks c(2);
   std::vector<std::unique_ptr<accumulating_join>> joins;
   for (rank_t r = 0; r < 2; ++r) {
@@ -337,7 +339,7 @@ TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
   for (rank_t r = 0; r < 2; ++r) {
     auto const* bloom = joins[r]->bloom();
     REQUIRE(bloom != nullptr);
-    CHECK(bloom->storage_bytes() == 64 * KiB);
+    CHECK(bloom->storage_bytes() == 8 * KiB);
     CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
     // Keys no rank holds are mostly absent.
     CHECK(members(*bloom, sequence(1'000'000, 1, 4000)) < 100);
@@ -347,22 +349,76 @@ TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
 TEST_CASE("a rank that accumulates and one that publishes a whole build size their Blooms alike",
           "[exchange][collectives][dynamic_filter]")
 {
-  // Planned for 64Ki keys, 128 KiB: the per-GPU cap of 64 KiB does not cut a distributed Bloom.
+  // Planned for 64Ki keys, 128 KiB: the per-GPU cap of 64 KiB does not cut a distributed Bloom,
+  // and the 40000 real keys need more than half of it, so it does not fold.
   ranks c(2);
   auto const planned = std::size_t{64} * KiB;
   accumulating_join accumulated(c.all[0].service, planned, 64 * KiB);
   whole_build_join whole(c.all[1].service, planned, 64 * KiB);
   on_every_rank(2, [&](rank_t r) {
     if (r == 0) {
-      accumulated.build(keys_batch(0, 2, 2000));
+      accumulated.build(keys_batch(0, 2, 20'000));
     } else {
-      static_cast<void>(whole.publish(keys_table(1, 2, 2000)->view()));
+      static_cast<void>(whole.publish(keys_table(1, 2, 20'000)->view()));
     }
   });
   for (auto const* bloom : {accumulated.bloom(), published_bloom(*whole.channel)}) {
     REQUIRE(bloom != nullptr);
     CHECK(bloom->storage_bytes() == 128 * KiB);
     CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
+  }
+}
+
+TEST_CASE("ranks drop a key whose plan leaves too few bits per real key",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // Planned for 4096 keys, so 256 blocks; the 80000 real keys would get 0.8 bits each.
+  ranks c(2);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, 4096, 64 * KiB));
+  }
+  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 40'000)); });
+  CHECK(joins[0]->bloom() == nullptr);
+  CHECK(joins[1]->bloom() == nullptr);
+}
+
+TEST_CASE("three ranks merge small Blooms in one all-gather",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(3);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 3; ++r) {
+    joins.push_back(
+      std::make_unique<accumulating_join>(c.all[r].service, std::size_t{1} << 20, 1024 * KiB));
+  }
+  // Rank r holds the keys equal to r modulo 3.
+  on_every_rank(3, [&](rank_t r) { joins[r]->build(keys_batch(r, 3, 30'000)); });
+  for (rank_t r = 0; r < 3; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(members(*bloom, sequence(0, 1, 90'000)) == 90'000);
+    CHECK(members(*bloom, sequence(10'000'000, 1, 10'000)) < 300);
+  }
+}
+
+TEST_CASE("three ranks merge large Blooms in a ring", "[exchange][collectives][dynamic_filter]")
+{
+  // 9M real keys need 562500 blocks, so the 2^20 planned blocks stay unfolded: 32 MiB, and 64 MiB
+  // sent per rank by an all-gather, past the small-merge bound.
+  ranks c(3);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 3; ++r) {
+    joins.push_back(std::make_unique<accumulating_join>(
+      c.all[r].service, std::size_t{1} << 24, std::uint64_t{64} << 20));
+  }
+  on_every_rank(3, [&](rank_t r) { joins[r]->build(keys_batch(r, 3, 3'000'000)); });
+  for (rank_t r = 0; r < 3; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == std::size_t{32} << 20);
+    CHECK(members(*bloom, sequence(0, 1, 9'000'000)) == 9'000'000);
+    CHECK(members(*bloom, sequence(100'000'000, 1, 100'000)) < 2'000);
   }
 }
 
@@ -488,6 +544,115 @@ TEST_CASE("a rank missing from one key's merge costs the others one timeout, not
   stream.sync();
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds{1800});
   CHECK(published_bloom(*channel) == nullptr);
+}
+
+TEST_CASE("a folded Bloom is the Bloom built at the smaller size",
+          "[exchange][collectives][dynamic_filter]")
+{
+  auto const stream = utils::default_stream();
+  auto const mr     = env().gpu->get_default_allocator();
+  auto const keys   = keys_table(17, 13, 50'000);
+  auto const column = keys->view().column(0);
+  // 16 keys per block: 4096 and 4096 / 8 blocks.
+  sirius::op::sirius_dynamic_bloom_filter folded(column, 4096 * 16, stream, mr);
+  sirius::op::sirius_dynamic_bloom_filter direct(column, 512 * 16, stream, mr);
+  REQUIRE(folded.block_count() == 4096);
+  REQUIRE(direct.block_count() == 512);
+  folded.fold_to(512, stream, mr);
+  REQUIRE(folded.storage_bytes() == direct.storage_bytes());
+  std::vector<std::uint8_t> a(folded.storage_bytes());
+  std::vector<std::uint8_t> b(direct.storage_bytes());
+  REQUIRE(
+    cudaMemcpyAsync(a.data(), folded.storage(), a.size(), cudaMemcpyDeviceToHost, stream.get()) ==
+    cudaSuccess);
+  REQUIRE(
+    cudaMemcpyAsync(b.data(), direct.storage(), b.size(), cudaMemcpyDeviceToHost, stream.get()) ==
+    cudaSuccess);
+  stream.sync();
+  CHECK(a == b);
+  CHECK(members(folded, sequence(17, 13, 50'000)) == 50'000);
+  CHECK_THROWS_AS(folded.fold_to(300, stream, mr), std::invalid_argument);
+}
+
+TEST_CASE("a ring all-reduce ORs every rank's words into every rank's", "[exchange][collectives]")
+{
+  for (rank_t world : {2u, 3u, 4u}) {
+    ranks c(world);
+    // Not a multiple of any world size here, so the slices differ in length.
+    constexpr std::size_t count = 1001;
+    std::vector<rmm::device_buffer> words;
+    for (rank_t r = 0; r < world; ++r) {
+      std::vector<std::uint32_t> mine(count);
+      for (std::size_t i = 0; i < count; ++i) {
+        mine[i] = (1u << r) | static_cast<std::uint32_t>(i << 8);
+      }
+      words.emplace_back(mine.data(),
+                         count * sizeof(std::uint32_t),
+                         utils::default_stream(),
+                         utils::get_resource_ref(*env().gpu));
+    }
+    utils::default_stream().sync();
+    on_every_rank(world, [&](rank_t r) {
+      sirius::exchange::ring_all_reduce(
+        *c.all[r].service,
+        51,
+        static_cast<std::uint32_t*>(words[r].data()),
+        count,
+        [](std::uint32_t* into, std::uint32_t const* from, std::size_t n, rmm::cuda_stream_view s) {
+          sirius::op::bloom_or_words(into, from, n, ::cuda::stream_ref{s.value()});
+        },
+        *env().gpu,
+        utils::default_stream(),
+        std::chrono::seconds{30});
+    });
+    for (rank_t r = 0; r < world; ++r) {
+      std::vector<std::uint32_t> got(count);
+      REQUIRE(cudaMemcpy(got.data(),
+                         words[r].data(),
+                         count * sizeof(std::uint32_t),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      for (std::size_t i = 0; i < count; ++i) {
+        REQUIRE(got[i] == (((1u << world) - 1) | static_cast<std::uint32_t>(i << 8)));
+      }
+    }
+  }
+}
+
+TEST_CASE("a rank that leaves a ring fails the others at once", "[exchange][collectives]")
+{
+  ranks c(3);
+  constexpr std::size_t count = 300;
+  std::vector<rmm::device_buffer> words;
+  for (rank_t r = 0; r < 3; ++r) {
+    words.emplace_back(
+      count * sizeof(std::uint32_t), utils::default_stream(), utils::get_resource_ref(*env().gpu));
+  }
+  auto const start = std::chrono::steady_clock::now();
+  std::vector<bool> failed(3, false);
+  on_every_rank(3, [&](rank_t r) {
+    if (r == 2) {
+      sirius::exchange::leave_ring(*c.all[r].service, 52);
+      return;
+    }
+    try {
+      sirius::exchange::ring_all_reduce(
+        *c.all[r].service,
+        52,
+        static_cast<std::uint32_t*>(words[r].data()),
+        count,
+        [](std::uint32_t* into, std::uint32_t const* from, std::size_t n, rmm::cuda_stream_view s) {
+          sirius::op::bloom_or_words(into, from, n, ::cuda::stream_ref{s.value()});
+        },
+        *env().gpu,
+        utils::default_stream(),
+        std::chrono::seconds{60});
+    } catch (sirius::internal_exception const&) {
+      failed[r] = true;
+    }
+  });
+  CHECK(failed[0]);
+  CHECK(failed[1]);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
 }
 
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")

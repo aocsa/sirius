@@ -6,6 +6,7 @@ target_sources(
           exchange_service.cpp
           fabric.cpp
           messages.cpp
+          ring_all_reduce.cpp
           transport.cpp
           wire.cpp)
 

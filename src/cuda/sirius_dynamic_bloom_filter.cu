@@ -451,6 +451,25 @@ __global__ void or_words(std::uint32_t* into, std::uint32_t const* from, std::si
   if (i < count) { into[i] |= from[i]; }
 }
 
+/// Word w of output block b is the OR of word w of input blocks [b * factor, (b + 1) * factor).
+__global__ void fold_blocks(std::uint32_t* out,
+                            std::uint32_t const* in,
+                            std::size_t out_words,
+                            std::size_t words_per_block,
+                            std::size_t factor)
+{
+  auto const i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= out_words) { return; }
+  auto const block    = i / words_per_block;
+  auto const word     = i % words_per_block;
+  auto const* run     = in + block * factor * words_per_block + word;
+  std::uint32_t value = 0;
+  for (std::size_t j = 0; j < factor; ++j) {
+    value |= run[j * words_per_block];
+  }
+  out[i] = value;
+}
+
 }  // namespace
 
 void const* sirius_dynamic_bloom_filter::storage() const
@@ -495,6 +514,73 @@ void sirius_dynamic_bloom_filter::merge_from(void const* words,
   or_words<<<blocks, threads, 0, stream.get()>>>(
     into, static_cast<std::uint32_t const*>(words), count);
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void bloom_or_words(std::uint32_t* into,
+                    std::uint32_t const* from,
+                    std::size_t count,
+                    ::cuda::stream_ref stream)
+{
+  if (count == 0) { return; }
+  constexpr unsigned threads = 256;
+  or_words<<<static_cast<unsigned>(::cuda::ceil_div(count, std::size_t{threads})),
+             threads,
+             0,
+             stream.get()>>>(into, from, count);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+std::size_t sirius_dynamic_bloom_filter::block_count() const
+{
+  return storage_bytes() / bloom_bytes_per_block;
+}
+
+std::uint32_t* sirius_dynamic_bloom_filter::mutable_storage()
+{
+  return static_cast<std::uint32_t*>(const_cast<void*>(storage()));
+}
+
+void sirius_dynamic_bloom_filter::fold_to(std::size_t blocks,
+                                          ::cuda::stream_ref stream,
+                                          rmm::device_async_resource_ref mr)
+{
+  auto const current = block_count();
+  if (blocks == 0 || current % blocks != 0) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_bloom_filter] fold to a size that does not divide");
+  }
+  if (replica_count() > 1) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter] fold_to on a filter on several GPUs");
+  }
+  if (blocks == current) { return; }
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_impl->source_device}};
+  // The folded array lives as an accumulated replica, with a stream of its own that orders its
+  // release, as the accumulated builder's arrays do.
+  auto owner = std::make_shared<rmm::cuda_stream>();
+  cuda_event ready;
+  ready.record(stream);
+  ready.wait(::cuda::stream_ref{owner->value()});
+  auto bits =
+    std::make_unique<rmm::device_buffer>(blocks * bloom_bytes_per_block, owner->view(), mr);
+  constexpr std::size_t words_per_block = bloom_bytes_per_block / sizeof(std::uint32_t);
+  auto const out_words                  = blocks * words_per_block;
+  constexpr unsigned threads            = 256;
+  fold_blocks<<<static_cast<unsigned>(::cuda::ceil_div(out_words, std::size_t{threads})),
+                threads,
+                0,
+                owner->value()>>>(static_cast<std::uint32_t*>(bits->data()),
+                                  static_cast<std::uint32_t const*>(storage()),
+                                  out_words,
+                                  words_per_block,
+                                  current / blocks);
+  CUDF_CUDA_TRY(cudaGetLastError());
+  // The old storage is freed below, so the fold must have read it; later work on the caller's
+  // stream reads the new one.
+  owner->synchronize();
+  _impl->replicas.clear();
+  _impl->accumulated_replicas.clear();
+  _impl->accumulated_replicas.push_back(std::make_unique<accumulated_bloom_replica>(
+    _impl->source_device, blocks, std::move(owner), std::move(bits)));
 }
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(
