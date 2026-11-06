@@ -92,6 +92,9 @@ class distributed_session {
   /// spaces the exchange uses still exist; a later get_exchange_service() connects anew.
   void shutdown();
 
+  /// \brief Test hook: @p service becomes this process's exchange, as if connected; null drops it.
+  void set_exchange_service_for_testing(std::shared_ptr<exchange_service> service);
+
  private:
   std::mutex mutex_;
   std::vector<std::string> peers_;

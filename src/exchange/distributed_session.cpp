@@ -190,4 +190,11 @@ void distributed_session::shutdown()
   if (service) { service->shutdown(); }
 }
 
+void distributed_session::set_exchange_service_for_testing(
+  std::shared_ptr<exchange_service> service)
+{
+  std::lock_guard lock{mutex_};
+  service_ = std::move(service);
+}
+
 }  // namespace sirius::exchange
