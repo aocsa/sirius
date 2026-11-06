@@ -461,7 +461,7 @@ TEST_CASE("a join whose build ends empty leaves the filter merge before its prob
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
 {
   ranks c(2);
-  auto const stream = (std::uint64_t{7} << sirius::exchange::query_stream_bits) | 1;
+  auto const stream = sirius::exchange::make_stream_id(7, 1);
   std::thread peer([&] {
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
     c.all[1].service->abort(7, "injected failure");

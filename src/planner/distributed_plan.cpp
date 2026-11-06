@@ -123,7 +123,7 @@ struct rewriter {
   /// Each CTE_SCAN's rows are where its CTE's materialization put them.
   std::map<op::sirius_physical_operator const*, placement> cte_scans;
 
-  exchange::stream_id stream() { return (query << exchange::query_stream_bits) | next_stream++; }
+  exchange::stream_id stream() { return exchange::make_stream_id(query, next_stream++); }
 
   op::sirius_physical_operator& expect(op::sirius_physical_operator& node, T type)
   {
@@ -210,9 +210,10 @@ struct rewriter {
       shape += "f";
       return;
     }
-    // Admitted key k merges on stream first + k.
-    auto const first = (query << exchange::query_stream_bits) | next_stream;
+    // Admitted key k merges on stream first + k, so the stream after the last key must fit too.
+    auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
+    static_cast<void>(exchange::make_stream_id(query, next_stream));
     join.set_distributed_dynamic_filters(std::make_shared<exchange::all_gather_filter_merge>(
       exchange::all_gather_filter_merge::options{
         .service      = service,
