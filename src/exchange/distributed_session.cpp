@@ -31,9 +31,11 @@ std::shared_ptr<exchange_service> distributed_session::get_exchange_service(
 {
   std::lock_guard lock{mutex_};
   if (service_) {
-    if (params.exchange_peers != peers_ || params.exchange_rank != rank_) {
+    if (params.exchange_peers != peers_ || params.exchange_rank != rank_ ||
+        params.exchange_host_staging != host_staging_) {
       throw invalid_input_exception(
-        "sirius_exchange_peers and sirius_exchange_rank cannot change once connected");
+        "sirius_exchange_peers, sirius_exchange_rank and sirius_exchange_host_staging cannot "
+        "change once connected");
     }
     return service_;
   }
@@ -43,9 +45,12 @@ std::shared_ptr<exchange_service> distributed_session::get_exchange_service(
   }
   auto* gpu  = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
   auto* host = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
-  service_   = make_nixl_exchange(params.exchange_rank, params.exchange_peers, *gpu, host);
-  peers_     = params.exchange_peers;
-  rank_      = params.exchange_rank;
+  nixl_exchange_options opts;
+  opts.staging  = parse_host_staging(params.exchange_host_staging);
+  service_      = make_nixl_exchange(params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+  peers_        = params.exchange_peers;
+  rank_         = params.exchange_rank;
+  host_staging_ = params.exchange_host_staging;
   return service_;
 }
 
@@ -62,6 +67,14 @@ void distributed_session::require_rank(std::uint32_t rank)
   std::lock_guard lock{mutex_};
   if (service_ && rank != rank_) {
     throw invalid_input_exception("sirius_exchange_rank cannot change once connected");
+  }
+}
+
+void distributed_session::require_host_staging(std::string const& staging)
+{
+  std::lock_guard lock{mutex_};
+  if (service_ && staging != host_staging_) {
+    throw invalid_input_exception("sirius_exchange_host_staging cannot change once connected");
   }
 }
 

@@ -49,11 +49,12 @@ class distributed_session {
   [[nodiscard]] std::shared_ptr<exchange_service> get_exchange_service(
     operator_params const& params, memory::sirius_memory_reservation_manager& memory);
 
-  /// \brief Refuses, once connected, other peers or another rank than this process connected
-  /// with. A connection that sets them anew sets the same ones.
+  /// \brief Refuses, once connected, other peers, rank or host staging than this process
+  /// connected with. A connection that sets them anew sets the same ones.
   /// @throws sirius::invalid_input_exception
   void require_peers(std::vector<std::string> const& peers);
   void require_rank(std::uint32_t rank);
+  void require_host_staging(std::string const& staging);
 
   /// \brief Numbers a distributed query planned on @p connection, from 1, and ties it to
   /// @p active_window unless that is 0. Every rank runs the same statements, so the same query
@@ -89,6 +90,7 @@ class distributed_session {
   std::mutex mutex_;
   std::vector<std::string> peers_;
   std::uint32_t rank_{0};
+  std::string host_staging_;
   std::shared_ptr<exchange_service> service_;
   std::uint64_t queries_{0};
   /// The connection that runs this process's distributed queries.
