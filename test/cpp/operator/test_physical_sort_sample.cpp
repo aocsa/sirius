@@ -24,6 +24,7 @@
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <op/sirius_physical_distributed_sort_sample.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_config.hpp>
@@ -212,6 +213,46 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
 
   // No batches to pull; execute() should still be able to mark boundaries done.
   REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("distributed sirius_physical_sort_sample schedules a boundary task with no input",
+          "[physical_sort_sample]")
+{
+  auto local = make_sort_sample(100000);
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(false);
+
+  SECTION("distributed")
+  {
+    sirius_physical_distributed_sort_sample sample_op(local, {nullptr, 0, nullptr, {}});
+    attach_port(sample_op, *repo, src_pipeline);
+
+    // The boundary task is owed before upstream finishes, but cannot run yet.
+    CHECK_FALSE(sample_op.all_ports_empty());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+    src_pipeline->set_finished(true);
+    auto hint = sample_op.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    CHECK(hint->hint == TaskCreationHint::READY);
+
+    auto input = sample_op.get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    CHECK(batch_count(*input) == 0);
+    CHECK(sample_op.runs_without_input());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+  }
+
+  SECTION("not distributed")
+  {
+    attach_port(local, *repo, src_pipeline);
+    src_pipeline->set_finished(true);
+    CHECK(local.get_next_task_input_data() == nullptr);
+    CHECK_FALSE(local.runs_without_input());
+  }
 }
 
 TEST_CASE("sirius_physical_sort_sample get_next_task_hint returns nullopt while scheduled",
