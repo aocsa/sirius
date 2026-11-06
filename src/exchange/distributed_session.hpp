@@ -33,6 +33,9 @@ struct operator_params;
 namespace memory {
 class sirius_memory_reservation_manager;
 }
+namespace parallel {
+class downgrade_executor;
+}
 }  // namespace sirius
 
 namespace sirius::exchange {
@@ -43,11 +46,14 @@ namespace sirius::exchange {
  */
 class distributed_session {
  public:
-  /// \brief This process's exchange, connected to every peer of @p params on first use.
+  /// \brief This process's exchange, connected to every peer of @p params on first use. A batch
+  /// that finds no room asks the GPU space's executor among @p downgrade for it.
   /// @throws sirius::invalid_input_exception when the settings change after it connected, or
   ///         Sirius was built without NIXL.
   [[nodiscard]] std::shared_ptr<exchange_service> get_exchange_service(
-    operator_params const& params, memory::sirius_memory_reservation_manager& memory);
+    operator_params const& params,
+    memory::sirius_memory_reservation_manager& memory,
+    std::vector<std::unique_ptr<parallel::downgrade_executor>> const& downgrade);
 
   /// \brief Refuses, once connected, other peers, rank or host staging than this process
   /// connected with. A connection that sets them anew sets the same ones.

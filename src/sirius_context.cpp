@@ -1222,9 +1222,10 @@ void SiriusContext::terminate()
   task_scheduler_->stop();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
-  // The exchange's engine thread lands batches in memory_manager_'s spaces and calls into sources
-  // and the components above: stop it while they all still exist. Plans can hold the service past
-  // terminate() (a prepared statement), so dropping a reference alone would not stop it.
+  // The exchange's engine thread lands batches in memory_manager_'s spaces, calls into sources and
+  // the components above, and asks the downgrade executors for room: stop it while they all still
+  // exist. Plans can hold the service past terminate() (a prepared statement), so dropping a
+  // reference alone would not stop it.
   if (auto* distributed = distributed_.load()) { distributed->shutdown(); }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
@@ -1307,7 +1308,8 @@ uint64_t SiriusContext::distributed_query_of(sirius::query_id_t window)
 std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_service(
   sirius::operator_params const& params)
 {
-  return ensure_distributed().get_exchange_service(params, get_memory_manager());
+  return ensure_distributed().get_exchange_service(
+    params, get_memory_manager(), get_downgrade_executors());
 }
 
 sirius::exchange::distributed_session& SiriusContext::ensure_distributed()

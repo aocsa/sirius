@@ -16,18 +16,22 @@
 
 #include "exchange/distributed_session.hpp"
 
+#include "downgrade/downgrade_executor.hpp"
 #include "exchange/exchange_runtime.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 namespace sirius::exchange {
 
 std::shared_ptr<exchange_service> distributed_session::get_exchange_service(
-  operator_params const& params, memory::sirius_memory_reservation_manager& memory)
+  operator_params const& params,
+  memory::sirius_memory_reservation_manager& memory,
+  std::vector<std::unique_ptr<parallel::downgrade_executor>> const& downgrade)
 {
   std::lock_guard lock{mutex_};
   if (service_) {
@@ -45,8 +49,19 @@ std::shared_ptr<exchange_service> distributed_session::get_exchange_service(
   }
   auto* gpu  = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
   auto* host = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
+  auto const executor =
+    std::ranges::find(downgrade, gpu->get_id(), [](auto const& e) { return e->get_space_id(); });
+  if (executor == downgrade.end()) {
+    throw internal_exception("exchange: no downgrade executor for the GPU space");
+  }
   nixl_exchange_options opts;
-  opts.staging  = parse_host_staging(params.exchange_host_staging);
+  opts.staging = parse_host_staging(params.exchange_host_staging);
+  // A batch with no room asks the GPU's downgrade executor for it, as a task would. terminate()
+  // shuts the exchange down before the executors stop.
+  opts.transport_options.request_room = [&executor = **executor, gpu](std::size_t bytes) {
+    static_cast<void>(
+      executor.request_downgrade([gpu, bytes] { return gpu->get_available_memory() >= bytes; }));
+  };
   service_      = make_nixl_exchange(params.exchange_rank, params.exchange_peers, *gpu, host, opts);
   peers_        = params.exchange_peers;
   rank_         = params.exchange_rank;
