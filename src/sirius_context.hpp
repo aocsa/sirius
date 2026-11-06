@@ -1040,9 +1040,9 @@ class SiriusContext : public ClientContextState {
 
   sirius::exchange::distributed_session& ensure_distributed();
 
-  // Last, so it goes first: its transport uses the memory spaces above. Null in a single
-  // process, so a standalone query neither locks nor looks up anything for it; created once, by
-  // the first distributed query or exchange connect.
+  // terminate() shuts its exchange down before the memory manager: its transport uses the memory
+  // spaces above. Null in a single process, so a standalone query neither locks nor looks up
+  // anything for it; created once, by the first distributed query or exchange connect.
   std::mutex distributed_mutex_;
   std::unique_ptr<sirius::exchange::distributed_session> distributed_owner_;
   std::atomic<sirius::exchange::distributed_session*> distributed_{nullptr};

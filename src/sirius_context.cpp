@@ -1222,6 +1222,10 @@ void SiriusContext::terminate()
   task_scheduler_->stop();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
+  // The exchange's engine thread lands batches in memory_manager_'s spaces and calls into sources
+  // and the components above: stop it while they all still exist. Plans can hold the service past
+  // terminate() (a prepared statement), so dropping a reference alone would not stop it.
+  if (auto* distributed = distributed_.load()) { distributed->shutdown(); }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }

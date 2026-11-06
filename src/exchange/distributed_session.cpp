@@ -145,4 +145,14 @@ void distributed_session::wait_sent(query_id_t window)
   }
 }
 
+void distributed_session::shutdown()
+{
+  std::shared_ptr<exchange_service> service;
+  {
+    std::lock_guard lock{mutex_};
+    service = std::move(service_);
+  }
+  if (service) { service->shutdown(); }
+}
+
 }  // namespace sirius::exchange

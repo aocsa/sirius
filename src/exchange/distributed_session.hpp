@@ -80,6 +80,10 @@ class distributed_session {
   /// \brief Waits until the exchange no longer holds batches window @p window's query sent.
   void wait_sent(query_id_t window);
 
+  /// \brief See exchange_service::shutdown. Called by SiriusContext::terminate(), while the memory
+  /// spaces the exchange uses still exist; a later get_exchange_service() connects anew.
+  void shutdown();
+
  private:
   std::mutex mutex_;
   std::vector<std::string> peers_;
