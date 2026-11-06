@@ -77,7 +77,8 @@ class distributed_session {
   /// peer's run of it fails too, rather than waiting for this rank's batches.
   void abort(query_id_t window, std::exception_ptr const& error) noexcept;
 
-  /// \brief Waits until the exchange no longer holds batches window @p window's query sent.
+  /// \brief Waits until the exchange no longer holds batches window @p window's query sent, then
+  /// has it forget the query (exchange_service::forget).
   void wait_sent(query_id_t window);
 
   /// \brief See exchange_service::shutdown. Called by SiriusContext::terminate(), while the memory

@@ -142,6 +142,7 @@ void distributed_session::wait_sent(query_id_t window)
       SIRIUS_LOG_WARN("Distributed query {}: sent batches still held by the exchange after 1 min",
                       query);
     }
+    if (service) { service->forget(query); }
   }
 }
 
