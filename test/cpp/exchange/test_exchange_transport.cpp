@@ -225,6 +225,26 @@ TEST_CASE("a failed transport frees the batches it held before reporting", "[exc
   CHECK(sender.wait_sent(5, std::chrono::seconds{5}));
 }
 
+TEST_CASE("a transport destroyed right after close and abort still sends them",
+          "[exchange][transport]")
+{
+  // A rank that already holds its peers' ends may tear down the moment it closes its own, as a
+  // barrier's slowest rank does. Many ends make it likely some are still queued at the teardown.
+  cluster c(2, 4, 4);
+  int const streams = 100;
+  for (int s = 0; s < streams; ++s) {
+    c.ranks[0].t->close(static_cast<stream_id>(s), 1);
+  }
+  c.ranks[0].t->abort(7, "stopped");
+  c.ranks[0].t.reset();
+  auto& got = *c.ranks[1].got;
+  REQUIRE(got.wait_for(
+    [&] { return got.error != nullptr && got.ended.size() == static_cast<std::size_t>(streams); },
+    std::chrono::seconds{10}));
+  CHECK_THROWS_WITH(std::rethrow_exception(got.error),
+                    Catch::Matchers::ContainsSubstring("stopped"));
+}
+
 TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange][transport]")
 {
   using namespace sirius::exchange;
