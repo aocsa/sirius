@@ -20,7 +20,6 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "event/query_event_publisher.hpp"
-#include "exchange/distributed_session.hpp"
 #include "exec/query_admission.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/resource_ref_utils.hpp"
@@ -77,6 +76,11 @@ class topology_index;
 namespace sirius {
 class sirius_engine;
 }  // namespace sirius
+
+namespace sirius::exchange {
+class distributed_session;
+class exchange_service;
+}  // namespace sirius::exchange
 
 namespace duckdb {
 
