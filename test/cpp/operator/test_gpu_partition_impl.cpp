@@ -18,6 +18,7 @@
 #include "data/data_batch_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
+#include "op/sirius_physical_exchange_sink.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
@@ -407,6 +408,8 @@ TEST_CASE("Hash partition after a partitioning with the same seed leaves buckets
     return empty;
   };
 
+  // Same seed: a rank's rows all share one parity of hash % 2, and hash % 4 keeps that parity, so
+  // 2 of the 4 buckets stay empty.
   CHECK(count_empty_buckets(cudf::DEFAULT_HASH_SEED) == 2);
-  CHECK(count_empty_buckets(0x9e3779b9u) == 0);
+  CHECK(count_empty_buckets(sirius::op::exchange_spec::default_hash_seed) == 0);
 }
