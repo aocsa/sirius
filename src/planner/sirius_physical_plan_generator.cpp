@@ -2244,6 +2244,12 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
       throw sirius::internal_exception(
         "distributed execution: sirius_exchange_peers set on a connection without Sirius state");
     }
+    // attach_byte_ranges replaced this rank's share of the files with the plan's own ranges.
+    if (context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+          sirius::planner::scan_byte_ranges_state::kStateKey)) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: a plan that carries its own byte ranges");
+    }
     auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
     auto service     = sirius_ctx->get_exchange_service(op_params);
     auto const query = sirius_ctx->next_distributed_query(context);

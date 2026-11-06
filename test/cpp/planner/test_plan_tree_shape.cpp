@@ -52,6 +52,7 @@
 #include "planner/distributed_plan.hpp"
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/substrait_scan_ranges.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
@@ -81,6 +82,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <map>
 #include <span>
 #include <sstream>
 #include <string>
@@ -509,6 +511,18 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                          "SELECT k FROM sirius_read_parquet(" +
                            sirius::test::sql_literal("file://" + parquet.string()) + ")"),
     Catch::Matchers::ContainsSubstring("a remote table of 1 files across 2 ranks"));
+
+  // Ranges a Substrait plan carries would replace this rank's share of the file.
+  std::map<std::string, std::vector<sirius::planner::scan_byte_range>> ranges;
+  ranges[parquet.string()] = {{0, 100}};
+  con->context->registered_state->Insert(
+    sirius::planner::scan_byte_ranges_state::kStateKey,
+    duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+  REQUIRE_THROWS_WITH(
+    generate_sirius_plan(
+      *con, "SELECT sum(k) FROM read_parquet(" + sirius::test::sql_literal(parquet.string()) + ")"),
+    Catch::Matchers::ContainsSubstring("a plan that carries its own byte ranges"));
+  con->context->registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
