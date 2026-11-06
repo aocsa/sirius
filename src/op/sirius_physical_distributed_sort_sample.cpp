@@ -162,6 +162,7 @@ void sirius_physical_distributed_sort_sample::compute_boundaries(cudf::table_vie
 
     // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
     _gather_entered = true;
+    // TODO(#2375): all_gather blocks this GPU worker thread until every rank's summary arrives.
     _gathered =
       exchange::all_gather(*_sampling.service, _sampling.stream, summary, gpu, stream.get());
   }

@@ -38,9 +38,9 @@ namespace sirius::op {
  *
  * Every rank shares an evenly spaced summary of its sample, and merges all of them in rank
  * order, so every rank holds the same global sample. From it each derives the same world size
- * - 1 boundaries for the range exchange after this operator, and its own partition boundaries
- * from the part of the sample inside its range. Every rank's boundary task joins the exchange,
- * one with no input included.
+ * minus one boundaries for the range exchange after this operator, and its own partition
+ * boundaries from the part of the sample inside its range. Every rank's boundary task joins the
+ * exchange, one with no input included.
  */
 class sirius_physical_distributed_sort_sample : public sirius_physical_sort_sample {
  public:
@@ -68,7 +68,8 @@ class sirius_physical_distributed_sort_sample : public sirius_physical_sort_samp
 
   //! The boundary task is still owed, input or not, until it has been claimed.
   [[nodiscard]] bool all_ports_empty() override;
-  //! get_next_task_input_data() has already claimed the task (SCHEDULED) when this is asked.
+  //! The boundary task runs with no input, since every rank's all-gather waits for it.
+  //! get_next_task_input_data() has already claimed it (SCHEDULED) when this is asked.
   [[nodiscard]] bool runs_without_input() const override
   {
     return _boundary_state.load(std::memory_order_acquire) != BoundaryState::DONE;
