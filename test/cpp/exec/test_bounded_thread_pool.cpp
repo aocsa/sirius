@@ -21,9 +21,12 @@
 
 #include <absl/cleanup/cleanup.h>
 
+#include <array>
 #include <atomic>
 #include <future>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -350,6 +353,44 @@ TEST_CASE("bounded_thread_pool concurrent producers all tasks execute", "[bounde
   REQUIRE(counter.load() == num_threads * tasks_each);
 }
 
+TEST_CASE("bounded_thread_pool propagates initialization failures after joining workers",
+          "[bounded_thread_pool]")
+{
+  std::atomic<int> initialized{0};
+  std::atomic<int> exited{0};
+  struct exit_counter {
+    std::atomic<int>& count;
+    ~exit_counter() { ++count; }
+  };
+  auto initialize = [&](bool allocation_failure) {
+    thread_local exit_counter on_exit{exited};
+    if (initialized.fetch_add(1) == 0) {
+      if (allocation_failure) { throw std::bad_alloc{}; }
+      throw std::runtime_error("worker initialization failed");
+    }
+  };
+
+  SECTION("allocation failure")
+  {
+    REQUIRE_THROWS_AS(bounded_thread_pool(4, "test", {}, [&] { initialize(true); }),
+                      std::bad_alloc);
+  }
+  SECTION("other initialization failure")
+  {
+    REQUIRE_THROWS_AS(bounded_thread_pool(4, "test", {}, [&] { initialize(false); }),
+                      std::runtime_error);
+  }
+  CHECK(initialized.load() == 4);
+  CHECK(exited.load() == 4);
+
+  // A failed pool leaves no workers behind and does not prevent a fresh pool.
+  {
+    bounded_thread_pool retry(4, "test", {}, [&] { initialize(false); });
+  }
+  CHECK(initialized.load() == 8);
+  CHECK(exited.load() == 8);
+}
+
 //===----------------------------------------------------------------------===//
 // Query retirement uses leases; pool tags identify queued work only.
 //===----------------------------------------------------------------------===//
@@ -580,4 +621,32 @@ TEST_CASE("leased callables retain captures on exception and discard",
   CHECK(observed == 1);
   lifecycle.wait_for_work(q);
   lifecycle.close(q);
+}
+
+TEST_CASE("bounded_thread_pool given no CPUs runs on the process's CPUs, not its creator's",
+          "[bounded_thread_pool]")
+{
+  // DuckDB pins each worker to one core on hosts with more than 64 cores; a pool started from such
+  // a worker must not inherit that one core for all its threads.
+  auto const process = thread_util::get_process_affinity();
+  REQUIRE_FALSE(process.empty());
+  if (process.size() < 2) { SKIP("needs at least two CPUs in the process affinity"); }
+
+  bool pinned = false;
+  std::vector<int> seen;
+  std::thread creator([&] {
+    std::array<int, 1> one{process.front()};
+    pinned = thread_util::set_current_thread_affinity(one) &&
+             thread_util::get_current_thread_affinity().size() == 1;
+    bounded_thread_pool pool(1, "affinity");
+    std::promise<std::vector<int>> affinity;
+    auto future = affinity.get_future();
+    pool.dispatch(pool.reserve(),
+                  [&affinity] { affinity.set_value(thread_util::get_current_thread_affinity()); });
+    seen = future.get();
+  });
+  creator.join();
+
+  REQUIRE(pinned);
+  CHECK(seen == process);
 }
