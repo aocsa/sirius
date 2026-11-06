@@ -165,6 +165,22 @@ TEST_CASE("a distributed plan refuses scans it cannot split", "[planner][distrib
       Catch::Matchers::ContainsSubstring("filename or file_index of a table split across ranks"));
   }
 
+  SECTION("an Iceberg table, with or without positional deletes")
+  {
+    // The fixtures' metadata stores repo-relative paths, so they resolve only from the repo root.
+    REQUIRE(fs::exists("test/cpp/integration/data/iceberg_v2_delete/metadata"));
+    REQUIRE_FALSE(con.Query("LOAD iceberg")->HasError());
+    // Pinned snapshots: an unpinned scan is declined before lowering, so it would never get here.
+    auto const table = GENERATE(as<std::string>{},
+                                "iceberg_scan('test/cpp/integration/data/iceberg_v2_delete', "
+                                "snapshot_from_id = 2000000000000000001)",
+                                "iceberg_scan('test/cpp/integration/data/iceberg_v1', "
+                                "snapshot_from_id = 1000000000000000001)");
+    // Reads a column: the extension answers count(*) of a table without deletes from metadata.
+    CHECK_THAT(lowering_error(con, "SELECT sum(count) FROM " + table),
+               Catch::Matchers::ContainsSubstring("distributed execution: an Iceberg table"));
+  }
+
   SECTION("a plan that carries its own byte ranges")
   {
     std::map<std::string, std::vector<sirius::planner::scan_byte_range>> ranges;

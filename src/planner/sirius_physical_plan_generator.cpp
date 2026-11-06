@@ -377,6 +377,12 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
                                  const sirius::operator_params& op_params,
                                  duckdb::ClientContext& context)
 {
+  // Some Iceberg declines (remote Puffin files, the deletion-vector route, delete-key ambiguity)
+  // are decided on this rank's share of the files, so ranks could take different routes.
+  if (op_params.distributed() && scan_op.function.GetName() == "iceberg_scan") {
+    throw sirius::not_implemented_exception(
+      "distributed execution: an Iceberg table; its deletes are not verified across ranks");
+  }
   populate_parquet_schema(out, scan_op, context);
   auto* info          = &out;
   info->table_filters = std::move(scan_op.table_filters);
