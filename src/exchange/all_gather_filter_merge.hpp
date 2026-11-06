@@ -40,12 +40,15 @@ class all_gather_filter_merge final : public op::cross_rank_filter_merge {
   struct options {
     std::shared_ptr<exchange_service> service;
     /// Admitted key i merges on stream first_stream + i, the same on every rank.
-    stream_id first_stream               = 0;
+    stream_id first_stream = 0;
+    /// Where this rank's contribution and the gathered filters are allocated; required.
     cucascade::memory::memory_space* gpu = nullptr;
     /// Every rank's Bloom is sized for this many keys.
     std::size_t bloom_keys = 0;
+    /// Shorter than all_gather's default: a late rank should cost the filter, not stall the build.
+    static constexpr std::chrono::milliseconds default_timeout{std::chrono::minutes{2}};
     /// A rank that has not sent its filter by then is given up on: the key publishes nothing.
-    std::chrono::milliseconds timeout{std::chrono::minutes{2}};
+    std::chrono::milliseconds timeout{default_timeout};
   };
 
   explicit all_gather_filter_merge(options options) : _options(std::move(options)) {}
