@@ -2652,18 +2652,25 @@ static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value
 
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto const value = UBigIntValue::Get(parameter);
+  if (value > std::numeric_limits<uint32_t>::max()) {
+    throw InvalidInputException("sirius_exchange_rank %llu does not fit 32 bits", value);
+  }
   auto* params    = get_operator_params(context, scope);
-  auto const rank = static_cast<uint32_t>(UBigIntValue::Get(parameter));
+  auto const rank = static_cast<uint32_t>(value);
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (auto* distributed = sirius_ctx ? sirius_ctx->distributed() : nullptr) {
     distributed->require_rank(rank);
   }
-  params->exchange_rank = rank;
   // Peers set first: connect now, during session setup, rather than inside the first
-  // distributed query, which would otherwise wait for every peer's process to reach it.
+  // distributed query, which would otherwise wait for every peer's process to reach it. The rank
+  // is kept only once that succeeds.
   if (sirius_ctx && sirius::planner::is_distributed(*params)) {
-    static_cast<void>(sirius_ctx->get_exchange_service(*params));
+    auto next          = *params;
+    next.exchange_rank = rank;
+    static_cast<void>(sirius_ctx->get_exchange_service(next));
   }
+  params->exchange_rank = rank;
 }
 
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)

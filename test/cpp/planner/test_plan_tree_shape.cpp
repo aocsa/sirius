@@ -532,6 +532,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   // Connecting, on SET or while planning, would listen on port 1, which needs root, and throw.
   REQUIRE_FALSE(con->Query("SET sirius_exchange_peers = '127.0.0.1:1'")->HasError());
   REQUIRE_FALSE(con->Query("SET sirius_exchange_rank = 0")->HasError());
+  // 2^32 + 1 would otherwise become rank 1.
+  auto const wide = con->Query("SET sirius_exchange_rank = 4294967297");
+  REQUIRE(wide->HasError());
+  CHECK_THAT(wide->GetError(), Catch::Matchers::ContainsSubstring("does not fit 32 bits"));
 
   // A DuckDB table, which a distributed query refuses to scan.
   auto plan = generate_sirius_plan(*con, "SELECT val FROM big_left WHERE id > 5");
