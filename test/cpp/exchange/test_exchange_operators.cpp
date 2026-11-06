@@ -861,6 +861,8 @@ TEST_CASE("a VALUES source keeps its rows on rank 0 alone", "[exchange][operator
         rows[r]             = sirius::get_cudf_table_view(batches.at(0)->to_read_only()).num_rows();
       } catch (std::exception const& e) {
         errors[r] = e.what();
+        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
+        c.all[r].service->abort(3, e.what());
       }
     });
   }
@@ -913,6 +915,8 @@ TEST_CASE("an ungrouped aggregate over rank 0's rows makes its row on rank 0 alo
         }
       } catch (std::exception const& e) {
         errors[r] = e.what();
+        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
+        c.all[r].service->abort(4, e.what());
       }
     });
   }
@@ -951,6 +955,8 @@ TEST_CASE("a partial result the exchange cannot carry is refused while planning"
         sirius::planner::distribute_plan(plan, c.all[r].service, *env().gpu, 6, lifecycle);
       } catch (sirius::not_implemented_exception const& e) {
         errors[r] = e.what();
+        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
+        c.all[r].service->abort(6, e.what());
       }
     });
   }
@@ -1033,6 +1039,8 @@ TEST_CASE("a join merging its filters across ranks gives each admitted key its o
         collect(*plan);
       } catch (std::exception const& e) {
         errors[r] = e.what();
+        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
+        c.all[r].service->abort(5, e.what());
       }
     });
   }
@@ -1109,6 +1117,8 @@ TEST_CASE("a right semi join's early build filter is removed and its publication
         sirius::planner::distribute_plan(plans[r], c.all[r].service, *env().gpu, 7, lifecycle);
       } catch (std::exception const& e) {
         errors[r] = e.what();
+        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
+        c.all[r].service->abort(7, e.what());
       }
     });
   }
