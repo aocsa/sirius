@@ -518,6 +518,24 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    */
   void merge_from(void const* words, std::size_t bytes, ::cuda::stream_ref stream);
 
+  /// Blocks in the source replica's bit storage.
+  [[nodiscard]] std::size_t block_count() const;
+
+  /**
+   * @brief Shrinks the filter to @p blocks blocks by ORing each run of block_count() / @p blocks
+   * neighbouring blocks into one. The result is exactly the filter of @p blocks blocks built from
+   * the same keys: a key's block is (hash * blocks) >> 32, so at a size that divides the current
+   * one it lands in the fold of its old block. Call before replicate_to_devices().
+   *
+   * @throw std::invalid_argument unless @p blocks is nonzero and divides block_count()
+   * @throw std::logic_error when this filter is on more than one GPU
+   */
+  void fold_to(std::size_t blocks, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr);
+
+  /// The source replica's bit storage, writable: for ORing other ranks' filters in place, before
+  /// replicate_to_devices().
+  [[nodiscard]] std::uint32_t* mutable_storage();
+
  private:
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
     cudf::column_view const& probe,
@@ -536,6 +554,12 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     membership_key_domain domain, std::unique_ptr<impl> completed);
   std::unique_ptr<impl> _impl;
 };
+
+/// ORs @p count words of @p from into @p into on @p stream: merging Blooms' bit storage.
+void bloom_or_words(std::uint32_t* into,
+                    std::uint32_t const* from,
+                    std::size_t count,
+                    ::cuda::stream_ref stream);
 
 class sirius_dynamic_filter_set;
 

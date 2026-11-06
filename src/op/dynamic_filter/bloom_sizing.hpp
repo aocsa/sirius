@@ -36,6 +36,9 @@ namespace sirius::op {
 inline constexpr std::size_t bloom_bits_per_block      = 256;  ///< One cuco Bloom filter block
 inline constexpr std::size_t bloom_bytes_per_block     = bloom_bits_per_block / 8;
 inline constexpr std::size_t bloom_target_bits_per_key = 16;
+/// Distributed: a merged Bloom with fewer bits per key than this (about 4% false positives) costs
+/// the merge and the probe more than it saves, so it is dropped.
+inline constexpr std::size_t bloom_min_bits_per_key = 8;
 
 static_assert(bloom_bits_per_block % bloom_target_bits_per_key == 0,
               "a block must hold a whole number of keys");
