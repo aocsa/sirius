@@ -605,6 +605,24 @@ TEST_CASE("all-gather gives every rank every rank's table, in rank order",
   }
 }
 
+TEST_CASE("a distributed SORT_SAMPLE retried after its all-gather failed fails at once",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  auto const stream = sirius::exchange::make_stream_id(9, 1);
+  sirius_physical_distributed_sort_sample sample(
+    *make_sample(),
+    sirius_physical_distributed_sort_sample::distributed_sampling{
+      c.all[0].service, stream, env().gpu, [](std::shared_ptr<cudf::table const>) {}});
+  // Rank 1 aborts the query instead of taking part.
+  c.all[1].service->abort(9, "injected failure");
+  pipelineable_operator_data data{{keys_batch(0, 1, 20'000)}};
+  CHECK_THROWS_WITH(sample.execute(data, utils::default_stream()),
+                    Catch::Matchers::ContainsSubstring("injected failure"));
+  CHECK_THROWS_WITH(sample.execute(data, utils::default_stream()),
+                    Catch::Matchers::ContainsSubstring("cannot be retried"));
+}
+
 TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every rank",
           "[exchange][collectives]")
 {

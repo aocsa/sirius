@@ -85,6 +85,8 @@ class sirius_physical_distributed_sort_sample : public sirius_physical_sort_samp
  private:
   distributed_sampling _sampling;
   std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _gathered;
+  //! This rank has entered the all-gather, whether or not it returned.
+  bool _gather_entered = false;
   std::vector<cudf::order> _column_order;
   std::vector<cudf::null_order> _null_precedence;
 };

@@ -22,6 +22,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -135,25 +136,32 @@ void sirius_physical_distributed_sort_sample::compute_boundaries(cudf::table_vie
   auto const world = _sampling.service->world_size();
   auto const rank  = _sampling.service->rank();
 
-  // 1. This rank's summary: up to distributed_summary_rows evenly spaced rows of its sample.
-  std::shared_ptr<::cucascade::data_batch> summary;
-  if (auto const rows = sample_keys.num_rows(); rows > 0) {
-    auto const take = std::min<std::size_t>(rows, distributed_summary_rows);
-    std::vector<int32_t> indices(take);
-    for (std::size_t i = 0; i < take; ++i) {
-      indices[i] = static_cast<int32_t>(i * static_cast<std::size_t>(rows) / take);
-    }
-    auto const column = index_column(indices, stream, mr);
-    summary           = make_data_batch(
-      cudf::gather(sample_keys, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr),
-      gpu,
-      stream,
-      batch_telemetry());
-  }
-
-  // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
-  // A retried task reuses the result: the peers have closed the all-gather's stream.
+  // A retried task reuses the gathered summaries: the peers have closed the all-gather's stream.
   if (!_gathered) {
+    // A gather that failed part way left the peers past it; a retry would wait out the timeout.
+    if (_gather_entered) {
+      throw sirius::internal_exception(
+        "[sort_sample] the boundary all-gather failed part way and cannot be retried");
+    }
+    // 1. This rank's summary: up to distributed_summary_rows evenly spaced rows of its sample.
+    std::shared_ptr<::cucascade::data_batch> summary;
+    if (auto const rows = sample_keys.num_rows(); rows > 0) {
+      auto const take = std::min<std::size_t>(rows, distributed_summary_rows);
+      std::vector<int32_t> indices(take);
+      for (std::size_t i = 0; i < take; ++i) {
+        indices[i] = static_cast<int32_t>(i * static_cast<std::size_t>(rows) / take);
+      }
+      auto const column = index_column(indices, stream, mr);
+      summary           = make_data_batch(
+        cudf::gather(
+          sample_keys, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr),
+        gpu,
+        stream,
+        batch_telemetry());
+    }
+
+    // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
+    _gather_entered = true;
     _gathered =
       exchange::all_gather(*_sampling.service, _sampling.stream, summary, gpu, stream.get());
   }
