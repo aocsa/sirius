@@ -95,8 +95,13 @@ void all_gather_filter_merge::merge(std::vector<op::key_filters>& per_key,
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[publish_dynamic_filters] key {}: filters not merged across ranks: {}", k, e.what());
-      membership.reset();
-      continue;
+      // A rank missing from this gather is missing from the later ones too: leave them at once
+      // (leave_rest) rather than wait out each one's timeout. This rank's Bloom alone would drop
+      // rows another rank's build matches, so those keys publish nothing.
+      for (auto j = k; j < per_key.size(); ++j) {
+        per_key[j].membership.reset();
+      }
+      return;
     }
     std::vector<std::uint32_t const*> others;
     bool mergeable = true;

@@ -398,6 +398,32 @@ TEST_CASE("a rank with no Bloom for a key does not wait for the others' filters"
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
 }
 
+TEST_CASE("a rank missing from one key's merge costs the others one timeout, not one per key",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  sirius::exchange::all_gather_filter_merge merge(
+    sirius::exchange::all_gather_filter_merge::options{.service      = c.all[0].service,
+                                                       .first_stream = 81,
+                                                       .gpu          = env().gpu,
+                                                       .bloom_keys   = 4096,
+                                                       .timeout      = std::chrono::seconds{1}});
+  auto const stream = utils::default_stream();
+  std::vector<sirius::op::key_filters> mine(2);
+  for (int k = 0; k < 2; ++k) {
+    auto const keys = numeric_column(cudf::data_type{cudf::type_id::INT64}, sequence(k, 2, 2000));
+    mine[k].membership = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+      keys->view(), 4096, stream, env().gpu->get_default_allocator());
+  }
+  // Rank 1 never takes part: rank 0 waits out key 0's gather, then leaves key 1's.
+  auto const start = std::chrono::steady_clock::now();
+  merge.merge(mine, stream);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds{1800});
+  // Either key's Bloom would miss rank 1's keys.
+  CHECK(mine[0].membership == nullptr);
+  CHECK(mine[1].membership == nullptr);
+}
+
 TEST_CASE("a join whose build ends empty leaves the filter merge before its probe ends",
           "[exchange][collectives][dynamic_filter]")
 {
