@@ -19,6 +19,7 @@
 #include "catch.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "planner/distributed_plan.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/table_filter_test_utils.hpp"
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using sirius::planner::byte_ranges_for_rank;
@@ -137,4 +139,61 @@ TEST_CASE("assign_files_to_rank selects files by file_index before splitting the
   auto const none = share(1, 7);
   CHECK(none->resolved_file_paths == std::vector<std::string>{files[1], files[2]});
   CHECK(none->resolved_file_indices == std::vector<std::size_t>{1, 2});
+}
+
+TEST_CASE("assign_files_to_rank takes this rank's share of a table's files",
+          "[exchange][byte_range]")
+{
+  using sirius::planner::assign_files_to_rank;
+  sirius::operator_params params;
+  auto const as_rank = [&](std::uint32_t rank, std::size_t world) {
+    params.exchange_peers = std::vector<std::string>(world, "127.0.0.1:1");
+    params.exchange_rank  = rank;
+  };
+
+  SECTION("one rank reads every file whole")
+  {
+    sirius::op::scan::parquet_ingestible_table_info info;
+    assign_files_to_rank(info, {"/a", "/b"}, params);
+    CHECK(info.resolved_file_paths == std::vector<std::string>{"/a", "/b"});
+    CHECK(info.resolved_file_ranges.empty());
+  }
+
+  SECTION("remote files are dealt whole, rank, rank + world, ...")
+  {
+    as_rank(1, 2);
+    sirius::op::scan::parquet_ingestible_table_info info;
+    assign_files_to_rank(info, {"s3://b/0", "s3://b/1", "s3://b/2", "s3://b/3"}, params);
+    CHECK(info.resolved_file_paths == std::vector<std::string>{"s3://b/1", "s3://b/3"});
+    CHECK(info.resolved_file_ranges.empty());
+  }
+
+  SECTION("a remote table needs a file per rank")
+  {
+    as_rank(0, 3);
+    sirius::op::scan::parquet_ingestible_table_info info;
+    CHECK_THROWS_AS(assign_files_to_rank(info, {"s3://b/0", "s3://b/1"}, params),
+                    sirius::not_implemented_exception);
+  }
+
+  SECTION("local files are split by byte range, and a rank may get none")
+  {
+    sirius::test::scratch_dir scratch{"assign_files_to_rank"};
+    auto const file = (scratch.path() / "two_bytes").string();
+    std::ofstream(file) << "xy";
+    // 2 bytes over 3 ranks: rank 0's span is empty, ranks 1 and 2 get a byte each.
+    for (std::uint32_t rank = 0; rank < 3; ++rank) {
+      as_rank(rank, 3);
+      sirius::op::scan::parquet_ingestible_table_info info;
+      assign_files_to_rank(info, {file}, params);
+      if (rank == 0) {
+        CHECK(info.resolved_file_paths.empty());
+      } else {
+        CHECK(info.resolved_file_paths == std::vector<std::string>{file});
+        REQUIRE(info.resolved_file_ranges.size() == 1);
+        CHECK(info.resolved_file_ranges[0] ==
+              std::vector<std::pair<std::uint64_t, std::uint64_t>>{{rank - 1, 1}});
+      }
+    }
+  }
 }
