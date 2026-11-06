@@ -25,8 +25,6 @@
 #include "sirius/exception.hpp"
 #include "utils/sirius_test_env.hpp"
 
-#include <cudf/copying.hpp>
-
 #include <arpa/inet.h>
 #include <duckdb.hpp>
 #include <netinet/in.h>
@@ -82,11 +80,13 @@ void barrier(nixl_rank& r, stream_id barrier)
     r.t->close(barrier, to);
   }
   REQUIRE(r.got.wait_for([&] {
+    if (r.got.error) { return true; }
     for (rank_t from = 0; from < r.t->world_size(); ++from) {
       if (!r.got.ended.contains({from, barrier})) { return false; }
     }
     return true;
   }));
+  REQUIRE_FALSE(r.got.error);
 }
 
 /// A free port below the ephemeral range: an ephemeral one could be taken as the source port of
@@ -115,6 +115,17 @@ nixl_fabric::host_staging staging_from_env()
 {
   auto const* value = std::getenv("SIRIUS_EXCHANGE_HOST_STAGING");
   return sirius::exchange::parse_host_staging(value != nullptr ? value : "auto");
+}
+
+/// Two distinct free_port()s as 127.0.0.1 addresses: the second is redrawn while it matches.
+std::vector<std::string> two_free_peers()
+{
+  int const first = free_port();
+  int second      = free_port();
+  while (second == first) {
+    second = free_port();
+  }
+  return {"127.0.0.1:" + std::to_string(first), "127.0.0.1:" + std::to_string(second)};
 }
 
 /// Records what one stream's receiver is handed into @p got.
@@ -147,9 +158,8 @@ struct recording_inbound : sirius::exchange::inbound {
 std::pair<std::unique_ptr<nixl_rank>, std::unique_ptr<nixl_rank>> two_ranks(
   nixl_fabric::host_staging staging)
 {
-  std::vector<std::string> const peers{"127.0.0.1:" + std::to_string(free_port()),
-                                       "127.0.0.1:" + std::to_string(free_port())};
-  auto config = [&](rank_t rank) {
+  auto const peers = two_free_peers();
+  auto config      = [&](rank_t rank) {
     nixl_fabric::config cfg{rank, peers};
     cfg.staging = staging;
     return cfg;
@@ -208,8 +218,7 @@ TEST_CASE("two ranks in one process exchange batches through host staging", "[ex
 
 TEST_CASE("a fabric that cannot reach its peer leaves nothing in /dev/shm", "[exchange][nixl]")
 {
-  nixl_fabric::config cfg{
-    0, {"127.0.0.1:" + std::to_string(free_port()), "127.0.0.1:" + std::to_string(free_port())}};
+  nixl_fabric::config cfg{0, two_free_peers()};
   cfg.connect_timeout = std::chrono::milliseconds{500};
   cfg.staging         = nixl_fabric::host_staging::always;
   frame_ring send(4, 64 * KiB);
@@ -260,8 +269,7 @@ TEST_CASE(
 TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "[exchange][nixl]")
 {
   using sirius::exchange::exchange_service;
-  std::vector<std::string> const peers{"127.0.0.1:" + std::to_string(free_port()),
-                                       "127.0.0.1:" + std::to_string(free_port())};
+  auto const peers = two_free_peers();
   sirius::exchange::nixl_exchange_options const opts{
     .frame_bytes = 64 * KiB, .send_frames = 4, .recv_frames_per_peer = 4};
   // Each waits for the other's hello.
@@ -313,10 +321,10 @@ TEST_CASE("a connected process keeps its exchange peers and rank",
 {
   auto const cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                    "minimal.yaml";
-  auto const peers =
-    "127.0.0.1:" + std::to_string(free_port()) + ",127.0.0.1:" + std::to_string(free_port());
-  auto db0 = sirius::test::open_sirius_db(nullptr, cfg);
-  auto db1 = sirius::test::open_sirius_db(nullptr, cfg);
+  auto const two   = two_free_peers();
+  auto const peers = two[0] + "," + two[1];
+  auto db0         = sirius::test::open_sirius_db(nullptr, cfg);
+  auto db1         = sirius::test::open_sirius_db(nullptr, cfg);
   duckdb::Connection c0(*db0);
   duckdb::Connection c1(*db1);
   REQUIRE_FALSE(c0.Query("SET sirius_exchange_peers = '" + peers + "'")->HasError());
@@ -363,7 +371,7 @@ TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multipro
   cfg.staging      = staging_from_env();
 
   // 1 MiB frames; batches of about 7 MiB take several.
-  nixl_rank r(cfg, KiB * KiB);
+  nixl_rank r(cfg, MiB);
   r.start();
   send_all(*r.t, {1, 2}, 3, 200'000);
   check_all(r.got, cfg.rank, world, {1, 2}, 3, 200'000);
@@ -387,8 +395,9 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   }
   cfg.staging      = staging_from_env();
   auto const world = static_cast<rank_t>(cfg.peers.size());
-  frame_ring send(16, 8 * KiB * KiB);
-  frame_ring recv(8 * (world - 1), 8 * KiB * KiB);
+  sirius::exchange::nixl_exchange_options const ring_opts{};
+  frame_ring send(ring_opts.send_frames, ring_opts.frame_bytes);
+  frame_ring recv(ring_opts.recv_frames_per_peer * (world - 1), ring_opts.frame_bytes);
   nixl_fabric fab(cfg, send, recv);
 
   std::mutex mutex;
@@ -417,22 +426,30 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
                  std::lock_guard lock{mutex};
                  error = e;
                  changed.notify_all();
+               },
+               [&](std::uint64_t, rank_t, std::string what) {
+                 std::lock_guard lock{mutex};
+                 error = std::make_exception_ptr(std::runtime_error(what));
+                 changed.notify_all();
                }},
               // The test GPU space holds 1 GiB: keep queued batches well inside it.
-              transport::options{.max_queued_bytes = std::size_t{256} << 20});
+              transport::options{.max_queued_bytes = 256 * MiB});
 
   // About 38 MB per batch (the test GPU space is small); 96 batches to each peer.
-  auto const table    = sample_table(1'000'000);
+  auto table          = sample_table(1'000'000);
   std::size_t batch_b = 0;
   for (cudf::size_type c = 0; c < table->num_columns(); ++c) {
     batch_b += table->get_column(c).alloc_size();
   }
+  // Sent to every peer, every time: the transport only reads it, and the timing then leaves out
+  // building batches.
+  auto const batch   = gpu_batch(std::move(table));
   int const per_peer = 96;
   auto const start   = std::chrono::steady_clock::now();
   for (int i = 0; i < per_peer; ++i) {
     for (rank_t to = 0; to < world; ++to) {
       if (to == cfg.rank) { continue; }
-      t.send(1, to, gpu_batch(std::make_unique<cudf::table>(*table)));
+      t.send(1, to, batch);
     }
   }
   for (rank_t to = 0; to < world; ++to) {
@@ -460,5 +477,7 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
     t.close(99, to);
   }
   std::unique_lock lock{mutex};
-  REQUIRE(changed.wait_for(lock, std::chrono::minutes{2}, [&] { return ended[99] == world; }));
+  REQUIRE(changed.wait_for(
+    lock, std::chrono::minutes{2}, [&] { return error != nullptr || ended[99] == world; }));
+  REQUIRE_FALSE(error);
 }
