@@ -154,7 +154,13 @@ void distributed_session::abort(query_id_t window, std::exception_ptr const& err
     }
     SIRIUS_LOG_WARN("Distributed query {} failed; aborting it on every rank: {}", query, what);
     service->abort(query, what);
-  } catch (...) {  // best effort: the peers' own timeouts remain
+  } catch (std::exception const& e) {  // best effort: the peers' own timeouts remain
+    try {
+      SIRIUS_LOG_WARN(
+        "Aborting distributed window {} on the other ranks failed: {}", value_of(window), e.what());
+    } catch (...) {
+    }
+  } catch (...) {
   }
 }
 
