@@ -202,10 +202,12 @@ struct rewriter {
       shape += "f";
       return;
     }
-    // One stream per admitted key: key k merges on first + k. The keys are fixed while planning,
-    // so every rank reserves the same streams.
+    // One stream for the merge's header round, then one per admitted key for its ring: key k
+    // merges on first + 1 + k. The keys are fixed while planning, so every rank reserves the same
+    // streams.
     auto const first = exchange::make_stream_id(query, next_stream);
-    next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
+    next_stream +=
+      1 + static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
     join.set_distributed_dynamic_filters(
       {.service      = service,
        .first_stream = first,
