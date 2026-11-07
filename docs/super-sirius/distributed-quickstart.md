@@ -62,6 +62,10 @@ sirius:
       networks: 10.87.140.0/24  # each rank's listen and exchange address
       quack_port: 9500          # rank i: 9500 + i
       exchange_port: 27000      # rank i: 27000 + i
+    exchange:                   # the gateway gives every rank these
+      host_staging: auto        # auto: TCP lanes to ranks on other hosts
+      tcp_lanes: 0              # 0: 16 shared by the ranks of a host
+      recv_frames_per_peer: 0   # 0: 16 with ranks on several hosts, else 8
     ucx:
       tls: cuda_copy,cuda_ipc,tcp,self
       # net_devices: bond0      # default: the interface that holds the rank's address
@@ -84,6 +88,9 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |
+| `exchange.host_staging` | `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` | `auto` | `sirius_gateway_exchange_host_staging`, which the gateway sets as `sirius_exchange_host_staging` on every rank. `auto` reaches ranks on other hosts over TCP lanes |
+| `exchange.tcp_lanes` | `SIRIUS_GATEWAY_EXCHANGE_TCP_LANES` | 0 | `sirius_gateway_exchange_tcp_lanes`: TCP lanes per rank, at most 64. 0 shares 16 among the ranks of a host, at least 2 each |
+| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 0 | `sirius_gateway_exchange_recv_frames_per_peer`: 8 MiB frames a peer may have in flight to a rank. 0 is 16 with ranks on several hosts, else 8 |
 | `ucx.tls` | `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self` | UCX transports; the default is `scripts/launcher_env.sh`'s |
 | `ucx.net_devices` | `UCX_NET_DEVICES` | the interface of the rank's address | UCX devices, for example `mlx5_0:1` |
 

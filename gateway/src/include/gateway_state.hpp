@@ -37,6 +37,12 @@ struct start_options {
   std::string sirius_extension;
   /// SQL every rank's session runs after the exchange settings.
   std::string rank_init;
+  /// The exchange settings every rank takes before it connects (`sirius_gateway_exchange_*`).
+  /// recv_frames_per_peer 0: 16 when the ranks are on several hosts, which keeps every TCP lane
+  /// busy, else 8.
+  std::string host_staging      = "auto";
+  uint32_t tcp_lanes            = 0;
+  uint32_t recv_frames_per_peer = 0;
   std::string log_dir;
   /// How a registered rank names its process, whether that process already joined a set of
   /// ranks, and how it is asked to exit for its launcher to restart it

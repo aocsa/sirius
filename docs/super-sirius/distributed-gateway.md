@@ -216,7 +216,10 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 |---|---|---|
 | `sirius_gateway_duckdb_binary` | | DuckDB that runs each spawned rank |
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
-| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings |
+| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings, so it cannot change them |
+| `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (TCP lanes to ranks on other hosts), `always`, `never` or `remote` |
+| `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank; 0 shares 16 lanes among the ranks of a host |
+| `sirius_gateway_exchange_recv_frames_per_peer` | 0 | `sirius_exchange_recv_frames_per_peer` for every rank; 0 is 16 when the ranks are on several hosts (one frame in flight per lane), else 8 |
 | `sirius_gateway_log_dir` | temporary | Rank init files and logs |
 | `sirius_gateway_allow_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
 | `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them |

@@ -24,6 +24,12 @@ KEYS = {
     ("node", "networks"): "SIRIUS_NODE_NETWORKS",
     ("node", "quack_port"): "SIRIUS_NODE_QUACK_PORT",
     ("node", "exchange_port"): "SIRIUS_NODE_EXCHANGE_PORT",
+    ("exchange", "host_staging"): "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING",
+    ("exchange", "tcp_lanes"): "SIRIUS_GATEWAY_EXCHANGE_TCP_LANES",
+    (
+        "exchange",
+        "recv_frames_per_peer",
+    ): "SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER",
     ("ucx", "tls"): "UCX_TLS",
     ("ucx", "net_devices"): "UCX_NET_DEVICES",
 }

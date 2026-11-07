@@ -23,6 +23,17 @@ struct gateway_info : TableFunctionInfo {
   std::shared_ptr<gateway_state> state;
 };
 
+/// Refuses a value no rank takes, at SET rather than when the ranks start.
+void check_host_staging(ClientContext&, SetScope, Value& parameter)
+{
+  auto const value = StringValue::Get(parameter);
+  if (value != "auto" && value != "always" && value != "never" && value != "remote") {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_host_staging must be auto, always, never or remote, not '%s'",
+      value);
+  }
+}
+
 gateway_state& gateway_of(TableFunctionBindInput& input)
 {
   return *input.info->Cast<gateway_info>().state;
@@ -382,6 +393,22 @@ void LoadInternal(ExtensionLoader& loader)
                             "SQL each rank's session runs after the exchange settings",
                             LogicalType::VARCHAR,
                             Value(""));
+  config.AddExtensionOption("sirius_gateway_exchange_host_staging",
+                            "sirius_exchange_host_staging for every rank: auto (TCP lanes to "
+                            "other hosts), always, never or remote",
+                            LogicalType::VARCHAR,
+                            Value("auto"),
+                            check_host_staging);
+  config.AddExtensionOption("sirius_gateway_exchange_tcp_lanes",
+                            "sirius_exchange_tcp_lanes for every rank: TCP lanes per rank to "
+                            "other hosts; 0 shares 16 among the ranks of a host",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0));
+  config.AddExtensionOption("sirius_gateway_exchange_recv_frames_per_peer",
+                            "sirius_exchange_recv_frames_per_peer for every rank; 0 is 16 when "
+                            "the ranks are on several hosts, else 8",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0));
   config.AddExtensionOption("sirius_gateway_log_dir",
                             "Directory for rank init files and logs; empty uses a temporary one",
                             LogicalType::VARCHAR,
