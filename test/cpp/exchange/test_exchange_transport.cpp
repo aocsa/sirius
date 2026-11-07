@@ -579,13 +579,15 @@ TEST_CASE("a malformed notification from a peer fails the receiver", "[exchange]
   }
 }
 
-TEST_CASE("sirius_exchange_host_staging takes auto, always or never", "[exchange][transport]")
+TEST_CASE("sirius_exchange_host_staging takes auto, always, never or remote",
+          "[exchange][transport]")
 {
   using sirius::exchange::host_staging;
   using sirius::exchange::parse_host_staging;
   CHECK(parse_host_staging("auto") == host_staging::automatic);
   CHECK(parse_host_staging("always") == host_staging::always);
   CHECK(parse_host_staging("never") == host_staging::never);
+  CHECK(parse_host_staging("remote") == host_staging::remote);
   CHECK_THROWS_AS(parse_host_staging(""), sirius::invalid_input_exception);
   CHECK_THROWS_AS(parse_host_staging("Always"), sirius::invalid_input_exception);
 }

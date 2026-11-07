@@ -33,8 +33,9 @@ host_staging parse_host_staging(std::string_view value)
   if (value == "auto") { return host_staging::automatic; }
   if (value == "always") { return host_staging::always; }
   if (value == "never") { return host_staging::never; }
+  if (value == "remote") { return host_staging::remote; }
   throw sirius::invalid_input_exception(
-    "sirius_exchange_host_staging must be auto, always or never, not '{}'", value);
+    "sirius_exchange_host_staging must be auto, always, never or remote, not '{}'", value);
 }
 
 std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
@@ -65,6 +66,7 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
   b->recv = std::make_unique<frame_ring>(opts.recv_frames_per_peer * peer_count, opts.frame_bytes);
   nixl_fabric::config cfg{rank, std::move(peers)};
   cfg.staging = opts.staging;
+  cfg.lanes   = opts.tcp_lanes;
   b->fabric   = std::make_unique<nixl_fabric>(std::move(cfg), *b->send, *b->recv);
   b->service  = std::make_unique<exchange_service>(
     *b->fabric, *b->send, *b->recv, gpu, host, std::move(opts.transport_options));

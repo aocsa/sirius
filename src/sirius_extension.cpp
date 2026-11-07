@@ -2699,6 +2699,29 @@ static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value
     sirius::exchange::parse_host_staging(StringValue::Get(parameter));
 }
 
+static void SetExchangeTcpLanes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const lanes = UBigIntValue::Get(parameter);
+  if (lanes > sirius::exchange::max_tcp_lanes) {
+    throw InvalidInputException("sirius_exchange_tcp_lanes must be 0 (automatic) to %u, not %llu",
+                                sirius::exchange::max_tcp_lanes,
+                                lanes);
+  }
+  get_operator_params(context, scope)->exchange_tcp_lanes = static_cast<uint32_t>(lanes);
+}
+
+static void SetExchangeRecvFramesPerPeer(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const frames = UBigIntValue::Get(parameter);
+  if (frames == 0 || frames > sirius::exchange::max_recv_frames_per_peer) {
+    throw InvalidInputException("sirius_exchange_recv_frames_per_peer must be 1 to %u, not %llu",
+                                sirius::exchange::max_recv_frames_per_peer,
+                                frames);
+  }
+  get_operator_params(context, scope)->exchange_recv_frames_per_peer =
+    static_cast<uint32_t>(frames);
+}
+
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const rank = UBigIntValue::Get(parameter);
@@ -3559,12 +3582,28 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetExchangeRank);
   config.AddExtensionOption(
     "sirius_exchange_host_staging",
-    "Distributed execution: auto, always or never send the exchange's writes to a peer through "
-    "its pinned host mirror instead of NIXL; auto does so where GPUs lack peer access. Set "
-    "before sirius_exchange_rank, which connects",
+    "Distributed execution: how the exchange's writes reach a peer. auto: over TCP lanes to "
+    "ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without "
+    "peer access; always: the mirror for every same-host peer; never: NIXL to every peer; "
+    "remote: TCP lanes to every peer. Same on every rank; set before sirius_exchange_rank, "
+    "which connects",
     LogicalType::VARCHAR,
     Value("auto"),
     SetExchangeHostStaging);
+  config.AddExtensionOption(
+    "sirius_exchange_tcp_lanes",
+    "Distributed execution: TCP lanes (connections, each with its own thread) per rank to ranks "
+    "on other hosts; 0 shares 16 among the ranks on this host. Set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(0),
+    SetExchangeTcpLanes);
+  config.AddExtensionOption(
+    "sirius_exchange_recv_frames_per_peer",
+    "Distributed execution: 8 MiB receive frames each peer may have in flight to this rank; a "
+    "TCP lane carries one. Same on every rank; set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(8),
+    SetExchangeRecvFramesPerPeer);
   config.AddExtensionOption("sirius_distributed_query_id",
                             "Distributed execution: number of the next distributed query, set by "
                             "a gateway; must increase. 0 numbers queries per process",

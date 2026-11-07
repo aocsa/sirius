@@ -1351,7 +1351,9 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
       auto* gpu    = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
       auto* host   = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
       sirius::exchange::nixl_exchange_options opts;
-      opts.staging = params.exchange_host_staging;
+      opts.staging              = params.exchange_host_staging;
+      opts.tcp_lanes            = params.exchange_tcp_lanes;
+      opts.recv_frames_per_peer = params.exchange_recv_frames_per_peer;
       // A batch with no room asks the GPU's downgrade executor for it, as a task would.
       // terminate() shuts the exchange down before the executors go.
       opts.transport_options.request_room = [&downgrade = get_downgrade_executor(gpu->get_id()),

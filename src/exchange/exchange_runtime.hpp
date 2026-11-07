@@ -34,7 +34,12 @@ namespace sirius::exchange {
 
 class exchange_service;
 
-/// "auto", "always" or "never", as the sirius_exchange_host_staging setting takes it.
+/// The most TCP lanes a rank may have.
+constexpr std::uint32_t max_tcp_lanes = 64;
+/// The most receive frames per peer.
+constexpr std::uint32_t max_recv_frames_per_peer = 256;
+
+/// "auto", "always", "never" or "remote", as the sirius_exchange_host_staging setting takes it.
 /// @throws sirius::invalid_input_exception on any other value.
 [[nodiscard]] host_staging parse_host_staging(std::string_view value);
 
@@ -43,10 +48,14 @@ class exchange_service;
 /// keep NIXL writes large enough to reach link bandwidth. The sizing is fixed until credits are
 /// granted on demand (#2371).
 struct nixl_exchange_options {
-  std::size_t frame_bytes            = std::size_t{8} * 1024 * 1024;  // 8 MiB
-  std::uint32_t send_frames          = 16;
+  std::size_t frame_bytes   = std::size_t{8} * 1024 * 1024;  // 8 MiB
+  std::uint32_t send_frames = 16;
+  /// The frames a peer may have in flight to this rank. Over TCP lanes a peer keeps one frame per
+  /// lane in flight, so fewer frames than lanes leave lanes idle.
   std::uint32_t recv_frames_per_peer = 8;
   host_staging staging               = host_staging::automatic;
+  /// TCP lanes per rank (at most max_tcp_lanes); 0 shares 16 among the ranks on this host.
+  std::uint32_t tcp_lanes = 0;
   transport::options transport_options;
 };
 
