@@ -142,6 +142,33 @@ SET gpu_execution = false;
 set on every rank by the gateway
 
 statement error con2
+SET sirius_exchange_host_staging = 'always';
+----
+set on every rank by the gateway
+
+# A client's transaction stays in its own gateway session; the shared rank sessions never see it.
+query I
+SELECT sirius_gateway_route('', 'BEGIN TRANSACTION; SELECT 1; COMMIT') = 'BEGIN TRANSACTION;' || chr(10) || 'FROM sirius_gateway_run(''SELECT 1'');' || chr(10) || 'COMMIT;' || chr(10);
+----
+true
+
+statement ok con2
+BEGIN TRANSACTION;
+
+query I con2
+FROM v;
+----
+42
+
+statement ok con2
+COMMIT;
+
+statement error con2
+PREPARE p AS SELECT 1;
+----
+not supported through the gateway
+
+statement error con2
 FROM sirius_gateway_stop();
 ----
 gateway's console

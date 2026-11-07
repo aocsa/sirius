@@ -19,9 +19,10 @@ using namespace duckdb;
 namespace {
 
 /// Set on each rank by the gateway; a client changing one would desynchronize the ranks.
-constexpr std::array<char const*, 5> rank_settings{"sirius_distributed_query_id",
+constexpr std::array<char const*, 6> rank_settings{"sirius_distributed_query_id",
                                                    "sirius_exchange_peers",
                                                    "sirius_exchange_rank",
+                                                   "sirius_exchange_host_staging",
                                                    "enable_duckdb_fallback",
                                                    "gpu_execution"};
 
@@ -59,6 +60,16 @@ std::vector<std::string> called_functions(SQLStatement& stmt)
 /// Whether @p stmt runs on the gateway rather than on every rank.
 bool runs_on_gateway(SQLStatement& stmt)
 {
+  // Every client shares one session per rank, so a client's transaction there would hold every
+  // other client's statements. It stays in the client's own gateway session instead; each
+  // statement still commits on the ranks as it runs.
+  if (stmt.type == StatementType::TRANSACTION_STATEMENT) { return true; }
+  // A prepared plan keeps the distributed query number it was planned with, which the gateway
+  // does not track across statements.
+  if (stmt.type == StatementType::PREPARE_STATEMENT ||
+      stmt.type == StatementType::EXECUTE_STATEMENT) {
+    throw InvalidInputException("PREPARE and EXECUTE are not supported through the gateway");
+  }
   if (stmt.type == StatementType::SET_STATEMENT) {
     auto const name = StringUtil::Lower(stmt.Cast<SetStatement>().name.GetIdentifierName());
     for (auto const* owned : rank_settings) {
@@ -93,8 +104,8 @@ std::string route(std::string const& sql)
   }
   std::string routed;
   for (auto& stmt : parser.statements) {
-    auto const& at = stmt->stmt_location;
-    auto text      = at.offset < sql.size() ? sql.substr(at.offset, at.length) : stmt->query;
+    // The parser leaves each statement's own text in query (and its location at 0).
+    auto text = stmt->query;
     StringUtil::RTrim(text, ";\n\t ");
     routed += runs_on_gateway(*stmt)
                 ? text
