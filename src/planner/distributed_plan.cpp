@@ -22,6 +22,10 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/wire.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/distributed/bloom_all_gather_merge.hpp"
+#include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
+#include "op/scan/parquet_scan_types.hpp"
+#include "op/scan/scan_plan.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
@@ -31,9 +35,14 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_sort_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/gpu_admission.hpp"
+#include "planner/substrait_scan_ranges.hpp"
 #include "sirius/exception.hpp"
+#include "sirius_config.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -44,6 +53,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -197,7 +207,10 @@ struct rewriter {
   {
     if (!join.publishes_dynamic_filters()) { return; }
     auto const build_rows = join.children[1]->estimated_cardinality;
-    if (build_rows < min_merged_build_rows) {
+    // A right semi or anti join publishes before its probe side drains; a merge would make that
+    // wait on every rank's build.
+    if (build_rows < min_merged_build_rows || join.join_type == duckdb::JoinType::RIGHT_SEMI ||
+        join.join_type == duckdb::JoinType::RIGHT_ANTI) {
       join.cancel_dynamic_filter_publication();
       shape += "f";
       return;
@@ -206,11 +219,10 @@ struct rewriter {
     // so every rank reserves the same streams.
     auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
-    join.set_distributed_dynamic_filters(
-      {.service      = service,
-       .first_stream = first,
-       .gpu          = gpu,
-       .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
+    install_filter_merge(join,
+                         std::make_shared<op::bloom_all_gather_merge>(
+                           service, first, join.dynamic_filter_plan().admitted_keys().size(), *gpu),
+                         std::clamp(build_rows, min_bloom_keys, max_bloom_keys));
     shape += "F";
   }
 
@@ -238,6 +250,12 @@ struct rewriter {
         auto& build       = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
         auto const world  = static_cast<std::uint64_t>(service->world_size());
         auto const bbytes = estimated_bytes(*build.children[0]);
+        // A BUILD_FILTER (right semi and anti joins only, which publish nothing distributed)
+        // would publish this rank's keys alone, before the exchange: it goes.
+        if (build.children[0]->type == T::BUILD_FILTER) {
+          auto input        = std::move(build.children[0]->children[0]);
+          build.children[0] = std::move(input);
+        }
         if (emits_build_rows_only_with_probe(join.join_type) &&
             bbytes <= max_broadcast_build_bytes &&
             bbytes <= estimated_bytes(*probe.children[0]) / std::max<std::uint64_t>(world - 1, 1)) {
@@ -409,9 +427,15 @@ struct rewriter {
           spec.null_precedence.push_back(op::to_cudf_null_order(o.type, o.null_order));
         }
         auto* sink = &insert(partition.children[0], std::move(spec), false);
-        sample.set_distributed({service, stream(), gpu, [sink](auto boundaries) {
-                                  sink->set_range_boundaries(std::move(boundaries));
-                                }});
+        // The sample, now below the sink, becomes one that gathers every rank's sample.
+        // SORT_PARTITION reads its boundaries through a pointer to it, so that follows.
+        auto& slot       = sink->children[0];
+        auto distributed = op::sirius_physical_distributed_sort_sample::from(
+          sample, {service, stream(), gpu, [sink](auto boundaries) {
+                     sink->set_range_boundaries(std::move(boundaries));
+                   }});
+        partition.Cast<op::sirius_physical_sort_partition>().set_sample_op(distributed.get());
+        slot = std::move(distributed);
         return done(placement::ranged);
       }
 
@@ -516,4 +540,90 @@ std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const>
   return mine;
 }
 
+void assign_files_to_rank(op::scan::parquet_ingestible_table_info& info,
+                          std::vector<std::string> files,
+                          operator_params const& op_params)
+{
+  if (!op_params.distributed()) {
+    info.resolved_file_paths = std::move(files);
+    return;
+  }
+  // A rank numbers the files of its own share from 0, so their index and a filter on their name
+  // would mean different files on different ranks.
+  using kind              = op::scan::scan_plan::parquet_virtual_column_kind;
+  auto const names_a_file = [&](auto const& column) {
+    return column.HasPrimaryIndex() &&
+           std::any_of(
+             info.virtual_columns.begin(), info.virtual_columns.end(), [&](auto const& v) {
+               return v.column_id == column.GetPrimaryIndex() &&
+                      (v.kind == kind::FILENAME || v.kind == kind::FILE_INDEX);
+             });
+  };
+  if (std::any_of(info.column_ids.begin(), info.column_ids.end(), names_a_file)) {
+    throw sirius::not_implemented_exception(
+      "distributed execution: filename or file_index of a table split across ranks");
+  }
+  auto const world  = op_params.exchange_peers.size();
+  auto const rank   = op_params.exchange_rank;
+  auto const remote = std::any_of(
+    files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
+  if (remote) {
+    // TODO(#2377): split remote files by byte range too, as local ones are.
+    if (files.size() < world) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
+        "Split it into at least {} files, or read it from local files, which split by byte range",
+        files.size(),
+        world,
+        world);
+    }
+    for (std::size_t i = rank; i < files.size(); i += world) {
+      info.resolved_file_paths.push_back(std::move(files[i]));
+    }
+    return;
+  }
+  std::vector<std::uint64_t> bytes;
+  bytes.reserve(files.size());
+  for (auto const& f : files) {
+    bytes.push_back(std::filesystem::file_size(f));
+  }
+  for (auto const& r : byte_ranges_for_rank(bytes, rank, world)) {
+    info.resolved_file_paths.push_back(std::move(files[r.file]));
+    info.resolved_file_ranges.push_back({{r.start, r.length}});
+  }
+}
+
+void check_distributed_scan(op::sirius_physical_table_scan const& scan,
+                            connector const& source,
+                            duckdb::ClientContext& context)
+{
+  // Nothing splits a DuckDB table by rank: every rank would scan all of it.
+  if (source.kind == op::scan::source_kind::duckdb_native) {
+    throw sirius::not_implemented_exception(
+      "distributed execution: a DuckDB table; read the table from Parquet files instead");
+  }
+  // One URI, expanded only when read: nothing splits it, so every rank would read all of it.
+  if (scan.function.GetName() == "sirius_read_parquet") {
+    throw sirius::not_implemented_exception(
+      "distributed execution: read_parquet of one remote URI; every rank would read all of it");
+  }
+  // The plan's own ranges would replace this rank's share (lower_parquet_scan attaches them).
+  if (source.lower == &lower_parquet_scan && context.registered_state &&
+      context.registered_state->Get<scan_byte_ranges_state>(scan_byte_ranges_state::kStateKey)) {
+    throw sirius::not_implemented_exception(
+      "distributed execution: a plan that carries its own byte ranges");
+  }
+}
+
+void install_filter_merge(op::sirius_physical_hash_join& join,
+                          std::shared_ptr<op::cross_rank_filter_merge> merge,
+                          std::size_t bloom_keys)
+{
+  join.dynamic_filter_session().set_cross_rank_merge(
+    std::move(merge), op::merged_bloom_policy(join.dynamic_filter_plan().policy(), bloom_keys));
+  // finish_input() never waits: a publication not yet started leaves each key's merge, and one
+  // already running completes on its own.
+  join.children[1]->add_finalize_listener(
+    [&session = join.dynamic_filter_session()] { session.finish_input(); });
+}
 }  // namespace sirius::planner

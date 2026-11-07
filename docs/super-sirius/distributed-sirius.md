@@ -171,7 +171,8 @@ arrived. It is used three ways:
   sorted sample, and every rank merges them all in rank order. From the same global sample each
   rank derives the same world − 1 range boundaries for the exchange after it, and its own
   `SORT_PARTITION` boundaries from inside its range. A rank with no input still runs its boundary
-  task (`runs_without_input()`), since the others wait for it.
+  task (`runs_without_input()`), since the others wait for it. `distribute_plan()` puts
+  `sirius_physical_distributed_sort_sample` in its place, which overrides `make_boundaries()`.
 - **The plan-shape check** (below).
 - **The Bloom merge** (below).
 
@@ -240,7 +241,8 @@ Running such an operator on each rank's share would return a wrong answer.
 
 After a join's exchange, a rank's build holds only its share of the keys, so a filter from it
 alone would drop rows another rank's build matches. In distributed mode a publishing join
-carries a `distributed_merge`. Every rank then:
+carries a `cross_rank_filter_merge` (`bloom_all_gather_merge` in `src/op/distributed/`) and a
+publication policy every rank shares (`merged_bloom_policy`). Every rank then:
 
 1. builds a Bloom of one size for each key, from the plan's build estimate clamped to
    [2^16, 2^30] keys;
@@ -254,14 +256,19 @@ A build split into several partitions accumulates its Bloom from every batch ins
 it the same way, at the same size, so a rank on either path merges with the others.
 `max_dynamic_filter_bloom_bytes_per_gpu` does not cut a distributed Bloom: the merged filter holds
 every rank's keys, and one cut far below them passes almost every probe row. Right semi and anti joins plan no
-BUILD_FILTER stage in distributed mode, so they publish nothing.
+BUILD_FILTER stage in distributed mode (`distribute_plan()` removes it), so they publish nothing.
 
 A rank with an empty build still merges, contributing an empty Bloom. A rank
 that never saw a whole build joins each key's all-gather without a filter, so the others drop
 that key at once instead of waiting out the timeout. It does so as soon as its build side ends
-(the build `CONCAT` closes the join's publication), before its probe side runs, and without
+(a finalize listener on the build `CONCAT` closes the join's publication), before its probe side runs, and without
 waiting (`leave_all_gather`): a rank holding build rows holds its probe side until the merge
 completes, and that probe side may be what the other rank's probe waits on.
+
+These rules are the publication policy that `merged_bloom_policy()` gives a merged join:
+`bloom_only` (no IN-lists), `fixed_bloom_keys` (every rank's Bloom has the same size, uncapped) and
+`publish_when_empty_or_drained` (an empty build or drained targets still take part). With one
+rank, all three keep their defaults and the publisher behaves as on one GPU.
 
 A join whose build is broadcast publishes from its whole build, as on one GPU, with nothing to
 merge. A join that hashes both sides and whose estimated build is under 2^14 rows publishes no
@@ -388,8 +395,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/exchange/transport.*`, `messages.*` | Credits, landing, end of stream, failure |
 | `src/exchange/fabric.*`, `nixl_fabric.*` | Rings; the NIXL fabric and its start-up |
 | `src/exchange/exchange_service.*`, `exchange_runtime.*`, `all_gather.*` | A process's exchange; collectives |
+| `src/exchange/distributed_session.*` | A process's distributed state: its exchange, query numbering, each window's query, abort and retire. `SiriusContext` creates it at the first distributed use; a process that runs none has none |
 | `src/op/sirius_physical_exchange_{sink,source}.*` | The operators |
-| `src/op/sirius_physical_sort_sample.*` | Distributed sampling |
-| `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check |
-| `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | Bloom merge across ranks |
+| `src/op/distributed/sirius_physical_distributed_sort_sample.*` | Distributed sampling |
+| `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check; each rank's share of a table's files, and the scans no rank can split |
+| `src/op/dynamic_filter/cross_rank_filter_merge.hpp`, `src/op/distributed/bloom_all_gather_merge.*` | The publisher's merge interface; the Bloom merge across ranks |
 | `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh`, `nixl_env.sh` | Launchers and runtime paths |
