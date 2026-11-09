@@ -127,6 +127,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_cte.cpp
     test/cpp/integration/test_gpu_execution_decimal_avg.cpp
+    test/cpp/integration/test_gpu_execution_scan_reuse.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
@@ -322,6 +323,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
+    test/cpp/planner/test_scan_reuse_rewrites.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_duckdb_host_reference_symbols.cpp
