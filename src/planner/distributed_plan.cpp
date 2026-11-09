@@ -82,10 +82,6 @@ enum class placement {
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
 };
 
-/// A join's Bloom filters are sized for its estimated build rows, within these bounds: the same
-/// size on every rank, since every rank plans the same estimate.
-constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
-constexpr std::size_t max_bloom_keys = std::size_t{1} << 30;
 /// A hash join whose estimated build has fewer rows publishes no merged Bloom filters.
 constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
 /// A join's build side is broadcast, and its probe side stays where it is, when the whole build
@@ -515,11 +511,8 @@ struct rewriter {
     // so every rank reserves the same streams.
     auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
-    join.set_distributed_dynamic_filters(
-      {.service      = service,
-       .first_stream = first,
-       .gpu          = gpu,
-       .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
+    // Each rank sizes its Bloom from the build rows it gets (distributed_merge::max_bloom_keys).
+    join.set_distributed_dynamic_filters({.service = service, .first_stream = first, .gpu = gpu});
     shape += "F";
   }
 

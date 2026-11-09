@@ -203,15 +203,19 @@ dynamic_filter_publish_plan filter_plan(
     {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
 }
 
-/// The merge of every rank's filters, the same on every rank.
+/// The merge of every rank's filters, the same on every rank. Each rank sizes its Bloom from its
+/// rows times the ranks, at least @p min_keys and at most @p max_keys.
 dynamic_filter_publish_plan::distributed_merge merge_over(std::shared_ptr<exchange_service> service,
-                                                          std::size_t bloom_keys)
+                                                          std::size_t min_keys,
+                                                          std::size_t max_keys = std::size_t{1}
+                                                                                 << 30)
 {
-  return {.service      = std::move(service),
-          .first_stream = 41,
-          .gpu          = env().gpu,
-          .bloom_keys   = bloom_keys,
-          .timeout      = std::chrono::seconds{30}};
+  return {.service        = std::move(service),
+          .first_stream   = 41,
+          .gpu            = env().gpu,
+          .min_bloom_keys = min_keys,
+          .max_bloom_keys = max_keys,
+          .timeout        = std::chrono::seconds{30}};
 }
 
 /// The Bloom published to @p channel, or null.
@@ -233,11 +237,12 @@ struct accumulating_join {
   std::unique_ptr<sirius::op::dynamic_filter_publication_session> session;
 
   accumulating_join(std::shared_ptr<exchange_service> service,
-                    std::size_t bloom_keys,
-                    std::uint64_t cap)
+                    std::size_t min_keys,
+                    std::uint64_t cap,
+                    std::size_t max_keys = std::size_t{1} << 30)
   {
     auto plan = filter_plan(channel, cap);
-    plan.set_distributed(merge_over(std::move(service), bloom_keys));
+    plan.set_distributed(merge_over(std::move(service), min_keys, max_keys));
     session =
       std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), &stats);
   }
@@ -279,11 +284,11 @@ struct whole_build_join {
   dynamic_filter_publish_plan plan;
 
   explicit whole_build_join(std::shared_ptr<exchange_service> service,
-                            std::size_t bloom_keys = 4096,
-                            std::uint64_t cap      = 64 * KiB)
+                            std::size_t min_keys = 4096,
+                            std::uint64_t cap    = 64 * KiB)
     : plan(filter_plan(channel, cap))
   {
-    plan.set_distributed(merge_over(std::move(service), bloom_keys));
+    plan.set_distributed(merge_over(std::move(service), min_keys));
   }
 
   sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
@@ -419,9 +424,10 @@ TEST_CASE("a rank whose accumulation ends without a filter does not hold up the 
   CHECK(joins[1]->bloom() == nullptr);
 }
 
-TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
+TEST_CASE("ranks whose Blooms differ in size by a power of two fold them onto the smallest",
           "[exchange][collectives][dynamic_filter]")
 {
+  // Floors of 4096 and 8192 keys: 8 KiB and 16 KiB.
   ranks c(2);
   std::vector<std::unique_ptr<accumulating_join>> joins;
   for (rank_t r = 0; r < 2; ++r) {
@@ -429,8 +435,57 @@ TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
       c.all[r].service, std::size_t{4096} << r, std::uint64_t{64} << 20));
   }
   on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 2000)}); });
-  CHECK(joins[0]->bloom() == nullptr);
-  CHECK(joins[1]->bloom() == nullptr);
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == 8 * KiB);
+    CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
+  }
+}
+
+TEST_CASE("each rank sizes its merged Bloom from its own build rows, not the plan",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // Rank 0 has 2000 rows (4000 keys over 2 ranks: 256 blocks, 8 KiB), rank 1 has 6000 (12000
+  // keys: 1024 blocks, 32 KiB). They fold to 8 KiB and keep every key.
+  ranks c(2);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(
+      std::make_unique<accumulating_join>(c.all[r].service, 1024, std::uint64_t{64} << 20));
+  }
+  on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, r == 0 ? 2000 : 6000)}); });
+  std::vector<std::int64_t> all_keys = sequence(0, 2, 2000);
+  auto const odd                     = sequence(1, 2, 6000);
+  all_keys.insert(all_keys.end(), odd.begin(), odd.end());
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == 8 * KiB);
+    CHECK(members(*bloom, all_keys) == all_keys.size());
+  }
+}
+
+TEST_CASE("ranks with equal rows size alike, and the cap bounds the size",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // 20000 rows each over 2 ranks: 40000 keys, 2500 blocks, rounded up to 4096 (128 KiB); with a
+  // cap of 16384 keys, 1024 blocks (32 KiB).
+  for (std::size_t max_keys : {std::size_t{1} << 30, std::size_t{16384}}) {
+    ranks c(2);
+    std::vector<std::unique_ptr<accumulating_join>> joins;
+    for (rank_t r = 0; r < 2; ++r) {
+      joins.push_back(std::make_unique<accumulating_join>(
+        c.all[r].service, 1024, std::uint64_t{64} << 20, max_keys));
+    }
+    on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 20000)}); });
+    for (rank_t r = 0; r < 2; ++r) {
+      auto const* bloom = joins[r]->bloom();
+      REQUIRE(bloom != nullptr);
+      CHECK(bloom->storage_bytes() == (max_keys == 16384 ? 32 : 128) * KiB);
+      CHECK(members(*bloom, sequence(0, 1, 40000)) == 40000);
+    }
+  }
 }
 
 TEST_CASE("whole-build ranks merge even when one build is empty and another's targets are drained",

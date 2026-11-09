@@ -55,6 +55,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <concepts>
@@ -204,6 +205,14 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
     }
   }
   return counts;
+}
+
+/// Keys this rank's share of a merged Bloom is sized for, from its @p rows of the build.
+std::size_t distributed_keys(dynamic_filter_publish_plan::distributed_merge const& d,
+                             std::size_t rows) noexcept
+{
+  return distributed_bloom_keys(
+    rows, d.service ? d.service->world_size() : 1, d.min_bloom_keys, d.max_bloom_keys);
 }
 
 void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
@@ -677,11 +686,12 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     }
     if (keys.empty()) { return false; }
     // A build too large for the cap gets a Bloom cut to it: more false positives, still a filter.
-    // Distributed, every rank takes the plan's size, uncapped, so the ranks' filters merge.
+    // Distributed, the size comes from this rank's rows (distributed_merge::max_bloom_keys),
+    // uncapped by the per-GPU cap, so the merged Bloom holds every rank's keys.
     auto const* distributed = plan.distributed();
     auto const cap =
       distributed ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
-    auto const wanted = distributed ? distributed->bloom_keys : rows;
+    auto const wanted = distributed ? distributed_keys(*distributed, rows) : rows;
     auto const sized_for =
       distributed ? wanted : std::min(rows, bloom_keys_within_cap(cap, keys.size()));
     auto const geometry =
@@ -1085,7 +1095,11 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
         return;
       }
       if (!bloom) { continue; }
-      std::vector<std::uint32_t const*> others;
+      // Each rank sized its Bloom from its own rows (distributed_bloom_keys), so the sizes may
+      // differ by powers of two; every rank folds them all onto the smallest, the same on every
+      // rank since every rank reads every header.
+      std::vector<std::pair<std::uint32_t const*, std::size_t>> others;
+      std::size_t smallest = head[3];
       bool mergeable =
         std::all_of(all.begin(), all.end(), [](auto const& t) { return t != nullptr; });
       if (mergeable) {
@@ -1095,23 +1109,46 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
           auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
           RMM_CUDA_TRY(cudaMemcpyAsync(
             heads[r].data(), theirs, sizeof(heads[r]), cudaMemcpyDeviceToHost, stream.get()));
-          if (r != d.service->rank()) { others.push_back(theirs + header); }
         }
         stream.sync();
-        mergeable =
-          std::all_of(heads.begin(), heads.end(), [&](auto const& h) { return h == head; });
+        for (auto const& h : heads) {
+          smallest = std::min<std::size_t>(smallest, h[3]);
+        }
+        auto const foldable = [&](std::size_t bytes) {
+          return smallest != 0 && bytes % smallest == 0 && std::has_single_bit(bytes / smallest);
+        };
+        mergeable = std::all_of(heads.begin(), heads.end(), [&](auto const& h) {
+          return h[0] == head[0] && h[1] == head[1] && h[2] == head[2] && foldable(h[3]);
+        });
+        for (exchange::rank_t r = 0; r < all.size(); ++r) {
+          if (r == d.service->rank()) { continue; }
+          others.emplace_back(
+            sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>() + header,
+            heads[r][3]);
+        }
       }
       if (!mergeable) {
         SIRIUS_LOG_DEBUG(
-          "[publish_dynamic_filters] key {}: a rank sent no filter or another kind; "
-          "nothing published for it.",
+          "[publish_dynamic_filters] key {}: a rank sent no filter, another kind, or a size that "
+          "does not fold; nothing published for it.",
           k);
         membership.reset();
         continue;
       }
       try {
-        for (auto const* words : others) {
-          bloom->merge_from(words, bloom->storage_bytes(), stream);
+        if (bloom->storage_bytes() != smallest) {
+          SIRIUS_LOG_INFO(
+            "[publish_dynamic_filters] key {}: folding this rank's {}-byte Bloom onto the "
+            "smallest rank's {} bytes.",
+            k,
+            bloom->storage_bytes(),
+            smallest);
+          auto folded = bloom->folded_to(smallest, stream, mr);
+          bloom       = folded.get();
+          membership  = std::move(folded);
+        }
+        for (auto const& [words, bytes] : others) {
+          bloom->merge_from(words, bytes, stream);
         }
       } catch (...) {
         // `all` and this Bloom must outlive every OR already queued on `stream`.
@@ -1215,7 +1252,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
-  auto const bloom_keys    = plan.distributed() ? plan.distributed()->bloom_keys : std::size_t{0};
+  auto const bloom_keys =
+    plan.distributed() ? distributed_keys(*plan.distributed(), build_rows) : std::size_t{0};
 
   std::vector<key_filters> per_key(admitted_keys.size());
   // Build columns restored from a narrowed carrier; filters copy from them asynchronously on

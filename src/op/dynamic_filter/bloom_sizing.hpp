@@ -28,8 +28,10 @@
 #include <cuda/cmath>
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace sirius::op {
 
@@ -62,6 +64,31 @@ static_assert(bloom_bits_per_block % bloom_target_bits_per_key == 0,
   auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
   auto const blocks        = cap / key_count / alignment * alignment / bloom_bytes_per_block;
   return blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
+}
+
+/**
+ * @brief The keys a distributed merged Bloom is sized for: this rank's @p local_rows times
+ * @p world, since a hash-exchanged build holds about a world-th of the keys on each rank; at least
+ * @p min_keys, at most @p max_keys; rounded up to a power-of-two number of blocks.
+ *
+ * Every rank sizes its own Bloom, so ranks whose rows straddle a power of two get different sizes.
+ * Power-of-two block counts let the merge fold the larger Blooms onto the smallest
+ * (sirius_dynamic_bloom_filter::merge_from). @p max_keys is taken down to a power-of-two number of
+ * blocks, so the result never exceeds it.
+ */
+[[nodiscard]] constexpr std::size_t distributed_bloom_keys(std::size_t local_rows,
+                                                           std::size_t world,
+                                                           std::size_t min_keys,
+                                                           std::size_t max_keys) noexcept
+{
+  constexpr std::size_t keys_per_block = bloom_bits_per_block / bloom_target_bits_per_key;
+  auto const max_blocks = std::bit_floor(std::max<std::size_t>(max_keys / keys_per_block, 1));
+  auto const ranks      = std::max<std::size_t>(world, 1);
+  auto const rows       = local_rows > std::numeric_limits<std::size_t>::max() / ranks
+                            ? std::numeric_limits<std::size_t>::max()
+                            : local_rows * ranks;
+  auto const blocks     = bloom_blocks_for(std::max(rows, min_keys));
+  return (blocks >= max_blocks ? max_blocks : std::bit_ceil(blocks)) * keys_per_block;
 }
 
 }  // namespace sirius::op
