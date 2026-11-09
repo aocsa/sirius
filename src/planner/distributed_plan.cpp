@@ -30,11 +30,13 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
@@ -74,6 +76,107 @@ enum class placement {
   ranged,  ///< Across ranks, rank i holding the i-th range of a sort order.
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
 };
+
+/// Where a subtree's rows are, and for rows a hash exchange spread, which columns still hold its
+/// keys.
+struct distribution {
+  placement where = placement::spread;
+  /// Key k of the hash exchange that spread the rows is in every column of hashed_on[k], so rows
+  /// that agree on one column of each key are on one rank. Empty when no column is known to hold
+  /// some key; always empty unless spread.
+  std::vector<std::vector<int>> hashed_on;
+
+  /// Whether rows that agree on @p columns are on one rank: they include a column of every key.
+  [[nodiscard]] bool co_located_on(std::vector<int> const& columns) const
+  {
+    return !hashed_on.empty() && std::ranges::all_of(hashed_on, [&](auto const& key) {
+      return std::ranges::find_first_of(key, columns) != key.end();
+    });
+  }
+};
+
+/// Spread by a hash exchange on @p keys, columns of its input. A cast the exchange hashes through
+/// is a function of the key, so rows that agree on the key columns hash alike, whatever the casts.
+distribution hashed_on(std::vector<int> const& keys)
+{
+  distribution d;
+  for (auto const key : keys) {
+    d.hashed_on.push_back({key});
+  }
+  return d;
+}
+
+/// @p d over an operator's output, whose column j is input column sources[j] (-1: computed).
+distribution through(distribution const& d, std::vector<int> const& sources)
+{
+  distribution out{.where = d.where};
+  for (auto const& key : d.hashed_on) {
+    auto& columns = out.hashed_on.emplace_back();
+    for (int j = 0; j < static_cast<int>(sources.size()); ++j) {
+      if (std::ranges::find(key, sources[j]) != key.end()) { columns.push_back(j); }
+    }
+    if (columns.empty()) { return {.where = d.where}; }
+  }
+  return out;
+}
+
+/// A grouped aggregate's output, its groups first, over its input @p d. A grouping set that leaves
+/// out a key merges rows from every rank into one group, so then no column holds a key.
+distribution grouped_output(distribution const& d, op::sirius_physical_grouped_aggregate const& agg)
+{
+  if (agg.has_grouping_sets()) { return {.where = d.where}; }
+  return through(d, agg.group_idx);
+}
+
+/// A hash join's output over its @p probe and @p build inputs. When both were hashed on the join
+/// keys, key k of either side holds key k of the output. A side whose columns the join fills with
+/// NULLs, for the other side's unmatched rows, holds no key: those rows are on the other side's
+/// ranks.
+distribution joined(op::sirius_physical_hash_join const& join,
+                    distribution const& probe,
+                    distribution const& build)
+{
+  using duckdb::JoinType;
+  auto const type = join.join_type;
+  // Probe columns, build columns, then a MARK join's mark.
+  bool const has_probe_cols = type != JoinType::RIGHT_SEMI && type != JoinType::RIGHT_ANTI;
+  bool const has_build_cols =
+    type != JoinType::SEMI && type != JoinType::ANTI && type != JoinType::MARK;
+  bool const pads_probe = type == JoinType::RIGHT || type == JoinType::OUTER;
+  bool const pads_build =
+    type == JoinType::LEFT || type == JoinType::OUTER || type == JoinType::SINGLE;
+  std::vector<int> from_probe;
+  std::vector<int> from_build;
+  if (has_probe_cols) {
+    for (auto const c : join.lhs_output_columns.col_idxs) {
+      from_probe.push_back(pads_probe ? -1 : static_cast<int>(c));
+      from_build.push_back(-1);
+    }
+  }
+  if (has_build_cols) {
+    for (auto const c : join.rhs_output_columns.col_idxs) {
+      from_probe.push_back(-1);
+      from_build.push_back(pads_build ? -1 : static_cast<int>(c));
+    }
+  }
+  if (type == JoinType::MARK) {
+    from_probe.push_back(-1);
+    from_build.push_back(-1);
+  }
+  distribution out{.where = probe.where == placement::rank0 ? placement::rank0 : placement::spread};
+  if (out.where != placement::spread || from_probe.size() != join.types.size()) { return out; }
+  auto const p = through(probe, from_probe).hashed_on;
+  auto const b = through(build, from_build).hashed_on;
+  if (p.empty() || b.empty()) {
+    out.hashed_on = p.empty() ? b : p;
+    return out;
+  }
+  for (std::size_t k = 0; k < p.size(); ++k) {
+    auto& columns = out.hashed_on.emplace_back(p[k]);
+    columns.insert(columns.end(), b[k].begin(), b[k].end());
+  }
+  return out;
+}
 
 /// A join's Bloom filters are sized for its estimated build rows, within these bounds: the same
 /// size on every rank, since every rank plans the same estimate.
@@ -187,17 +290,24 @@ struct rewriter {
 
   /// A hash exchange on @p partition's keys, between it and its input. An input on rank 0 alone
   /// (a gathered aggregate) is spread from there; the other ranks' copies of it hold no rows.
-  placement hash_below(op::sirius_physical_operator& partition_node,
-                       bool null_keys_to_every_rank = false)
+  distribution exchange_below(op::sirius_physical_partition& partition,
+                              bool null_keys_to_every_rank = false)
   {
-    auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
-    visit(partition.children[0]);
     exchange_spec spec;
     spec.key_columns             = partition.partition_keys();
     spec.key_cast_types          = partition.specification().key_cast_types;
     spec.null_keys_to_every_rank = null_keys_to_every_rank;
     insert(partition.children[0], std::move(spec), false);
-    return placement::spread;
+    return hashed_on(partition.partition_keys());
+  }
+
+  /// @p partition_node's input, visited, then hash-exchanged on its keys (see exchange_below).
+  distribution hash_below(op::sirius_physical_operator& partition_node,
+                          bool null_keys_to_every_rank = false)
+  {
+    auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
+    visit(partition.children[0]);
+    return exchange_below(partition, null_keys_to_every_rank);
   }
 
   /// After hash exchanges a rank's build holds only its share of the keys: a filter from it
@@ -225,22 +335,41 @@ struct rewriter {
     shape += "F";
   }
 
-  placement visit(duckdb::unique_ptr<op::sirius_physical_operator>& slot)
+  distribution visit(duckdb::unique_ptr<op::sirius_physical_operator>& slot)
   {
     auto& node = *slot;
     shape += op::SiriusPhysicalOperatorToString(node.type) + "(";
-    auto const done = [&](placement p) {
+    auto const done = [&](distribution d) {
       shape += ")";
-      return p;
+      return d;
     };
     switch (node.type) {
-      case T::GPU_SCAN: return done(placement::spread);
-      case T::FILTER:
-      case T::PROJECTION:
+      case T::GPU_SCAN: return done({});
       // A join-edge dynamic filter: its filter holds every rank's keys (see HASH_JOIN).
-      case T::DYNAMIC_FILTER:
+      case T::DYNAMIC_FILTER: return done(visit(node.children[0]));
+
+      case T::FILTER: {
+        auto const input = visit(node.children[0]);
+        auto const* kept = std::get_if<std::vector<cudf::size_type>>(
+          &node.Cast<op::sirius_physical_filter>().output_columns);
+        return done(kept ? through(input, {kept->begin(), kept->end()}) : input);
+      }
+
+      case T::PROJECTION: {
+        auto const input = visit(node.children[0]);
+        std::vector<int> sources;
+        for (auto const& e : node.Cast<op::sirius_physical_projection>().select_list) {
+          sources.push_back(e->holds<sirius::ast::reference>()
+                              ? static_cast<int>(e->get<sirius::ast::reference>().column_index)
+                              : -1);
+        }
+        return done(through(input, sources));
+      }
+
       // A partial aggregate keeps its input's placement; its merge above decides the exchange.
-      case T::HASH_GROUP_BY: return done(visit(node.children[0]));
+      case T::HASH_GROUP_BY:
+        return done(grouped_output(visit(node.children[0]),
+                                   node.Cast<op::sirius_physical_grouped_aggregate>()));
 
       case T::HASH_JOIN: {
         // Both sides are CONCAT → PARTITION → input.
@@ -265,16 +394,16 @@ struct rewriter {
           visit(build.children[0]);
           insert(
             build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-          return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+          return done(joined(join, probe_rows, {}));
         }
         merge_filters_across_ranks(join);
         // Each side's rows meet their matches once both are exchanged on the join keys. A MARK
         // join's NULL build keys match nothing yet turn a missed probe row's mark NULL, so every
         // rank needs them; its sink also sends every rank one build row, so that a NULL probe
         // key's mark is NULL on any rank once the build has rows.
-        hash_below(probe);
-        hash_below(build, join.join_type == duckdb::JoinType::MARK);
-        return done(placement::spread);
+        auto const probe_rows = hash_below(probe);
+        auto const build_rows = hash_below(build, join.join_type == duckdb::JoinType::MARK);
+        return done(joined(join, probe_rows, build_rows));
       }
 
       case T::LEFT_DELIM_JOIN:
@@ -309,11 +438,11 @@ struct rewriter {
         insert(node.children[0], std::move(spec), false);
         merge_filters_across_ranks(join);
         hash_below(other);
-        return done(placement::spread);
+        return done({});
       }
 
       // A rank's share of its delim join's DISTINCT (see LEFT_DELIM_JOIN).
-      case T::DELIM_SCAN: return done(placement::spread);
+      case T::DELIM_SCAN: return done({});
 
       // A literal table (VALUES, or a count DuckDB took from Parquet metadata): every rank planned
       // the same rows, so rank 0 keeps them and the other ranks emit none.
@@ -326,7 +455,7 @@ struct rewriter {
           }
           slot = std::move(none);
         }
-        return done(placement::rank0);
+        return done({.where = placement::rank0});
       }
 
       case T::NESTED_LOOP_JOIN: {
@@ -340,10 +469,11 @@ struct rewriter {
         }
         auto& probe = expect(*expect(*node.children[0], T::CONCAT).children[0], T::PARTITION);
         auto& build = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
-        auto const probe_rows = visit(probe.children[0]);
+        auto const probe_rows = visit(probe.children[0]).where;
         visit(build.children[0]);
         insert(build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-        return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+        return done(
+          {.where = probe_rows == placement::rank0 ? placement::rank0 : placement::spread});
       }
 
       case T::DENSE_COUNT_JOIN: {
@@ -352,25 +482,28 @@ struct rewriter {
         for (auto& side : node.children) {
           hash_below(*side);
         }
-        return done(placement::spread);
+        return done({});
       }
 
       case T::CTE: {
         // CTE → (materialization, consumer): each rank materializes its share, and the CTE_SCANs
         // under the consumer read it where it is.
-        auto const materialized = visit(node.children[0]);
+        auto const materialized = visit(node.children[0]).where;
         for (auto const& scan : node.Cast<op::sirius_physical_cte>().cte_scans) {
           cte_scans[&scan.get()] = materialized;
         }
         return done(visit(node.children[1]));
       }
 
-      case T::CTE_SCAN: return done(cte_scans.at(&node));
+      case T::CTE_SCAN: return done({.where = cte_scans.at(&node)});
 
       case T::MERGE_GROUP_BY: {
-        // MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY: partial results meet by group key.
-        auto& partition = *node.children[0];
-        auto& grouped   = expect(*partition.children[0], T::HASH_GROUP_BY)
+        // MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY: partial results meet by group key. Rows
+        // already hashed on some of the group keys hold whole groups on each rank, and merge
+        // there.
+        auto& partition =
+          expect(*node.children[0], T::PARTITION).Cast<op::sirius_physical_partition>();
+        auto& grouped = expect(*partition.children[0], T::HASH_GROUP_BY)
                           .Cast<op::sirius_physical_grouped_aggregate>();
         if (grouped.has_count_distinct) {
           // Partial distinct sets are LIST columns, which the exchange does not carry: the input
@@ -379,30 +512,41 @@ struct rewriter {
             throw sirius::not_implemented_exception(
               "distributed execution: COUNT(DISTINCT) with grouping sets");
           }
-          visit(grouped.children[0]);
-          exchange_spec spec;
-          spec.key_columns = grouped.group_idx;
-          insert(grouped.children[0], std::move(spec), false);
-          return done(placement::spread);
+          auto input = visit(grouped.children[0]);
+          if (!input.co_located_on(grouped.group_idx)) {
+            exchange_spec spec;
+            spec.key_columns = grouped.group_idx;
+            insert(grouped.children[0], std::move(spec), false);
+            input = hashed_on(grouped.group_idx);
+          }
+          return done(grouped_output(input, grouped));
         }
-        return done(hash_below(partition));
+        auto const partials = visit(partition.children[0]);
+        if (partials.co_located_on(partition.partition_keys())) { return done(partials); }
+        auto const merged = exchange_below(partition);
+        // The keys then include the grouping set id, which the merge does not output.
+        return done(grouped.has_grouping_sets() ? distribution{} : merged);
       }
 
       case T::MERGE_AGGREGATE: {
         // MERGE_AGGREGATE → UNGROUPED_AGGREGATE: partial results gathered to rank 0.
         auto& partial = expect(*node.children[0], T::UNGROUPED_AGGREGATE);
-        if (visit(partial.children[0]) == placement::rank0) { return done(placement::rank0); }
+        if (visit(partial.children[0]).where == placement::rank0) {
+          return done({.where = placement::rank0});
+        }
         insert(node.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
-        return done(placement::rank0);
+        return done({.where = placement::rank0});
       }
 
       case T::MERGE_TOP_N: {
         // MERGE_TOP_N → TOP_N: each rank's top rows gathered to rank 0, whose merge keeps the
         // overall top. A row outside its rank's top N is outside the overall top N too.
         auto& partial = expect(*node.children[0], T::TOP_N);
-        if (visit(partial.children[0]) == placement::rank0) { return done(placement::rank0); }
+        if (visit(partial.children[0]).where == placement::rank0) {
+          return done({.where = placement::rank0});
+        }
         insert(node.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
-        return done(placement::rank0);
+        return done({.where = placement::rank0});
       }
 
       case T::MERGE_SORT: {
@@ -412,7 +556,9 @@ struct rewriter {
         auto& sample =
           expect(*partition.children[0], T::SORT_SAMPLE).Cast<op::sirius_physical_sort_sample>();
         auto& order = expect(*sample.children[0], T::ORDER_BY);
-        if (visit(order.children[0]) == placement::rank0) { return done(placement::rank0); }
+        if (visit(order.children[0]).where == placement::rank0) {
+          return done({.where = placement::rank0});
+        }
         exchange_spec spec;
         spec.routing = exchange_spec::mode::range;
         for (auto const& o : sample.orders) {
@@ -429,7 +575,7 @@ struct rewriter {
         auto& sink = insert(partition.children[0], std::move(spec), false);
         // The sample, now below the sink, takes its boundaries from every rank's sample.
         install_sort_boundaries(sample, sink, service, stream(), *gpu);
-        return done(placement::ranged);
+        return done({.where = placement::ranged});
       }
 
       default:
@@ -501,7 +647,7 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
 {
   rewriter r{service, &gpu, query, &lifecycle};
   try {
-    auto const where = r.visit(plan);
+    auto const where = r.visit(plan).where;
     if (where != placement::rank0) {
       r.insert(plan,
                exchange_spec{.routing = exchange_spec::mode::gather},
