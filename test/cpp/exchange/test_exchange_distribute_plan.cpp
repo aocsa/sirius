@@ -508,6 +508,46 @@ TEST_CASE("distribute_plan merges groups in place on rows already hashed on a gr
   }
 }
 
+TEST_CASE("distribute_plan hashes only the join sides not already placed on the join keys",
+          "[exchange][planner]")
+{
+  fixture f;
+  // Whether rank 0's outermost hash join exchanges its {probe, build} input.
+  auto const exchanged = [&](std::string const& sql) {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    return std::pair{sink_below(*probe) != nullptr, sink_below(*build) != nullptr};
+  };
+
+  SECTION("an aggregate's output, hashed on its group key, joined on it")
+  {
+    CHECK(exchanged("SELECT a.k, a.s, c.v FROM (SELECT k, sum(v) AS s FROM big GROUP BY k) a "
+                    "JOIN big2 c ON a.k = c.k") == std::pair{true, false});
+  }
+
+  SECTION("a join's output, hashed on its key, joined on it again")
+  {
+    CHECK(exchanged("SELECT b.v, c.v, d.v FROM big b JOIN big2 c ON b.k = c.k "
+                    "JOIN big d ON c.k = d.k") == std::pair{false, true});
+  }
+
+  SECTION("hashed as another type than the join hashes it")
+  {
+    CHECK(exchanged("SELECT a.k, a.s, c.v FROM (SELECT k::INTEGER AS k, sum(v) AS s FROM big "
+                    "GROUP BY 1) a JOIN big2 c ON a.k = c.k") == std::pair{true, true});
+  }
+
+  SECTION("a MARK join's build, whose NULL keys every rank needs")
+  {
+    CHECK(exchanged("SELECT k, k IN (SELECT k FROM big2 GROUP BY k) FROM big") ==
+          std::pair{true, true});
+  }
+}
+
 TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
           "[exchange][planner]")
 {
