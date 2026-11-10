@@ -55,6 +55,8 @@ set(SIRIUS_LINK_LIBRARIES
     PkgConfig::LIBURING
     OpenSSL::Crypto
     absl::any_invocable
+    # kvikIO: the GPUDirect Storage scan backend (src/io/gds).
+    kvikio::kvikio
     # NVML: the NIXL fabric checks peer access between GPUs other processes own.
     CUDA::nvml)
 
