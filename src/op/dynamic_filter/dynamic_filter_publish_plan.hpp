@@ -183,7 +183,8 @@ class dynamic_filter_publish_plan final {
    */
   struct distributed_merge {
     std::shared_ptr<exchange::exchange_service> service;
-    /// Admitted key i merges on stream first_stream + i, the same on every rank.
+    /// The merge's header round runs on first_stream and admitted key i merges on
+    /// first_stream + 1 + i, the same on every rank.
     exchange::stream_id first_stream = 0;
     /// Where this rank's contribution and the gathered filters are allocated; required.
     cucascade::memory::memory_space* gpu = nullptr;

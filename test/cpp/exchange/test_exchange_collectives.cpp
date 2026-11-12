@@ -414,7 +414,7 @@ TEST_CASE("ranks drop a key whose plan leaves too few bits per real key",
   for (rank_t r = 0; r < 2; ++r) {
     joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, 4096, 64 * KiB));
   }
-  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 40'000)); });
+  on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 40'000)}); });
   CHECK(joins[0]->bloom() == nullptr);
   CHECK(joins[1]->bloom() == nullptr);
 }
@@ -429,7 +429,7 @@ TEST_CASE("three ranks merge small Blooms in one all-gather",
       std::make_unique<accumulating_join>(c.all[r].service, std::size_t{1} << 20, 1024 * KiB));
   }
   // Rank r holds the keys equal to r modulo 3.
-  on_every_rank(3, [&](rank_t r) { joins[r]->build(keys_batch(r, 3, 30'000)); });
+  on_every_rank(3, [&](rank_t r) { joins[r]->build({keys_batch(r, 3, 30'000)}); });
   for (rank_t r = 0; r < 3; ++r) {
     auto const* bloom = joins[r]->bloom();
     REQUIRE(bloom != nullptr);
@@ -448,7 +448,7 @@ TEST_CASE("three ranks merge large Blooms in a ring", "[exchange][collectives][d
     joins.push_back(std::make_unique<accumulating_join>(
       c.all[r].service, std::size_t{1} << 24, std::uint64_t{64} << 20));
   }
-  on_every_rank(3, [&](rank_t r) { joins[r]->build(keys_batch(r, 3, 3'000'000)); });
+  on_every_rank(3, [&](rank_t r) { joins[r]->build({keys_batch(r, 3, 3'000'000)}); });
   for (rank_t r = 0; r < 3; ++r) {
     auto const* bloom = joins[r]->bloom();
     REQUIRE(bloom != nullptr);
@@ -664,7 +664,8 @@ TEST_CASE("a rank that leaves a ring fails the others at once", "[exchange][coll
       count * sizeof(std::uint32_t), utils::default_stream(), utils::get_resource_ref(*env().gpu));
   }
   auto const start = std::chrono::steady_clock::now();
-  std::vector<bool> failed(3, false);
+  // Not vector<bool>: two ranks write their flags from two threads.
+  std::vector<char> failed(3, 0);
   on_every_rank(3, [&](rank_t r) {
     if (r == 2) {
       sirius::exchange::leave_ring(*c.all[r].service, 52);

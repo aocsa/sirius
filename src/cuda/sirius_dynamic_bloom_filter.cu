@@ -528,6 +528,15 @@ void bloom_or_words(std::uint32_t* into,
                     ::cuda::stream_ref stream)
 {
   if (count == 0) { return; }
+  // Both ranges are on one GPU, which need not be the caller's current one.
+  cudaPointerAttributes into_at{};
+  cudaPointerAttributes from_at{};
+  CUDF_CUDA_TRY(cudaPointerGetAttributes(&into_at, into));
+  CUDF_CUDA_TRY(cudaPointerGetAttributes(&from_at, from));
+  if (from_at.type == cudaMemoryTypeDevice && from_at.device != into_at.device) {
+    throw std::invalid_argument("[bloom_or_words] the two ranges are on different GPUs");
+  }
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{into_at.device}};
   constexpr unsigned threads = 256;
   or_words<<<static_cast<unsigned>(::cuda::ceil_div(count, std::size_t{threads})),
              threads,

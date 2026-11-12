@@ -200,6 +200,8 @@ void ring_all_reduce(exchange_service& service,
     closed = true;
     service.close(stream, next);
   } catch (...) {
+    // The caller may free `words` next: a copy or reduction queued on the stream still reads them.
+    cuda_stream.synchronize_no_throw();
     // The next rank waits on this one: tell it now, rather than at its timeout.
     if (!closed) {
       try {

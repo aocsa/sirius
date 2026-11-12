@@ -1142,16 +1142,23 @@ void gather_and_or(dynamic_filter_publish_plan::distributed_merge const& d,
     *d.gpu,
     stream.get(),
     d.timeout);
-  for (exchange::rank_t r = 0; r < all.size(); ++r) {
-    if (r == d.service->rank()) { continue; }
-    if (!all[r]) {
-      throw sirius::internal_exception("rank {} sent no Bloom after agreeing to merge", r);
+  try {
+    for (exchange::rank_t r = 0; r < all.size(); ++r) {
+      if (r == d.service->rank()) { continue; }
+      if (!all[r]) {
+        throw sirius::internal_exception("rank {} sent no Bloom after agreeing to merge", r);
+      }
+      auto const theirs = sirius::get_cudf_table_view(*all[r]).column(0);
+      if (static_cast<std::size_t>(theirs.size()) != count) {
+        throw sirius::internal_exception("rank {} sent {} words, not {}", r, theirs.size(), count);
+      }
+      bloom_or_words(bloom.mutable_storage(), theirs.data<std::uint32_t>(), count, stream);
     }
-    auto const theirs = sirius::get_cudf_table_view(*all[r]).column(0);
-    if (static_cast<std::size_t>(theirs.size()) != count) {
-      throw sirius::internal_exception("rank {} sent {} words, not {}", r, theirs.size(), count);
-    }
-    bloom_or_words(bloom.mutable_storage(), theirs.data<std::uint32_t>(), count, stream);
+  } catch (...) {
+    // `all` and this Bloom must outlive every OR already queued on `stream`.
+    auto error = std::current_exception();
+    stream.sync();
+    std::rethrow_exception(error);
   }
   // The gathered Blooms are freed with `all`, after the ORs have read them.
   stream.sync();
