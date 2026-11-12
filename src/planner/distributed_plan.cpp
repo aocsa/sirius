@@ -52,6 +52,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -491,6 +492,26 @@ void require_same_shape(rewriter& r)
   }
 }
 
+/// Best effort: fails @p query on every rank with @p error, and retires it on this one, which
+/// will not run it.
+void abort_unplanned(exchange::exchange_service& service,
+                     std::uint64_t query,
+                     std::exception_ptr const& error) noexcept
+{
+  try {
+    std::string what = "unknown error";
+    try {
+      std::rethrow_exception(error);
+    } catch (std::exception const& e) {
+      what = e.what();
+    } catch (...) {
+    }
+    service.abort(query, what);
+    service.forget(query);
+  } catch (...) {  // the peers' own timeouts remain
+  }
+}
+
 }  // namespace
 
 void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
@@ -500,13 +521,20 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      exec::query_lifecycle_registry& lifecycle)
 {
   rewriter r{std::move(service), &gpu, query, &lifecycle};
-  auto const where = r.visit(plan);
-  if (where != placement::rank0) {
-    r.insert(plan,
-             exchange_spec{.routing = exchange_spec::mode::gather},
-             /*ordered=*/where == placement::ranged);
+  try {
+    auto const where = r.visit(plan);
+    if (where != placement::rank0) {
+      r.insert(plan,
+               exchange_spec{.routing = exchange_spec::mode::gather},
+               /*ordered=*/where == placement::ranged);
+    }
+    require_same_shape(r);
+  } catch (...) {
+    // The query is numbered, so the other ranks plan it too and would wait for this one in the
+    // shape check: no execution window's error handler sees a planning failure.
+    abort_unplanned(*r.service, query, std::current_exception());
+    throw;
   }
-  require_same_shape(r);
 }
 
 std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const> file_bytes,
