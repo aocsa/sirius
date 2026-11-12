@@ -77,31 +77,81 @@ enum class placement {
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
 };
 
+/// One key of the hash exchange that spread a subtree's rows.
+struct hashed_key {
+  /// Every column whose value, cast to `type`, is what the exchange hashed.
+  std::vector<int> columns;
+  /// What the exchange hashed: the key's cast type, or else its column's type.
+  cudf::data_type type;
+};
+
 /// Where a subtree's rows are, and for rows a hash exchange spread, which columns still hold its
 /// keys.
 struct distribution {
   placement where = placement::spread;
-  /// Key k of the hash exchange that spread the rows is in every column of hashed_on[k], so rows
-  /// that agree on one column of each key are on one rank. Empty when no column is known to hold
-  /// some key; always empty unless spread.
-  std::vector<std::vector<int>> hashed_on;
+  /// The keys of the hash exchange that spread the rows, in its order. Rows that agree on one
+  /// column of each key are on one rank. Empty when no column is known to hold some key; always
+  /// empty unless spread.
+  std::vector<hashed_key> hashed_on;
 
   /// Whether rows that agree on @p columns are on one rank: they include a column of every key.
   [[nodiscard]] bool co_located_on(std::vector<int> const& columns) const
   {
     return !hashed_on.empty() && std::ranges::all_of(hashed_on, [&](auto const& key) {
-      return std::ranges::find_first_of(key, columns) != key.end();
+      return std::ranges::find_first_of(key.columns, columns) != key.columns.end();
     });
+  }
+
+  /// Whether every row is on the rank a hash exchange on @p keys, hashed as @p types, would send
+  /// it to. The hash is of the key tuple, so the keys must match in number, order and type.
+  [[nodiscard]] bool placed_by(std::vector<int> const& keys,
+                               std::vector<cudf::data_type> const& types) const
+  {
+    if (hashed_on.size() != keys.size()) { return false; }
+    for (std::size_t k = 0; k < keys.size(); ++k) {
+      if (types[k].id() == cudf::type_id::EMPTY || types[k] != hashed_on[k].type ||
+          std::ranges::find(hashed_on[k].columns, keys[k]) == hashed_on[k].columns.end()) {
+        return false;
+      }
+    }
+    return true;
   }
 };
 
-/// Spread by a hash exchange on @p keys, columns of its input. A cast the exchange hashes through
-/// is a function of the key, so rows that agree on the key columns hash alike, whatever the casts.
-distribution hashed_on(std::vector<int> const& keys)
+/// The type a hash exchange on column @p key of @p input hashes: @p cast unless EMPTY, else the
+/// column's physical type. EMPTY when cuDF has no type for it.
+cudf::data_type hashed_type(op::sirius_physical_operator const& input,
+                            int key,
+                            cudf::data_type cast)
+{
+  if (cast.id() != cudf::type_id::EMPTY) { return cast; }
+  if (input.has_physical_overrides()) {
+    return input.get_physical_types()[static_cast<std::size_t>(key)];
+  }
+  return get_cudf_type(input.types[static_cast<std::size_t>(key)])
+    .value_or(cudf::data_type{cudf::type_id::EMPTY});
+}
+
+/// The types a hash exchange on @p keys of @p input hashes, through @p casts (empty: none).
+std::vector<cudf::data_type> hashed_types(op::sirius_physical_operator const& input,
+                                          std::vector<int> const& keys,
+                                          std::vector<cudf::data_type> const& casts)
+{
+  std::vector<cudf::data_type> out;
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    out.push_back(hashed_type(
+      input, keys[k], casts.empty() ? cudf::data_type{cudf::type_id::EMPTY} : casts[k]));
+  }
+  return out;
+}
+
+/// Spread by a hash exchange on @p keys, columns of its input, hashed as @p types. A cast is a
+/// function of the key, so rows that agree on the key columns hash alike, whatever the casts.
+distribution hashed_on(std::vector<int> const& keys, std::vector<cudf::data_type> const& types)
 {
   distribution d;
-  for (auto const key : keys) {
-    d.hashed_on.push_back({key});
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    d.hashed_on.push_back({.columns = {keys[k]}, .type = types[k]});
   }
   return d;
 }
@@ -111,11 +161,13 @@ distribution through(distribution const& d, std::vector<int> const& sources)
 {
   distribution out{.where = d.where};
   for (auto const& key : d.hashed_on) {
-    auto& columns = out.hashed_on.emplace_back();
+    auto& mapped = out.hashed_on.emplace_back(hashed_key{.type = key.type});
     for (int j = 0; j < static_cast<int>(sources.size()); ++j) {
-      if (std::ranges::find(key, sources[j]) != key.end()) { columns.push_back(j); }
+      if (std::ranges::find(key.columns, sources[j]) != key.columns.end()) {
+        mapped.columns.push_back(j);
+      }
     }
-    if (columns.empty()) { return {.where = d.where}; }
+    if (mapped.columns.empty()) { return {.where = d.where}; }
   }
   return out;
 }
@@ -128,10 +180,10 @@ distribution grouped_output(distribution const& d, op::sirius_physical_grouped_a
   return through(d, agg.group_idx);
 }
 
-/// A hash join's output over its @p probe and @p build inputs. When both were hashed on the join
-/// keys, key k of either side holds key k of the output. A side whose columns the join fills with
-/// NULLs, for the other side's unmatched rows, holds no key: those rows are on the other side's
-/// ranks.
+/// A hash join's output over its @p probe and @p build inputs. When both are placed by a hash on
+/// the join keys, key k of either side holds key k of the output. A side whose columns the join
+/// fills with NULLs, for the other side's unmatched rows, holds no key: those rows are on the other
+/// side's ranks.
 distribution joined(op::sirius_physical_hash_join const& join,
                     distribution const& probe,
                     distribution const& build)
@@ -172,8 +224,8 @@ distribution joined(op::sirius_physical_hash_join const& join,
     return out;
   }
   for (std::size_t k = 0; k < p.size(); ++k) {
-    auto& columns = out.hashed_on.emplace_back(p[k]);
-    columns.insert(columns.end(), b[k].begin(), b[k].end());
+    auto& key = out.hashed_on.emplace_back(p[k]);
+    key.columns.insert(key.columns.end(), b[k].columns.begin(), b[k].columns.end());
   }
   return out;
 }
@@ -293,21 +345,51 @@ struct rewriter {
   distribution exchange_below(op::sirius_physical_partition& partition,
                               bool null_keys_to_every_rank = false)
   {
-    exchange_spec spec;
-    spec.key_columns             = partition.partition_keys();
-    spec.key_cast_types          = partition.specification().key_cast_types;
-    spec.null_keys_to_every_rank = null_keys_to_every_rank;
-    insert(partition.children[0], std::move(spec), false);
-    return hashed_on(partition.partition_keys());
+    return hash_exchange(partition.children[0],
+                         partition.partition_keys(),
+                         partition.specification().key_cast_types,
+                         null_keys_to_every_rank);
   }
 
-  /// @p partition_node's input, visited, then hash-exchanged on its keys (see exchange_below).
+  /// A hash exchange on @p keys through @p casts, above what is in @p slot.
+  distribution hash_exchange(duckdb::unique_ptr<op::sirius_physical_operator>& slot,
+                             std::vector<int> const& keys,
+                             std::vector<cudf::data_type> const& casts,
+                             bool null_keys_to_every_rank = false)
+  {
+    auto placed = hashed_on(keys, hashed_types(*slot, keys, casts));
+    exchange_spec spec;
+    spec.key_columns             = keys;
+    spec.key_cast_types          = casts;
+    spec.null_keys_to_every_rank = null_keys_to_every_rank;
+    insert(slot, std::move(spec), false);
+    return placed;
+  }
+
+  /// @p input, visited, unless already placed as a hash exchange on @p keys through @p casts would
+  /// place it, then hash-exchanged on them. Null keys sent to every rank are never placed already.
+  distribution hash_unless_placed(duckdb::unique_ptr<op::sirius_physical_operator>& input,
+                                  std::vector<int> const& keys,
+                                  std::vector<cudf::data_type> const& casts,
+                                  bool null_keys_to_every_rank = false)
+  {
+    auto const placed = visit(input);
+    if (!null_keys_to_every_rank && placed.placed_by(keys, hashed_types(*input, keys, casts))) {
+      shape += "R";
+      return placed;
+    }
+    return hash_exchange(input, keys, casts, null_keys_to_every_rank);
+  }
+
+  /// @p partition_node's input, hash-exchanged on its keys unless already placed so.
   distribution hash_below(op::sirius_physical_operator& partition_node,
                           bool null_keys_to_every_rank = false)
   {
     auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
-    visit(partition.children[0]);
-    return exchange_below(partition, null_keys_to_every_rank);
+    return hash_unless_placed(partition.children[0],
+                              partition.partition_keys(),
+                              partition.specification().key_cast_types,
+                              null_keys_to_every_rank);
   }
 
   /// After hash exchanges a rank's build holds only its share of the keys: a filter from it
@@ -431,11 +513,7 @@ struct rewriter {
           throw sirius::not_implemented_exception(
             "distributed execution: a delim join whose join keys are not its delim columns");
         }
-        visit(node.children[0]);
-        exchange_spec spec;
-        spec.key_columns    = keys;
-        spec.key_cast_types = fanned.specification().key_cast_types;
-        insert(node.children[0], std::move(spec), false);
+        hash_unless_placed(node.children[0], keys, fanned.specification().key_cast_types);
         merge_filters_across_ranks(join);
         hash_below(other);
         return done({});
@@ -514,10 +592,7 @@ struct rewriter {
           }
           auto input = visit(grouped.children[0]);
           if (!input.co_located_on(grouped.group_idx)) {
-            exchange_spec spec;
-            spec.key_columns = grouped.group_idx;
-            insert(grouped.children[0], std::move(spec), false);
-            input = hashed_on(grouped.group_idx);
+            input = hash_exchange(grouped.children[0], grouped.group_idx, {});
           }
           return done(grouped_output(input, grouped));
         }

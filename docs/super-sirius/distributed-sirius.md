@@ -192,11 +192,11 @@ single-process plan already partitions:
 
 | Plan shape | Exchange |
 |---|---|
-| `HASH_JOIN`, each side `CONCAT → PARTITION → input` | `hash` on that `PARTITION`'s join keys and casts, below it |
+| `HASH_JOIN`, each side `CONCAT → PARTITION → input` | `hash` on that `PARTITION`'s join keys and casts, below it; none on a side already placed by a hash on the same keys and types |
 | the same, with a small build side | `broadcast` of the build side; the probe side stays where it is |
 | `NESTED_LOOP_JOIN`, each side `CONCAT → PARTITION → input` | `broadcast` of the build side; the probe side stays where it is |
 | `DENSE_COUNT_JOIN`, each side `PARTITION → input` | `hash` on the join key, both sides |
-| `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side |
+| `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side; each skipped as for `HASH_JOIN` |
 | `MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY` | `hash` on the group keys, between `PARTITION` and `HASH_GROUP_BY`; none when the input is already hashed on some of the group keys |
 | the same, with `COUNT(DISTINCT)` | `hash` on the group keys, below `HASH_GROUP_BY`: partial distinct sets are LIST columns, which the wire does not carry; none when already hashed as above |
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
@@ -220,6 +220,13 @@ one rank, whatever casts the exchange hashed through. So a group-by whose keys i
 column holds whole groups on each rank and merges there, with no exchange: TPC-H Q3 groups on
 `l_orderkey`, the key its `orders` ⋈ `lineitem` join was hashed on. Grouping sets clear the keys,
 since a set that leaves a key out totals rows from every rank.
+
+A join side needs more: every row on the rank the join's own hash would send it to. The exchange
+hashes the key tuple, each key cast to the join's prepared type, so a side is placed already only
+when the last hash exchange had the join's keys, in the same order, hashed as the same types. The
+rewrite records each key's hashed type for this. Such a side is not exchanged again: TPC-H Q2,
+Q17 and Q20 join a subquery's aggregate on its group key. A `MARK` join's build is always
+exchanged, for its NULL keys.
 
 A hash join's build side is broadcast when its estimated size is at most 1 GiB and at most the
 probe side's divided by ranks − 1, and when its join type emits build rows only with a probe match.
