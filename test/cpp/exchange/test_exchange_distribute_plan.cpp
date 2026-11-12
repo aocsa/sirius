@@ -433,6 +433,81 @@ TEST_CASE("distribute_plan drops a right semi or anti join's early build publica
   }
 }
 
+TEST_CASE("distribute_plan merges groups in place on rows already hashed on a group key",
+          "[exchange][planner]")
+{
+  fixture f;
+  // Whether rank 0's merges, outermost first, each merge partials that crossed no exchange:
+  // MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY → input, with no EXCHANGE_SOURCE between them.
+  auto const in_place = [&](std::string const& sql) {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
+    std::vector<bool> out;
+    std::function<void(sirius_physical_operator&)> walk = [&](sirius_physical_operator& node) {
+      if (node.type == T::MERGE_GROUP_BY) {
+        auto& partials = *node.children.at(0)->children.at(0);
+        out.push_back(partials.type == T::HASH_GROUP_BY &&
+                      partials.children.at(0)->type != T::EXCHANGE_SOURCE);
+      }
+      for (auto& child : node.children) {
+        walk(*child);
+      }
+    };
+    walk(*plans[0]);
+    return out;
+  };
+
+  SECTION("grouped on a join key of either side of a hashed join")
+  {
+    CHECK(in_place("SELECT b.k, b.v, sum(c.v) FROM big b JOIN big2 c ON b.k = c.k "
+                   "GROUP BY b.k, b.v") == std::vector{true});
+    CHECK(in_place("SELECT c.k, sum(b.v), sum(c.v) FROM big b JOIN big2 c ON b.k = c.k "
+                   "GROUP BY c.k") == std::vector{true});
+  }
+
+  SECTION("the TPC-H Q3 shape: a broadcast join under a hashed one, keys through projections")
+  {
+    CHECK(in_place("SELECT c.k, b.v, s.v, sum(c.v + b.k) AS revenue FROM small s "
+                   "JOIN big b ON s.k = b.v JOIN big2 c ON c.k = b.k "
+                   "GROUP BY c.k, b.v, s.v") == std::vector{true});
+  }
+
+  SECTION("an aggregate over an aggregate on the same key")
+  {
+    CHECK(in_place("SELECT k, count(*), sum(s) FROM (SELECT b.k AS k, b.v, sum(c.v) AS s "
+                   "FROM big b JOIN big2 c ON b.k = c.k GROUP BY b.k, b.v) GROUP BY k") ==
+          std::vector{true, true});
+  }
+
+  SECTION("COUNT(DISTINCT) on a join key")
+  {
+    CHECK(in_place("SELECT b.k, count(DISTINCT c.v), sum(b.v) FROM big b JOIN big2 c "
+                   "ON b.k = c.k GROUP BY b.k") == std::vector{true});
+  }
+
+  SECTION("exchanged when the group keys leave out the join key")
+  {
+    CHECK(in_place("SELECT b.v, sum(c.v) FROM big b JOIN big2 c ON b.k = c.k GROUP BY b.v") ==
+          std::vector{false});
+    CHECK(in_place("SELECT v, sum(k) FROM big GROUP BY v") == std::vector{false});
+  }
+
+  SECTION("exchanged on the side a join fills with NULLs")
+  {
+    CHECK(in_place("SELECT c.k, sum(b.v), sum(c.v) FROM big b LEFT JOIN big2 c ON b.k = c.k "
+                   "GROUP BY c.k") == std::vector{false});
+    CHECK(in_place("SELECT b.k, sum(b.v), sum(c.v) FROM big b LEFT JOIN big2 c ON b.k = c.k "
+                   "GROUP BY b.k") == std::vector{true});
+  }
+
+  SECTION("exchanged under grouping sets, whose totals span ranks")
+  {
+    CHECK(in_place("SELECT b.k, b.v, sum(c.v) FROM big b JOIN big2 c ON b.k = c.k "
+                   "GROUP BY ROLLUP (b.k, b.v)") == std::vector{false});
+  }
+}
+
 TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
           "[exchange][planner]")
 {

@@ -197,8 +197,8 @@ single-process plan already partitions:
 | `NESTED_LOOP_JOIN`, each side `CONCAT → PARTITION → input` | `broadcast` of the build side; the probe side stays where it is |
 | `DENSE_COUNT_JOIN`, each side `PARTITION → input` | `hash` on the join key, both sides |
 | `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side |
-| `MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY` | `hash` on the group keys, between `PARTITION` and `HASH_GROUP_BY` |
-| the same, with `COUNT(DISTINCT)` | `hash` on the group keys, below `HASH_GROUP_BY`: partial distinct sets are LIST columns, which the wire does not carry |
+| `MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY` | `hash` on the group keys, between `PARTITION` and `HASH_GROUP_BY`; none when the input is already hashed on some of the group keys |
+| the same, with `COUNT(DISTINCT)` | `hash` on the group keys, below `HASH_GROUP_BY`: partial distinct sets are LIST columns, which the wire does not carry; none when already hashed as above |
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
 | `MERGE_TOP_N → TOP_N` | `gather` to rank 0, between them; a row outside its rank's top N is outside the overall top N |
 | `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
@@ -210,6 +210,16 @@ take the materialization's placement. A hash exchange may start from an input on
 gathered scalar): rank 0 sends its rows by key, and the other ranks' copies of it hold none.
 A `GPU_VALUES` (a `VALUES` list, or a `count(*)` DuckDB answered from Parquet metadata) is on
 rank 0 the same way: every rank planned the same rows, so the other ranks' copies emit none.
+
+The rewrite also tracks which columns still hold the keys of the hash exchange that spread a
+subtree's rows. A projection or filter carries them to the output columns that copy them, a grouped
+aggregate to its group columns, and a hashed join to the join-key columns of both sides, except
+the side it pads with NULLs for unmatched rows (the build of a `LEFT` join, either side of a `FULL`
+one). A broadcast join keeps its probe side's keys. Rows that agree on a column of every key are on
+one rank, whatever casts the exchange hashed through. So a group-by whose keys include such a
+column holds whole groups on each rank and merges there, with no exchange: TPC-H Q3 groups on
+`l_orderkey`, the key its `orders` ⋈ `lineitem` join was hashed on. Grouping sets clear the keys,
+since a set that leaves a key out totals rows from every rank.
 
 A hash join's build side is broadcast when its estimated size is at most 1 GiB and at most the
 probe side's divided by ranks − 1, and when its join type emits build rows only with a probe match.
