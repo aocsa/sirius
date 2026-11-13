@@ -23,6 +23,7 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
+#include "exchange/ring_all_reduce.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
@@ -52,6 +53,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -571,6 +573,107 @@ TEST_CASE("a rank missing from one key's merge costs the others one timeout, not
   stream.sync();
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds{1800});
   CHECK(published_bloom(*channel) == nullptr);
+}
+
+/// ORs @p n words of @p from into @p into through the host: a reduction for the ring tests.
+void or_words(std::uint32_t* into,
+              std::uint32_t const* from,
+              std::size_t n,
+              rmm::cuda_stream_view stream)
+{
+  std::vector<std::uint32_t> a(n);
+  std::vector<std::uint32_t> b(n);
+  auto const bytes = n * sizeof(std::uint32_t);
+  // Runs on the ranks' threads, where a Catch assertion is not safe: a failed copy throws.
+  auto const copy = [&](void* to, void const* source, cudaMemcpyKind kind) {
+    if (cudaMemcpyAsync(to, source, bytes, kind, stream.value()) != cudaSuccess) {
+      throw std::runtime_error("or_words: cudaMemcpyAsync failed");
+    }
+  };
+  copy(a.data(), into, cudaMemcpyDeviceToHost);
+  copy(b.data(), from, cudaMemcpyDeviceToHost);
+  stream.synchronize();
+  for (std::size_t i = 0; i < n; ++i) {
+    a[i] |= b[i];
+  }
+  copy(into, a.data(), cudaMemcpyHostToDevice);
+  stream.synchronize();
+}
+
+TEST_CASE("a ring all-reduce ORs every rank's words into every rank's", "[exchange][collectives]")
+{
+  for (rank_t world : {2u, 3u, 4u}) {
+    ranks c(world);
+    // Not a multiple of any world size here, so the slices differ in length.
+    constexpr std::size_t count = 1001;
+    std::vector<rmm::device_buffer> words;
+    for (rank_t r = 0; r < world; ++r) {
+      std::vector<std::uint32_t> mine(count);
+      for (std::size_t i = 0; i < count; ++i) {
+        mine[i] = (1u << r) | static_cast<std::uint32_t>(i << 8);
+      }
+      words.emplace_back(mine.data(),
+                         count * sizeof(std::uint32_t),
+                         utils::default_stream(),
+                         utils::get_resource_ref(*env().gpu));
+    }
+    utils::default_stream().sync();
+    on_every_rank(world, [&](rank_t r) {
+      sirius::exchange::ring_all_reduce(*c.all[r].service,
+                                        51,
+                                        static_cast<std::uint32_t*>(words[r].data()),
+                                        count,
+                                        or_words,
+                                        *env().gpu,
+                                        utils::default_stream(),
+                                        std::chrono::seconds{30});
+    });
+    for (rank_t r = 0; r < world; ++r) {
+      std::vector<std::uint32_t> got(count);
+      REQUIRE(cudaMemcpy(got.data(),
+                         words[r].data(),
+                         count * sizeof(std::uint32_t),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      for (std::size_t i = 0; i < count; ++i) {
+        REQUIRE(got[i] == (((1u << world) - 1) | static_cast<std::uint32_t>(i << 8)));
+      }
+    }
+  }
+}
+
+TEST_CASE("a rank that leaves a ring fails the others at once", "[exchange][collectives]")
+{
+  ranks c(3);
+  constexpr std::size_t count = 300;
+  std::vector<rmm::device_buffer> words;
+  for (rank_t r = 0; r < 3; ++r) {
+    words.emplace_back(
+      count * sizeof(std::uint32_t), utils::default_stream(), utils::get_resource_ref(*env().gpu));
+  }
+  auto const start = std::chrono::steady_clock::now();
+  // Not vector<bool>: two ranks write their flags from two threads.
+  std::vector<char> failed(3, 0);
+  on_every_rank(3, [&](rank_t r) {
+    if (r == 2) {
+      sirius::exchange::leave_ring(*c.all[r].service, 52);
+      return;
+    }
+    try {
+      sirius::exchange::ring_all_reduce(*c.all[r].service,
+                                        52,
+                                        static_cast<std::uint32_t*>(words[r].data()),
+                                        count,
+                                        or_words,
+                                        *env().gpu,
+                                        utils::default_stream(),
+                                        std::chrono::seconds{60});
+    } catch (sirius::internal_exception const&) {
+      failed[r] = true;
+    }
+  });
+  CHECK(failed[0]);
+  CHECK(failed[1]);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
 }
 
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
