@@ -30,6 +30,7 @@
 #include "exchange/distributed_session.hpp"
 #include "exchange/exchange_runtime.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/rank_control.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
@@ -1218,7 +1219,7 @@ void SiriusContext::release_resources() noexcept
   // The exchange's engine thread lands batches in memory_manager_'s spaces and calls into sources
   // and the components above: stop it while they all still exist. Plans can hold the service past
   // terminate() (a prepared statement), so dropping this reference alone would not stop it.
-  if (auto* session = distributed()) { session->shutdown(); }
+  shutdown_exchange();
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
@@ -1284,10 +1285,10 @@ sirius::exchange::distributed_session& SiriusContext::distributed_session_for_us
   return *distributed_owner_;
 }
 
-uint64_t SiriusContext::next_distributed_query(ClientContext& context)
+uint64_t SiriusContext::next_distributed_query(ClientContext& context, uint64_t assigned)
 {
   // The connection state is read outside the session's lock, which never nests DuckDB's.
-  auto const query = distributed_session_for_use().next_query(context.GetConnectionId());
+  auto const query = distributed_session_for_use().next_query(context.GetConnectionId(), assigned);
   if (auto state = get_sirius_connection_state(context)) {
     if (state->active_window != 0) {
       distributed()->tie(state->active_window, query);
@@ -1301,6 +1302,11 @@ uint64_t SiriusContext::next_distributed_query(ClientContext& context)
 void SiriusContext::release_distributed_connection(ClientContext& context)
 {
   if (auto* session = distributed()) { session->release_connection(context.GetConnectionId()); }
+}
+
+void SiriusContext::shutdown_exchange()
+{
+  if (auto* session = distributed()) { session->shutdown(); }
 }
 
 void SiriusContext::set_exchange_service_for_testing(
@@ -1353,8 +1359,10 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
         static_cast<void>(downgrade.request_downgrade(
           [gpu, bytes] { return gpu->get_available_memory() >= bytes; }));
       };
-      return sirius::exchange::make_nixl_exchange(
+      auto exchange = sirius::exchange::make_nixl_exchange(
         params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+      sirius::exchange::note_exchange_joined();
+      return exchange;
     });
 }
 
