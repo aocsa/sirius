@@ -2375,11 +2375,18 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
         "distributed execution: sirius_exchange_peers set on a connection without Sirius state");
     }
     auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
-    sirius::planner::distribute_plan(plan,
-                                     sirius_ctx->get_exchange_service(op_params),
-                                     *gpu,
-                                     sirius_ctx->next_distributed_query(context),
-                                     sirius_ctx->get_query_lifecycle_registry());
+    sirius::planner::distribute_plan(
+      plan,
+      sirius_ctx->get_exchange_service(op_params),
+      *gpu,
+      sirius_ctx->next_distributed_query(context),
+      sirius_ctx->get_query_lifecycle_registry(),
+      op_params.enable_complete_group_having
+        ? planner::parquet_footer_reader{[&scans = sirius_ctx->get_scan_manager()](
+                                           std::string const& path) {
+            return scans.parquet_footer(path);
+          }}
+        : planner::parquet_footer_reader{});
   }
 }
 
