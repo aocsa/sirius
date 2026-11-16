@@ -27,6 +27,7 @@
 #include "transparent/connection_provenance.hpp"
 #include "transparent/narrow_outer_join_counts.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
+#include "transparent/push_narrowing_expressions.hpp"
 
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -73,31 +74,13 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
 /// The option as `query_operator_options` resolves it, without creating the session's overrides:
 /// those snapshot the global configuration, which would stop the session from seeing later
 /// changes to it.
-bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
+bool operator_option_enabled(duckdb::ClientContext& context, bool sirius::operator_params::* option)
 {
   auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_delim_aggregate_reuse;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_delim_aggregate_reuse;
-  }
+  if (state && state->execution_options) { return (*state->execution_options).*option; }
+  if (state && state->operator_overrides) { return (*state->operator_overrides).*option; }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
-}
-
-/// The option as `query_operator_options` resolves it, without creating the session's overrides.
-bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
-{
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_exists_minmax_rewrite;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_exists_minmax_rewrite;
-  }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+  return runtime && runtime->get_config().get_operator_params().*option;
 }
 
 /// The option as `query_operator_options` resolves it, without creating the session's overrides.
@@ -476,7 +459,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     // first, so its failure starts over before the EXISTS rewrite has replaced anything.
     auto const rewrite_subqueries =
       [&](duckdb::unique_ptr<duckdb::LogicalOperator>& copy) -> std::size_t {
-      if (delim_aggregate_reuse_enabled(context)) {
+      if (operator_option_enabled(context, &sirius::operator_params::enable_delim_aggregate_reuse)) {
         try {
           sirius::planner::reuse_delim_rows_for_subquery_aggregates(
             context, input.optimizer.binder, copy);
@@ -487,7 +470,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
           copy = copy_logical_plan(*captured, context);
         }
       }
-      if (!exists_minmax_rewrite_enabled(context)) { return 0; }
+      if (!operator_option_enabled(context, &sirius::operator_params::enable_exists_minmax_rewrite)) { return 0; }
       try {
         return sirius::planner::rewrite_correlated_inequality_exists(
           context, input.optimizer.binder, copy, gpu_memory_budget(context));
@@ -515,6 +498,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
       }
     }
     narrow_outer_join_counts(*copy, input.optimizer.binder);
+    if (operator_option_enabled(context,
+                                &sirius::operator_params::enable_narrowing_expression_pushdown)) {
+      push_narrowing_expressions(*copy, input.optimizer.binder);
+    }
     // Recorded once the plan is final, so the counts describe the plan that is captured.
     ctx->record_exists_minmax_rewrites(exists_rewrites);
     ctx->record_partial_aggregate_pushdowns(pushed_aggregates);
