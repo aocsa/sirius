@@ -81,6 +81,7 @@
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/mark_join_conversion.hpp"
+#include "planner/build_side_choice.hpp"
 #include "planner/scan_reuse_rewrites.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
@@ -2425,6 +2426,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
           read_views->record_skipped_scans(
             sirius::op::scan::capture_bound_read_views(dropped, context));
         });
+    }
+    if (!sirius_ctx || duckdb::query_operator_options(context)->enable_build_side_swap) {
+      sirius::planner::swap_unfiltered_builds(context, *op);
     }
   }
   {
