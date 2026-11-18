@@ -46,8 +46,8 @@ You also need to know where things go. Ask if the conversation does not already 
 | Input | Flag | Notes |
 |---|---|---|
 | Checkout folder | `--checkout` | Used if it exists, cloned there if not. On a file system every node mounts. The checkout you are working in is the natural choice |
-| Run folder | `--out` | New, visible from this host and from the nodes, usually under `$HOME` |
-| Launcher | `--launcher slurm` or `local` | Slurm whenever Slurm schedules the nodes. `local` is only for machines it does not |
+| Run folder | `--out` | New, visible from this host and from the nodes, usually under `$HOME`. With the `local` launcher a machine that does not see it gets its own at the same path |
+| Launcher | `--launcher slurm` or `local` | Slurm whenever Slurm schedules the nodes. `local` is only for machines it does not: section 1c |
 | Slurm partition, site options | `--partition`, `--sbatch-args`, `--time-limit` | |
 | Spill folder | `--spill-dir` | Needed by the presets; on a disk with free space |
 | Large output | `--big-dir` | The client output reaches gigabytes at large scale factors. Keep it off a `$HOME` near its quota |
@@ -132,6 +132,38 @@ python3 <this folder>/scripts/bench.py plan --reference sf30k-n2-gds --data ... 
   SF30000 and with run 1 for SF100000, and read the record's `note` first: `sf100k-n1-gds` is
   a composite of eight sessions, and `sf100k-n4-uring` counts Q5 from a rerun.
 
+## 1c. Machines without Slurm
+
+For machines reached over `ssh` (workstations, lab nodes), the `sirius-cluster` skill prepares
+them and this skill runs the benchmark. `cluster.sh init` records the hosts and their addresses
+and writes a rank config, `setup` builds the branch on each machine, `data` generates TPC-H, and
+`nodes` and `status` show what runs there. Its cluster files give the inputs of `plan`:
+
+| In `clusters/<name>.env` | For `plan` |
+|---|---|
+| `ZENO_ADDRS` | `--nodes`, comma-separated; the first is the machine `bench.py` runs on |
+| `ZENO_NET` | `--env SIRIUS_GATEWAY_PRIORITY_NETWORKS=<CIDR>` |
+| `ZENO_WORK` | `--checkout <work>/sirius`, `--out <work>/runs/<name>`, `--spill-dir <work>/spill` |
+| `ZENO_BRANCH`, `ZENO_REPO` | `--branch`, `--repo` |
+| `ZENO_SF` | `--sf`, and `--data <work>/tpch_sf<SF>` (or `ZENO_DATA`, where the file sets it) |
+| `clusters/<name>.yaml` | `--config`, once it is on the first machine (`cluster.sh push`) |
+
+- Run `bench.py` on the first machine, for example with `cluster.sh sh <first> '...'`: this skill
+  is in that machine's checkout.
+- The first machine needs `ssh` without a password to the others. Every machine needs the
+  checkout, the build, the data, Pixi and `$HOME` at the same paths.
+- The machines may share `$HOME` and the run folder, or each have its own. A machine with its
+  own gets the run folder, `config.yaml` and the gateway's `gateway.conf` copied to it, and its
+  rank logs are copied back at the end.
+- `build` builds on the first machine only. Machines with their own file system each need a
+  build at the same commit: `cluster.sh setup`, then compare the `checkout:` lines of
+  `cluster.sh nodes`.
+- `bench.py` takes Pixi from `$PIXI_HOME/bin`, or from `~/.pixi/bin`. Where `$HOME` is shared with
+  machines of another architecture, export `PIXI_HOME` as the folder that holds this machine's
+  Pixi before every `bench.py` command.
+- A checkout that is not on the branch (a detached commit) needs `--commit` with its commit.
+- `cluster.sh nodes` before the first gate, `cluster.sh status` after the last.
+
 ## 2. Plan and confirm
 
 ```bash
@@ -152,7 +184,7 @@ python3 .../bench.py build     --out <run folder> --yes   # clone if absent, the
 ```
 
 - Preflight checks the tools on this host and, on each node, that every table has Parquet files
-  and that the run folder is visible. It counts the GPUs, which gives the number of ranks. For a
+  and that the run folder is visible or can be made there. It counts the GPUs, which gives the number of ranks. For a
   custom benchmark it also finds the tables (with `--tables auto`) and resolves the query
   selection against the files in `--queries-dir`; show the user the lists it prints.
 - Build reuses a build that is already there and says which commit it is. It builds only when
@@ -179,7 +211,8 @@ all of these hold: the client exited cleanly, no statement returned an error, ev
 time, every rank is `up` and `ready` in the final status, and, for TPC-H, `supplier` has
 `10000 x SF` rows.
 `--dry-run` writes the launch script and the SQL without starting anything, which is a good way to
-show the user exactly what will run.
+show the user exactly what will run. It leaves the `smoke` folder behind, so the real smoke test
+after it needs `--rerun`.
 
 If it fails, stop and diagnose (section 7). Do not go on to the full benchmark, and do not rerun
 in a loop: after a job whose ranks were killed, wait until the node is idle again.
@@ -204,6 +237,10 @@ python3 .../bench.py report --out <run folder>
 Interrupting the script cancels the Slurm job (or stops the gateway and ranks). If you stop it any
 other way, check that nothing is left: `squeue -u $USER`, or on a machine without Slurm
 `nvidia-smi --query-compute-apps=pid --format=csv,noheader` must print nothing.
+
+The smoke test stops at its first failed statement. A full run does not: the queries after a
+failed one still run, so one failure does not hide the next. The run still ends as failed, and
+with `--sessions` the sessions after it do not start.
 
 ## 6. Report
 
@@ -289,15 +326,37 @@ job and ask first. If no reference exists, say in the report that the answers we
     smoke test with CSV results, and a smoke test and a two-session full run with Parquet
     results. Q1, Q6 and Q12 matched in each.
   - Earlier that day, the smoke test of the `gb200-sf10000` preset on one node.
+- **Run for real without Slurm** (2026-11-18, one x86_64 machine with four RTX PRO 6000 GPUs, an
+  existing build at `18fdfca21`, SF100, the config of `cluster.sh init`): the `local` launcher's
+  smoke test in single mode, 4 ranks. Q1, Q6 and Q12 took 0.61 s, 0.93 s and 0.60 s; the answers
+  were not checked. For two machines that share `$HOME` and the run folder: `plan`, `preflight`
+  (over `ssh`), `smoke --dry-run`, and a smoke test stopped by hand after 24 s. In it the second
+  machine passed `sirius_node.sh --check` and started its four ranks; no rank had joined yet, so
+  no query ran. Stopping it left the second machine's ranks running, because the checkout was a
+  link; the fix (the stop also matches the real path) was tested on stand-in processes only.
+- **Run for real on two machines without Slurm** (2026-11-18, two aarch64 machines with one GB10
+  GPU each, each with its own `$HOME` and disk, started from a macOS control machine through
+  `cluster.sh`; a new build of this branch at `5d6c3f08` and SF100 from `cluster.sh setup` and
+  `data`): `plan`, `preflight`, `build` (reuse), `show`, `smoke --dry-run` and the `local`
+  launcher's smoke test in multi mode, 2 ranks. The first run failed at session setup
+  (`rank 0 reached 0 of 1 peers in 120000 ms`): the machines cap locked memory at 15 GiB and the
+  default 16 TCP lanes pin more. With `distributed: { exchange: { tcp_lanes: 2 } }` in the
+  config it passed: Q1, Q6 and Q12 took 0.98 s, 0.29 s and 0.42 s, exchange host-staged over TCP
+  lanes; the answers were not checked. The second machine got the run folder, `config.yaml` and
+  `gateway.conf`, and its rank log came back. `cluster.sh status` was clean on both machines
+  after the failed run and after the passed one.
 - **Checked with `--dry-run` only:** the 20 reference runs as a whole. For each, the script wrote
   the config, the SQL statements and their order, the statement timeout, the commit, the rank
   count and the environment, and they equal the files of the recorded run.
 - **Tested only against stand-ins** for Slurm and for the client: a full benchmark of 22 queries,
   failure detection, a build from a fresh clone, and custom datasets (tables found
-  automatically, a views file, queries chosen by name and by number).
-- **Not run at all:** four nodes, the `local` launcher, any GDS run through this script, a run at
-  SF30000 or SF100000, `--order pass`, a new clone at `--commit`, `check` on all 22 queries or
-  with `--ref-client` on nodes, and `--results parquet` where
+  automatically, a views file, queries chosen by name and by number). Also the `local` launcher's
+  script on three machines, one of them with its own `$HOME` and file system: the copies of
+  `config.yaml` and `gateway.conf`, and the rank logs copied back.
+- **Not run at all:** four nodes, a query through the `local` launcher on machines that share
+  `$HOME`, any GDS run through this script, a run at SF30000 or SF100000, `--order pass`, a new clone at
+  `--commit`,
+  `check` on all 22 queries or with `--ref-client` on nodes, and `--results parquet` where
   Slurm confines a step to its CPUs (the client step asks for one CPU, and fetching a large
   result needs more).
 
