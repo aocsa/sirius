@@ -73,3 +73,6 @@ plans/
 # Core dumps (debugging concurrency crashes writes these into the repo root)
 core
 core.*
+
+# sirius-cluster: `init` writes the user's hosts and addresses here
+.claude/skills/sirius-cluster/clusters/
