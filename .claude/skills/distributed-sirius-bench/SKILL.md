@@ -211,7 +211,8 @@ all of these hold: the client exited cleanly, no statement returned an error, ev
 time, every rank is `up` and `ready` in the final status, and, for TPC-H, `supplier` has
 `10000 x SF` rows.
 `--dry-run` writes the launch script and the SQL without starting anything, which is a good way to
-show the user exactly what will run.
+show the user exactly what will run. It leaves the `smoke` folder behind, so the real smoke test
+after it needs `--rerun`.
 
 If it fails, stop and diagnose (section 7). Do not go on to the full benchmark, and do not rerun
 in a loop: after a job whose ranks were killed, wait until the node is idle again.
@@ -333,6 +334,17 @@ job and ask first. If no reference exists, say in the report that the answers we
   machine passed `sirius_node.sh --check` and started its four ranks; no rank had joined yet, so
   no query ran. Stopping it left the second machine's ranks running, because the checkout was a
   link; the fix (the stop also matches the real path) was tested on stand-in processes only.
+- **Run for real on two machines without Slurm** (2026-11-18, two aarch64 machines with one GB10
+  GPU each, each with its own `$HOME` and disk, started from a macOS control machine through
+  `cluster.sh`; a new build of this branch at `5d6c3f08` and SF100 from `cluster.sh setup` and
+  `data`): `plan`, `preflight`, `build` (reuse), `show`, `smoke --dry-run` and the `local`
+  launcher's smoke test in multi mode, 2 ranks. The first run failed at session setup
+  (`rank 0 reached 0 of 1 peers in 120000 ms`): the machines cap locked memory at 15 GiB and the
+  default 16 TCP lanes pin more. With `distributed: { exchange: { tcp_lanes: 2 } }` in the
+  config it passed: Q1, Q6 and Q12 took 0.98 s, 0.29 s and 0.42 s, exchange host-staged over TCP
+  lanes; the answers were not checked. The second machine got the run folder, `config.yaml` and
+  `gateway.conf`, and its rank log came back. `cluster.sh status` was clean on both machines
+  after the failed run and after the passed one.
 - **Checked with `--dry-run` only:** the 20 reference runs as a whole. For each, the script wrote
   the config, the SQL statements and their order, the statement timeout, the commit, the rank
   count and the environment, and they equal the files of the recorded run.
@@ -341,8 +353,8 @@ job and ask first. If no reference exists, say in the report that the answers we
   automatically, a views file, queries chosen by name and by number). Also the `local` launcher's
   script on three machines, one of them with its own `$HOME` and file system: the copies of
   `config.yaml` and `gateway.conf`, and the rank logs copied back.
-- **Not run at all:** four nodes, a query through the `local` launcher on more than one machine,
-  any GDS run through this script, a run at SF30000 or SF100000, `--order pass`, a new clone at
+- **Not run at all:** four nodes, a query through the `local` launcher on machines that share
+  `$HOME`, any GDS run through this script, a run at SF30000 or SF100000, `--order pass`, a new clone at
   `--commit`,
   `check` on all 22 queries or with `--ref-client` on nodes, and `--results parquet` where
   Slurm confines a step to its CPUs (the client step asks for one CPU, and fetching a large
