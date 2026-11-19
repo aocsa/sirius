@@ -1,0 +1,19 @@
+[package]
+name = "dfd-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+datafusion = "55"
+# No "grpc": the planner must work without Arrow Flight, tonic and tower.
+datafusion-distributed = { path = "../../dfd-refs/datafusion-distributed", default-features = false, features = ["parquet", "sql"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+url = "2.5.7"
+
+[profile.release]
+codegen-units = 16
+lto = false
+debug = false

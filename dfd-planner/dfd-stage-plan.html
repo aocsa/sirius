@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>DFD Stage Plan</title>
+<link rel="stylesheet" href="htmlplan.css">
+<script src="htmlplan.js" defer></script>
+<body>
+
+<header>
+  <h1>DFD Stage Plans in Distributed Sirius</h1>
+  <doc-changes new="5" changed="6"></doc-changes>
+  <details class="thread"><summary>Why · 2 requests</summary>
+    <doc-quote via="prompt" from="the user">consider using the query planner of Distributed DataFusion inside distributed-sirius as a third-party library and adding hooks to distributed-sirius to make it work. We already have tested how to use the datafusion query planner using sirius operators in this branch https://github.com/mbrobbel/sirius/tree/datafusion. We know that DFD uses datafusion planner and we need that sirius understand this plan first, so that DFD puts a boundary where DataFusion put a hash RepartitionExec. The translator must put those in, so it must make the same choices as distribute_plan().</doc-quote>
+    <doc-quote via="prompt" from="the user">create a plan with a proposal</doc-quote>
+  </details>
+</header>
+
+<main>
+<doc-plan>
+
+<!-- ═════ 1 ═════ -->
+<doc-claim>
+  <p>A rank gets the stages of DFD for a query with no DFD worker.</p>
+  <doc-code src="dfd-planner/probe-sf100-4r.txt" lines="19-24" wrap caption="Real output of the probe for Q3 on 4 ranks. Each line is one boundary, written as an exchange_spec.">
+    <doc-pin line="20" title="NetworkCoalesceExec">It becomes a gather to rank 0.</doc-pin>
+    <doc-pin line="22" tone="info" title="senders=2">DFD reads the small customer table on 2 tasks.</doc-pin>
+  </doc-code>
+
+  <doc-claim>
+    <p>The probe calls <code>create_distributed_plan</code> on the physical plan of DataFusion.</p>
+    <doc-code src="dfd-planner/probe-main.rs" lines="94-120" hl="97,100,118,120">
+      <doc-pin line="97" title="One URL for each rank"></doc-pin>
+      <doc-pin line="100" title="Built-in handlers">This call is the only public way to add the file-scan handlers.</doc-pin>
+      <doc-pin line="120" tone="ok" title="The public entry point">No coordinator and no worker start.</doc-pin>
+    </doc-code>
+    <doc-claim at="src/distributed_planner/distributed_query_planner.rs:84">
+      <p><b>distributed_query_planner.rs:84</b> · create_distributed_plan()</p>
+      <doc-code src="src/distributed_planner/distributed_query_planner.rs" lines="137-167" hl="155-156">
+        <doc-pin line="155" tone="warn" title="Crate-private pass">A library caller cannot replace this pass.</doc-pin>
+      </doc-code>
+    </doc-claim>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The probe reads each boundary through the public API of DFD.</p>
+    <doc-code src="dfd-planner/probe-main.rs" lines="36-49" hl="37,43-45">
+      <doc-pin line="37" title="NetworkBoundaryExt"></doc-pin>
+      <doc-pin line="44" title="Stage::task_count()">This number is the sender count of the stage.</doc-pin>
+    </doc-code>
+  </doc-claim>
+
+  <doc-claim>
+    <p>DFD builds with no Arrow Flight.</p>
+    <doc-code src="dfd-planner/probe-Cargo.toml" lines="9-14" hl="12" wrap>
+      <doc-pin line="12" tone="ok" title="No grpc feature">The package arrow-flight is not in the dependency tree.</doc-pin>
+    </doc-code>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The plans of the probe are the same as the plans of the DFD coordinator.</p>
+    <doc-mock frame="terminal" title="gcn-01 · SF100" w="470"><template><span class="dim">></span> for n in 2 4 8 16; for q in 01..22
+<span class="dim">    dfd-probe $SF100 q$q.sql $n $((144/n)) --plan</span>
+<span class="dim">    cmp probe.plan runs/sf100-${n}p/plans/q$q.txt</span>
+<span class="g">✓</span> byte-identical plans: <b>88 of 88</b>
+
+<span class="dim">></span> time dfd-probe $SF100 q03.sql 4 36
+real    <b>0m0.090s</b></template></doc-mock>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═════ 2 ═════ -->
+<doc-claim>
+  <p><code>distribute_plan()</code> puts each exchange where a directive tells it.</p>
+  <doc-code title="directives for Q3 on 4 ranks · sketch" lang="text" caption="One line for each site where distribute_plan() decides today.">
+<script type="text/plain">
+# q03, 4 ranks, source: dfd-probe
+site 0  HASH_JOIN       customer x orders     probe=hash  build=hash
+site 1  HASH_JOIN       (c x o) x lineitem    probe=hash  build=hash
+site 2  MERGE_GROUP_BY  l_orderkey, ...       none
+site 3  MERGE_TOP_N                           gather
+</script>
+    <doc-pin line="4" tone="ok" title="none">DFD keeps the group-by in the stage of the join.</doc-pin>
+  </doc-code>
+  <doc-ask id="depth">
+    <p>How much of the plan does DFD control?</p>
+    <label><input type="radio" name="depth" value="directives" checked> The exchange choices only <small>Sirius keeps its own plan and operators</small></label>
+    <label><input type="radio" name="depth" value="full"> The full physical plan <small>a new translator; approximately 2 to 3 months</small></label>
+    <label><input type="radio" name="depth" value="advisor"> Nothing in the engine <small>the probe stays a report tool; claims 2 to 4 go</small></label>
+  </doc-ask>
+  <div data-if="depth=full"><doc-note tone="risk"><strong>Risk</strong> DataFusion then replaces the DuckDB optimizer and the plan generator of Sirius. The translator must read 16 node types for TPC-H.</doc-note></div>
+
+  <doc-claim>
+    <p>The three boundary types of DFD map to <code>exchange_spec</code>.</p>
+    <doc-code src="src/op/sirius_physical_exchange_sink.hpp" lines="38-71" hl="40,44,45,70">
+      <doc-pin line="40" title="NetworkShuffleExec">The keys come from the hash RepartitionExec.</doc-pin>
+      <doc-pin line="41" tone="warn" title="No DFD boundary">DFD has no range repartition. Sirius keeps its sort rule.</doc-pin>
+      <doc-pin line="44" title="NetworkBroadcastExec"></doc-pin>
+      <doc-pin line="45" title="NetworkCoalesceExec"></doc-pin>
+      <doc-pin line="70" title="Task count of the consumer stage">It is the rank count with the defaults of DFD.</doc-pin>
+    </doc-code>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The rewriter asks for a directive at each site where it decides today.</p>
+    <doc-calls title="distribute_plan()" caption="Three cases change. insert() and the shape check do not change.">
+<script type="text/plain">
+~ distribute_plan(plan, service, ..., stages, directives)  @ src/planner/distributed_plan.cpp:952
+~   rewriter::visit(slot)                                  @ src/planner/distributed_plan.cpp:657
++     **next_directive**(site)                             @ src/planner/distributed_plan.cpp:657  -- sketch in the shared claim
+~     case HASH_JOIN: broadcast, hash or rank 0            @ src/planner/distributed_plan.cpp:693
+~     case MERGE_GROUP_BY: hash or none                    @ src/planner/distributed_plan.cpp:835
+~     case MERGE_SORT: range or gather                     @ src/planner/distributed_plan.cpp:864
+      insert(slot, spec, ordered)                          @ src/planner/distributed_plan.cpp:527
+      merge_filters_across_ranks(join)                     @ src/planner/distributed_plan.cpp:623
+    require_same_shape(r)                                  @ src/planner/distributed_plan.cpp:901
+
+~ sirius_physical_plan_generator: stage_policy{...}        @ src/planner/sirius_physical_plan_generator.cpp:2391
++   **read_directives**(op_params.exchange_directives)     @ src/planner/sirius_physical_plan_generator.cpp:2412  -- a file path in the first slice
+</script>
+    </doc-calls>
+    <doc-claim at="src/planner/distributed_plan.cpp:693">
+      <p><b>distributed_plan.cpp:693</b> · the join site</p>
+      <doc-code src="src/planner/distributed_plan.cpp" lines="693-724" hl="693-695,708-709">
+        <doc-pin line="693" title="The broadcast rule of today">A directive replaces these three lines.</doc-pin>
+        <doc-pin line="710" tone="warn" title="Bloom merge">It stays for each hashed join. DFD has no boundary for it.</doc-pin>
+      </doc-code>
+    </doc-claim>
+    <doc-claim at="src/planner/distributed_plan.cpp:835">
+      <p><b>distributed_plan.cpp:835</b> · the group-by site</p>
+      <doc-code src="src/planner/distributed_plan.cpp" lines="817-836" hl="835">
+        <doc-pin line="835" title="Always an exchange today">The directive "none" skips this call.</doc-pin>
+      </doc-code>
+    </doc-claim>
+  </doc-claim>
+
+  <doc-claim>
+    <p>With no directive, the rewriter decides as it does today.</p>
+    <doc-code diff file="src/planner/distributed_plan.cpp" start="693" caption="The join site. The other two sites get the same shape.">
+<script type="text/plain">
+@@ -693,3 +693,6 @@
+-        if (emits_build_rows_only_with_probe(join.join_type) &&
+-            bbytes <= max_broadcast_build_bytes &&
+-            bbytes <= estimated_bytes(*probe.children[0]) / std::max<std::uint64_t>(world - 1, 1)) {
++        auto const told = directives.next(T::HASH_JOIN);
++        bool const broadcast_safe = emits_build_rows_only_with_probe(join.join_type);
++        if (told ? told->routing == exchange_spec::mode::broadcast && broadcast_safe
++                 : broadcast_safe && bbytes <= max_broadcast_build_bytes &&
++                     bbytes <= estimated_bytes(*probe.children[0]) /
++                                 std::max<std::uint64_t>(world - 1, 1)) {
+</script>
+      <doc-pin line="695" tone="warn" title="Safety stays in Sirius">A directive cannot broadcast a join that emits build rows.</doc-pin>
+    </doc-code>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═════ 3 ═════ -->
+<doc-claim>
+  <p>Each rank uses the same directives for a query.</p>
+  <doc-flow caption="Each rank makes its directives from the same SQL and the same Parquet footers.">
+<script type="text/plain">
+sql   = SQL statement / each rank
++ dfd = sirius-dfd / DataFusion + DFD [green]
++ dir = directives / one per site
+dp    = distribute_plan() / each rank
+sh    = require_same_shape() / all-gather
+run   = EXCHANGE_SINK and SOURCE / GPU exchange
+| sql | dfd | dir |
+| .   | dp  | sh  |
+| .   | run | .   |
+sql -> dfd : plan
+dfd -> dir : walk
+dir -> dp : each site
+sql -> dp : Sirius plan
+dp -> sh : shape hash
+dp -> run : insert()
+</script>
+  </doc-flow>
+  <doc-ask id="who">
+    <p>Which rank makes the directives?</p>
+    <label><input type="radio" name="who" value="each" checked> Each rank <small>the model of today; no new stream</small></label>
+    <label><input type="radio" name="who" value="rank0"> Rank 0, and it sends them <small>one planner; adds an all-gather before the rewrite</small></label>
+  </doc-ask>
+
+  <doc-claim>
+    <p>The routing and the width of each exchange are in the plan shape.</p>
+    <doc-code src="src/planner/distributed_plan.cpp" lines="545-556" hl="551-555">
+      <doc-pin line="551" tone="ok" title="No change">A different directive on one rank gives a different shape.</doc-pin>
+    </doc-code>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The query stops on all ranks when one shape is different.</p>
+    <doc-code src="src/planner/distributed_plan.cpp" lines="924-947" hl="940-946"></doc-code>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═════ 4 ═════ -->
+<doc-claim>
+  <p>The exchange of Sirius moves the rows. No DFD worker starts.</p>
+  <doc-calls title="sirius-dfd · sketch" caption="Red rows are the parts of DFD that do not run.">
+<script type="text/plain">
++ **plan_directives**(sql, tables, ranks)                    @ rust/crates/sirius-dfd/src/lib.rs:1
++   with_distributed_worker_resolver(**Ranks**)              @ rust/crates/sirius-dfd/src/lib.rs:20   -- one URL for each rank
++   with_distributed_planner()                               @ rust/crates/sirius-dfd/src/lib.rs:24   -- the file-scan handlers of DFD
+?   with_distributed_desired_task_count_handler(**Scans**)   @ rust/crates/sirius-dfd/src/lib.rs:28   -- proposed: task counts from the footers of Sirius
+?   with_distributed_scale_up_leaf_node_handler(**Keep**)    @ rust/crates/sirius-dfd/src/lib.rs:32   -- proposed: Sirius keeps its scan shares
++   create_distributed_plan(physical, state)                 @ rust/crates/sirius-dfd/src/lib.rs:40
++   **walk**(plan)                                           @ rust/crates/sirius-dfd/src/boundaries.rs:1  -- the walk() of the probe
+-   DistributedExec::execute()                               @ rust/crates/sirius-dfd/src/lib.rs:44   -- never called: no Flight, no worker
+-   RouteTaskHandler, WorkerPlanRewriteHandler               @ rust/crates/sirius-dfd/src/lib.rs:44   -- not used: task k is rank k
+</script>
+  </doc-calls>
+
+  <doc-claim>
+    <p>The distributed code stays out of the standalone operators.</p>
+    <doc-tree caption="No file under src/op/ changes.">
+<script type="text/plain">
+rust/
+  ~ Cargo.toml                         # one new workspace member
+  crates/
+    + sirius-dfd/                      # DataFusion 55, DFD with no grpc
+      + Cargo.toml
+      + src/lib.rs                     # plan_directives()
+      + src/boundaries.rs              # walk(), from the probe
+src/
+  planner/
+    + exchange_directives.hpp          # the shared record
+    ~ distributed_plan.hpp             # one more argument
+    ~ distributed_plan.cpp             # three sites
+    ~ sirius_physical_plan_generator.cpp
+  ~ sirius_config.hpp                  # exchange_directives setting
+  ~ sirius_extension.cpp
+test/cpp/planner/
+  + test_exchange_directives.cpp
+</script>
+    </doc-tree>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The branch of mbrobbel gives Sirius a logical plan, not a physical plan.</p>
+    <doc-code title="experimental/datafusion/src/plan.rs · mbrobbel/sirius d5d406c34" lang="rust" start="24">
+<script type="text/plain">
+pub async fn prepare_query(ctx: &SessionContext, sql: &str) -> Result<Vec<u8>> {
+    let frame = ctx.sql(sql).await?;
+    let (state, plan) = frame.into_parts();
+    let plan = state.optimize(&plan)?;
+    let mut plan = *to_substrait_plan(&plan, &state)?;
+    let table_names = named_tables(&plan)?;
+    let bindings = bindings_from_context(ctx, table_names).await?;
+    bind_named_tables(&mut plan, &bindings)?;
+    Ok(plan.encode_to_vec())
+}
+</script>
+      <doc-pin line="27" tone="warn" title="Logical optimizer only">No RepartitionExec exists on this path.</doc-pin>
+      <doc-pin line="28" title="Substrait">DuckDB and Sirius then select each physical operator.</doc-pin>
+    </doc-code>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═════ 5 ═════ -->
+<doc-claim>
+  <p>The first slice runs Q12 and Q3 and measures the bytes.</p>
+  <doc-mock frame="terminal" title="exp/stage-tasks · SF1000 · 4 ranks · today" w="470"><template><b>Q12</b>  s2 hash   orders, o_orderkey     0.462 GB
+     s3 hash   lineitem, l_orderkey   0.420 GB
+     s4 hash   group-by, l_shipmode   0.000 GB
+     <span class="dim">DFD: the same 3 hash boundaries</span>
+     <span class="g">expected: same shape, same answer</span>
+
+<b>Q3</b>   s2 hash   lineitem, l_orderkey   0.543 GB
+     s3 bcast  customer               0.360 GB
+     s4 hash   customer x orders      2.206 GB
+     s5 hash   group-by               <span class="y">0.204 GB</span>
+     <span class="dim">DFD: no exchange below the group-by</span>
+     <span class="g">expected: s5 goes</span></template></doc-mock>
+  <doc-ask id="first">
+    <p>Which queries does the first slice run?</p>
+    <label><input type="radio" name="first" value="q12q3" checked> Q12, then Q3 <small>Q12 proves the hook; Q3 removes one exchange</small></label>
+    <label><input type="radio" name="first" value="q12"> Q12 only <small>no change in bytes; the smallest proof</small></label>
+    <label><input type="radio" name="first" value="six"> Q3, Q5, Q9, Q12, Q18, Q21 <small>Q5, Q9 and Q21 need the join order of DataFusion first</small></label>
+  </doc-ask>
+
+  <doc-claim>
+    <p>DFD with the defaults of DataFusion shuffles more than Sirius does.</p>
+    <doc-mock frame="terminal" title="hash / broadcast boundaries · 4 ranks" w="470"><template>       DFD default   DFD 1 GiB   Sirius today
+<b>Q3</b>       4 / 0        1 / 2       3 / 1
+<b>Q5</b>       7 / 2        1 / 5       5 / 3
+<b>Q9</b>       <span class="r">9 / 1</span>        5 / 3       5 / 3
+<b>Q21</b>      7 / 1        5 / 3       4 / 3
+
+<span class="dim">DFD default: broadcast below 1 MiB or 131072 rows</span>
+<span class="dim">Sirius: build ≤ 1 GiB and ≤ probe / (ranks − 1)</span>
+<span class="dim">DFD: SF100 probe. Sirius: SF1000 engine.log.</span></template></doc-mock>
+    <doc-ask id="bcast">
+      <p>Which broadcast rule do the directives use?</p>
+      <label><input type="radio" name="bcast" value="sirius" checked> The rule of Sirius <small>DFD supplies the group-by and width choices only</small></label>
+      <label><input type="radio" name="bcast" value="df1g"> DataFusion with a 1 GiB threshold <small>more broadcasts than today on Q5</small></label>
+      <label><input type="radio" name="bcast" value="dfdefault"> The defaults of DataFusion <small>more shuffles than today</small></label>
+    </doc-ask>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The work on the crate starts only if the slice sends fewer bytes.</p>
+    <doc-machine name="slice" caption="The times are estimates. The Bloom merges do not change in this plan.">
+<script type="text/plain">
+machine slice initial hook
+state hook          # Add the directive lookups. Read the directives from a file. Approximately one week.
+state measure       # Run Q12 and Q3 at SF1000 on 4 ranks. Compare the GB of each stream.
+state crate final   # Add sirius-dfd and the DataFusion front end. Approximately 3 to 4 weeks.
+state stop  final   # Keep the hook. Keep the probe as a report tool.
+
+| hook | measure | crate |
+| .    | stop    | .     |
+
+hook    -tests->  measure : same answers
+measure -fewer->  crate   : fewer GB
+measure -same->   stop    : no gain
+</script>
+    </doc-machine>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═════ shared ═════ -->
+<doc-claim aux="shared">
+  <p>Shared: one directive record.</p>
+  <doc-schema id="directive" lang="cpp" title="src/planner/exchange_directives.hpp · sketch" caption="An empty list keeps the behaviour of today.">
+<script type="text/plain">
+namespace sirius::planner {
+
+/// What one site of distribute_plan() does, from an external planner.
+struct exchange_directive {
+  op::SiriusPhysicalOperatorType site;       // HASH_JOIN, MERGE_GROUP_BY, MERGE_SORT
+  std::optional<op::exchange_spec::mode> routing;  // nullopt = no exchange at this site
+  exchange::rank_t width = 0;                // receivers; 0 = each rank
+  std::string source;                        // "dfd stage 3 -> 5", for the log
+};
+
+/// One query's directives, in visit order. A site of a different type is an error.
+struct exchange_directives {
+  std::vector<exchange_directive> sites;
+  std::size_t next_site = 0;
+  exchange_directive const* next(op::SiriusPhysicalOperatorType site);
+};
+
+}  // namespace sirius::planner
+</script>
+  </doc-schema>
+</doc-claim>
+
+<!-- ═════ scope ═════ -->
+<doc-claim aux="scope">
+  <p>Not changing: operators, the exchange, the Bloom merge, the sort.</p>
+  <ul>
+    <li>No file under <code>src/op/</code> and <code>src/exchange/</code> changes.</li>
+    <li>The Bloom all-gather merge, the range exchange, the delim joins and the deferred probe scan stay. DFD has no boundary for them.</li>
+    <li>The SQL path through DuckDB stays the default.</li>
+    <li>The adaptive task counts of DFD are private to its crate. They are not in this plan.</li>
+    <li>This plan pushes nothing.</li>
+  </ul>
+</doc-claim>
+
+</doc-plan>
+</main>
+</body></html>

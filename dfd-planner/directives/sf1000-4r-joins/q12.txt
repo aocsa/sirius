@@ -1,0 +1,4 @@
+# q12.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=dfd
+MERGE_GROUP_BY l_shipmode hash  # stage 4, FinalPartitioned
+HASH_JOIN l_orderkey=o_orderkey hash  # stage 3, Partitioned

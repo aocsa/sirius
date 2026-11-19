@@ -1,0 +1,6 @@
+# q15.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=dfd
+HASH_JOIN max(revenue_view.total_revenue)=total_revenue broadcast  # stage 6, CollectLeft
+MERGE_GROUP_BY l_suppkey hash  # stage 2, FinalPartitioned
+HASH_JOIN s_suppkey=supplier_no hash  # stage 6, Partitioned
+MERGE_GROUP_BY l_suppkey hash  # stage 6, FinalPartitioned

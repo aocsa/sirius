@@ -1,0 +1,8 @@
+# q09.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=dfd
+MERGE_GROUP_BY nation,o_year hash  # stage 11, FinalPartitioned
+HASH_JOIN n_nationkey=s_nationkey broadcast  # stage 10, CollectLeft
+HASH_JOIN o_orderkey=l_orderkey hash  # stage 10, Partitioned
+HASH_JOIN ps_suppkey=l_suppkey,ps_partkey=l_partkey hash  # stage 9, Partitioned
+HASH_JOIN s_suppkey=l_suppkey hash  # stage 8, Partitioned
+HASH_JOIN p_partkey=l_partkey hash  # stage 7, Partitioned

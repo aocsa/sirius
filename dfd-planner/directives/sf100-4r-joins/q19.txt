@@ -1,0 +1,3 @@
+# q19.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=dfd
+HASH_JOIN p_partkey=l_partkey hash  # stage 3, Partitioned
