@@ -20,6 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/stage_choice.hpp"
 #include "exchange/wire.hpp"
 #include "expression/ast/utils.hpp"
 #include "log/logging.hpp"
@@ -553,6 +554,7 @@ struct rewriter {
       shape += std::to_string(key) + ",";
     }
     if (spec.width != 0) { shape += "w" + std::to_string(spec.width); }
+    if (spec.build_choice) { shape += spec.counts_build ? "cb" : "cp"; }
     {
       static constexpr std::array<std::string_view, 4> modes{
         "hash", "range", "broadcast", "gather"};
@@ -562,6 +564,7 @@ struct rewriter {
       }
       label += "] casts=" + std::to_string(spec.key_cast_types.size()) +
                (spec.width != 0 ? " width=" + std::to_string(spec.width) : std::string{}) +
+               (!spec.build_choice ? "" : spec.counts_build ? " choice=build" : " choice=probe") +
                " est_rows=" + std::to_string(rows) +
                " below=" + op::SiriusPhysicalOperatorToString(child->type);
       service->describe(id, std::move(label));
@@ -587,8 +590,10 @@ struct rewriter {
   /// (a gathered aggregate) is spread from there; the other ranks' copies of it hold no rows.
   /// With @p stay_narrow, an input on rank 0 alone (placement::narrow) is left there.
   placement hash_below(op::sirius_physical_operator& partition_node,
-                       bool null_keys_to_every_rank = false,
-                       bool stay_narrow             = false)
+                       bool null_keys_to_every_rank                             = false,
+                       bool stay_narrow                                         = false,
+                       std::shared_ptr<exchange::broadcast_choice> build_choice = nullptr,
+                       bool counts_build                                        = false)
   {
     auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
     auto const where = visit(partition.children[0]);
@@ -597,6 +602,8 @@ struct rewriter {
     spec.key_columns             = partition.partition_keys();
     spec.key_cast_types          = partition.specification().key_cast_types;
     spec.null_keys_to_every_rank = null_keys_to_every_rank;
+    spec.build_choice            = std::move(build_choice);
+    spec.counts_build            = counts_build && spec.build_choice != nullptr;
     insert(partition.children[0], std::move(spec), false);
     return placement::spread;
   }
@@ -620,7 +627,9 @@ struct rewriter {
   /// alone would drop rows other ranks' builds match, so every rank's Bloom is merged. With
   /// @p narrow the join runs on rank 0 alone: its build is whole there, and its Bloom goes from
   /// there to every rank, whose scans it filters.
-  void merge_filters_across_ranks(op::sirius_physical_hash_join& join, bool narrow = false)
+  void merge_filters_across_ranks(op::sirius_physical_hash_join& join,
+                                  bool narrow                                             = false,
+                                  std::shared_ptr<exchange::broadcast_choice> whole_build = nullptr)
   {
     if (!join.publishes_dynamic_filters()) { return; }
     auto const build_rows = join.children[1]->estimated_cardinality;
@@ -648,7 +657,8 @@ struct rewriter {
         join.dynamic_filter_plan().admitted_keys().size(),
         *gpu,
         op::bloom_all_gather_merge::default_timeout,
-        narrow ? std::optional<exchange::rank_t>{0} : std::nullopt),
+        narrow ? std::optional<exchange::rank_t>{0} : std::nullopt,
+        std::move(whole_build)),
       // Rank 0 alone holds a narrow join's build: all of its keys, not one part in the ranks.
       narrow ? 1 : service->world_size());
     shape += narrow ? "F0" : "F";
@@ -707,7 +717,20 @@ struct rewriter {
         auto const pbytes = estimated_bytes(*probe.children[0]);
         bool const narrow = stages.stage_bytes > 0 && bbytes <= stages.stage_bytes &&
                             pbytes <= stages.stage_bytes - bbytes;
-        merge_filters_across_ranks(join, narrow);
+        // A build that really holds few bytes goes whole to every rank, as the small estimated
+        // one above does, and the probe rows stay: the build side's sinks count it as it runs.
+        std::shared_ptr<exchange::broadcast_choice> choice;
+        if (!narrow && stages.broadcast_bytes > 0 &&
+            emits_build_rows_only_with_probe(join.join_type) &&
+            join.join_type != duckdb::JoinType::MARK) {
+          auto const count_stream = stream();
+          service->describe(count_stream, "build bytes");
+          choice = std::make_shared<exchange::broadcast_choice>(
+            service, count_stream, stages.broadcast_bytes, *gpu);
+          // With the limit: ranks that differ in it would choose differently as they run.
+          shape += "C" + std::to_string(stages.broadcast_bytes);
+        }
+        merge_filters_across_ranks(join, narrow, choice);
         if (narrow) {
           shape += "N";
           to_rank0_below(probe);
@@ -719,8 +742,8 @@ struct rewriter {
         // join's NULL build keys match nothing yet turn a missed probe row's mark NULL, so every
         // rank needs them; its sink also sends every rank one build row, so that a NULL probe
         // key's mark is NULL on any rank once the build has rows.
-        hash_below(probe);
-        hash_below(build, join.join_type == duckdb::JoinType::MARK);
+        hash_below(probe, false, false, choice);
+        hash_below(build, join.join_type == duckdb::JoinType::MARK, false, choice, true);
         return done(placement::spread);
       }
 

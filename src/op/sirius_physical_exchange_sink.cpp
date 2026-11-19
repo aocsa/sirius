@@ -32,7 +32,10 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -359,10 +362,11 @@ void sirius_physical_exchange_sink::sink(const operator_data& input_data,
   }
   _held.push_back({batches, routed.destinations()});
   if (_held_bytes <= _spec.build_choice->share()) { return; }
-  // More than this rank's share: the build is hashed, whatever the other ranks hold.
-  _spec.build_choice->over();
+  // More than this rank's share: the build is hashed, whatever the other ranks hold. A task
+  // that holds a batch before over() has settled it is past its share too, and comes here.
   auto const held = std::exchange(_held, {});
   lock.unlock();
+  _spec.build_choice->over();
   for (auto const& h : held) {
     send(h.batches, h.destinations, false);
   }
@@ -435,6 +439,9 @@ void sirius_physical_exchange_sink::on_finalize_operator()
 {
   if (_spec.counts_build && !_spec.build_choice->known()) {
     _settling = std::jthread{[this] {
+      // Not one of the GPU's task threads: it has to pick the GPU itself.
+      rmm::cuda_set_device_raii const device{
+        rmm::cuda_device_id{_spec.build_choice->gpu().get_device_id()}};
       settle_build();
       close_streams();
     }};

@@ -3070,6 +3070,14 @@ static void SetExchangeStageBytes(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated config EXCHANGE_STAGE_BYTES to {}", params->exchange_stage_bytes);
 }
 
+static void SetExchangeBroadcastBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                     = get_operator_params(context, scope);
+  params->exchange_broadcast_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EXCHANGE_BROADCAST_BYTES to {}",
+                   params->exchange_broadcast_bytes);
+}
+
 static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                       = get_operator_params(context, scope);
@@ -3593,6 +3601,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.exchange_stage_bytes),
                     SetExchangeStageBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "exchange_broadcast_bytes",
+                    "distributed: send a join's build of at most this many bytes whole; 0 = off",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.exchange_broadcast_bytes),
+                    SetExchangeBroadcastBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_scan_reuse_rewrites",

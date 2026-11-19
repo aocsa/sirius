@@ -33,6 +33,10 @@ namespace sirius::exchange {
 class exchange_service;
 }
 
+namespace sirius::exchange {
+class broadcast_choice;
+}  // namespace sirius::exchange
+
 namespace sirius::op {
 
 /**
@@ -47,6 +51,9 @@ namespace sirius::op {
  * A join that runs on one rank alone has its whole build there. Constructed with that rank, only
  * it sends its Bloom, one copy to each rank, and every other rank publishes that filter at that
  * size in place of its own, which is empty. A rank that did not get it publishes nothing.
+ *
+ * A join whose build may go whole to every rank as it runs (exchange::broadcast_choice) merges
+ * nothing when it did: each rank's filters hold every key, and every rank leaves the all-gathers.
  */
 class bloom_all_gather_merge final : public cross_rank_filter_merge {
  public:
@@ -59,13 +66,15 @@ class bloom_all_gather_merge final : public cross_rank_filter_merge {
    * @param gpu Where this rank's contribution and the gathered filters are allocated.
    * @param timeout A rank that has not sent its filter by then is given up on.
    * @param only_from The one rank whose build holds every key, when the join runs there alone.
+   * @param whole_build The join's choice of a build whole on every rank, when it has one.
    */
   bloom_all_gather_merge(std::shared_ptr<exchange::exchange_service> service,
                          exchange::stream_id first_stream,
                          std::size_t key_count,
                          cucascade::memory::memory_space& gpu,
                          std::chrono::milliseconds timeout          = default_timeout,
-                         std::optional<exchange::rank_t> only_from = std::nullopt);
+                         std::optional<exchange::rank_t> only_from = std::nullopt,
+                         std::shared_ptr<exchange::broadcast_choice> whole_build = nullptr);
 
   void merge(std::span<std::shared_ptr<sirius_dynamic_filter>> membership,
              ::cuda::stream_ref stream) override;
@@ -81,6 +90,7 @@ class bloom_all_gather_merge final : public cross_rank_filter_merge {
   cucascade::memory::memory_space* _gpu;
   std::chrono::milliseconds _timeout;
   std::optional<exchange::rank_t> _only_from;
+  std::shared_ptr<exchange::broadcast_choice> _whole_build;
 };
 
 /// The bounds of a merged Bloom's size in keys, until the streaming OR (#2375).

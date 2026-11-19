@@ -71,6 +71,9 @@ class stage_count {
   /// Whether this rank has its answer.
   [[nodiscard]] bool resolved() const;
 
+  /// The GPU the counts are gathered on.
+  [[nodiscard]] cucascade::memory::memory_space& gpu() const noexcept { return *_gpu; }
+
   /// The answer another thread of this rank gets from total() or over(); blocks until it has it.
   /// @throws as total(), or sirius::internal_exception after the timeout.
   [[nodiscard]] std::optional<std::uint64_t> wait() const;
@@ -128,6 +131,9 @@ class broadcast_choice {
 
   /// The choice; blocks until this rank has it. @throws as stage_count::wait().
   [[nodiscard]] bool wait() const { return fits(_count.wait()); }
+
+  /// The GPU the counts are gathered on.
+  [[nodiscard]] cucascade::memory::memory_space& gpu() const noexcept { return _count.gpu(); }
 
  private:
   [[nodiscard]] bool fits(std::optional<std::uint64_t> sum) const noexcept

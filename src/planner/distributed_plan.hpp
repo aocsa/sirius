@@ -81,6 +81,9 @@ struct stage_policy {
   /// A hashed join whose two inputs are estimated at this many bytes or fewer in all runs on
   /// rank 0 alone, and so does what is above it, until an operator spreads its rows again.
   std::uint64_t stage_bytes = 0;
+  /// A hashed join's build side is counted as it runs: a build of at most this many bytes over
+  /// all ranks goes whole to every rank, and the probe rows stay where they are.
+  std::uint64_t broadcast_bytes = 0;
 };
 
 /**

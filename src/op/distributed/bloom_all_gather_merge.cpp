@@ -20,6 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/stage_choice.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
@@ -46,19 +47,41 @@ bloom_all_gather_merge::bloom_all_gather_merge(std::shared_ptr<exchange::exchang
                                                std::size_t key_count,
                                                cucascade::memory::memory_space& gpu,
                                                std::chrono::milliseconds timeout,
-                                               std::optional<exchange::rank_t> only_from)
+                                               std::optional<exchange::rank_t> only_from,
+                                               std::shared_ptr<exchange::broadcast_choice> whole_build)
   : _service(std::move(service)),
     _first_stream(first_stream),
     _key_count(key_count),
     _gpu(&gpu),
     _timeout(timeout),
-    _only_from(only_from)
+    _only_from(only_from),
+    _whole_build(std::move(whole_build))
 {
 }
 
 void bloom_all_gather_merge::merge(std::span<std::shared_ptr<sirius_dynamic_filter>> membership,
                                    ::cuda::stream_ref stream)
 {
+  if (_whole_build) {
+    // The build's stream has ended on this rank, so its choice is known here.
+    bool whole = false;
+    try {
+      whole = _whole_build->wait();
+    } catch (std::exception const& e) {
+      // A failed choice has aborted the query. As after a failed merge, nothing is published.
+      SIRIUS_LOG_WARN("[publish_dynamic_filters] the build's choice failed: {}", e.what());
+      for (auto& filter : membership) {
+        filter.reset();
+      }
+      leave_merges(0, membership.size());
+      return;
+    }
+    // Whole on every rank: this rank's filters hold every key, and every rank leaves.
+    if (whole) {
+      leave_merges(0, membership.size());
+      return;
+    }
+  }
   // A rank's contribution: rep | family | scale | storage bytes | the Bloom's words, as UINT32.
   constexpr std::size_t header = 4;
   auto const mr                = _gpu->get_default_allocator();

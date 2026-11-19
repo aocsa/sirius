@@ -593,6 +593,49 @@ TEST_CASE("distribute_plan runs a join whose inputs fit the stage budget on rank
   }
 }
 
+TEST_CASE("distribute_plan lets a hashed join send a small build whole, chosen as it runs",
+          "[exchange][planner]")
+{
+  fixture f;
+  auto const sql =
+    std::string{"SELECT b.k, count(*) FROM big b JOIN big2 c ON b.k = c.k GROUP BY b.k"};
+
+  SECTION("with a limit, the two sides share one choice and the build side counts for it")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.broadcast_bytes = std::uint64_t{1} << 20}) ==
+            std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    REQUIRE(sink_below(*probe));
+    REQUIRE(sink_below(*build));
+    auto const& probe_spec = sink_below(*probe)->spec();
+    auto const& build_spec = sink_below(*build)->spec();
+    CHECK(build_spec.routing == exchange_spec::mode::hash);
+    REQUIRE(build_spec.build_choice);
+    CHECK(build_spec.counts_build);
+    CHECK(probe_spec.build_choice == build_spec.build_choice);
+    CHECK_FALSE(probe_spec.counts_build);
+  }
+
+  SECTION("without a limit there is no choice")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK_FALSE(sink_below(*side)->spec().build_choice);
+      CHECK_FALSE(sink_below(*side)->spec().counts_build);
+    }
+  }
+}
+
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")
 {
   fixture f;

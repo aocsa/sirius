@@ -246,11 +246,17 @@ dynamic_filter_publish_plan filter_plan(
 std::shared_ptr<sirius::op::bloom_all_gather_merge> merge_over(
   std::shared_ptr<exchange_service> service,
   dynamic_filter_publish_plan const& plan,
-  std::chrono::milliseconds timeout = std::chrono::seconds{30},
-  std::optional<rank_t> only_from   = std::nullopt)
+  std::chrono::milliseconds timeout                               = std::chrono::seconds{30},
+  std::optional<rank_t> only_from                                 = std::nullopt,
+  std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
 {
-  return std::make_shared<sirius::op::bloom_all_gather_merge>(
-    std::move(service), 41, plan.admitted_keys().size(), *env().gpu, timeout, only_from);
+  return std::make_shared<sirius::op::bloom_all_gather_merge>(std::move(service),
+                                                              41,
+                                                              plan.admitted_keys().size(),
+                                                              *env().gpu,
+                                                              timeout,
+                                                              only_from,
+                                                              std::move(whole_build));
 }
 
 /// Merges @p plan's filters across ranks. Each rank sizes its Bloom from its rows times the
@@ -260,11 +266,12 @@ void merge_across_ranks(dynamic_filter_publish_plan& plan,
                         std::size_t min_keys,
                         std::size_t max_keys              = std::size_t{1} << 30,
                         std::chrono::milliseconds timeout = std::chrono::seconds{30},
-                        std::optional<rank_t> only_from   = std::nullopt)
+                        std::optional<rank_t> only_from   = std::nullopt,
+                        std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
 {
   // A build that is whole on one rank holds all of its keys there.
   auto const ranks = only_from ? rank_t{1} : service->world_size();
-  auto merge       = merge_over(std::move(service), plan, timeout, only_from);
+  auto merge = merge_over(std::move(service), plan, timeout, only_from, std::move(whole_build));
   plan.set_cross_rank_merge(
     std::move(merge), sirius::op::merged_bloom_policy(plan.policy(), ranks, min_keys, max_keys));
 }
@@ -337,11 +344,17 @@ struct whole_build_join {
   explicit whole_build_join(std::shared_ptr<exchange_service> service,
                             std::size_t min_keys            = 4096,
                             std::uint64_t cap               = 64 * KiB,
-                            std::optional<rank_t> only_from = std::nullopt)
+                            std::optional<rank_t> only_from = std::nullopt,
+                            std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
     : plan(filter_plan(channel, cap))
   {
-    merge_across_ranks(
-      plan, std::move(service), min_keys, std::size_t{1} << 30, std::chrono::seconds{30}, only_from);
+    merge_across_ranks(plan,
+                       std::move(service),
+                       min_keys,
+                       std::size_t{1} << 30,
+                       std::chrono::seconds{30},
+                       only_from,
+                       std::move(whole_build));
   }
 
   sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
@@ -594,6 +607,29 @@ TEST_CASE("a merge from one rank gives every rank that rank's Bloom, at its size
     CHECK(members(*bloom, keys) == keys.size());
     CHECK(members(*bloom, sequence(1'000'000, 1, 6000)) < 100);
   }
+}
+
+TEST_CASE("a rank whose build went whole to every rank publishes its own Bloom and gathers none",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(3);
+  // Every rank's build sinks held few bytes: the build went whole to every rank.
+  std::vector<std::shared_ptr<sirius::exchange::broadcast_choice>> whole(3);
+  std::vector<int> decided(3, 0);
+  on_every_rank(3, [&](rank_t r) {
+    whole[r] = std::make_shared<sirius::exchange::broadcast_choice>(
+      c.all[r].service, 25, std::uint64_t{1} << 30, *env().gpu, std::chrono::seconds{30});
+    decided[r] = whole[r]->decide(1000, utils::default_stream());
+  });
+  REQUIRE(decided == std::vector<int>(3, 1));
+  // Rank 0 alone publishes: an all-gather would wait out the other ranks and publish nothing.
+  whole_build_join join(c.all[0].service, 4096, 64 * KiB, std::nullopt, whole[0]);
+  auto const keys = sequence(0, 1, 20000);
+  static_cast<void>(join.publish(keys_table(0, 1, 20000)->view()));
+  auto const* bloom = published_bloom(*join.channel);
+  REQUIRE(bloom != nullptr);
+  CHECK(members(*bloom, keys) == keys.size());
+  CHECK(members(*bloom, sequence(1'000'000, 1, 6000)) < 100);
 }
 
 TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter merge",
