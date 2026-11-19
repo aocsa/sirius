@@ -226,7 +226,10 @@ neither routed nor sent, so a range exchange needs no boundaries when no rank ha
 - A failed exchange is the exception of the source's next task.
 
 `exchange_service` is one process's end of every exchange. It holds what arrives for a stream
-before the stream's source is planned, and replays it when the source attaches.
+before the stream's source is planned, and replays it when the source attaches. When a query
+retires, each rank logs one line per stream: what the planner said it carries (routing, key
+columns, estimated rows, the operator below; or `bloom merge`, `sort sample`, `plan shape`), the
+GB and batches sent and received, and the GB sent to each rank. A line for the whole query follows.
 
 ### Collectives (`src/exchange/all_gather.*`)
 

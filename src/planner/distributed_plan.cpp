@@ -544,6 +544,18 @@ struct rewriter {
     for (auto const key : spec.key_columns) {
       shape += std::to_string(key) + ",";
     }
+    {
+      static constexpr std::array<std::string_view, 4> modes{
+        "hash", "range", "broadcast", "gather"};
+      auto label = std::string{modes[static_cast<std::size_t>(spec.routing)]} + " keys=[";
+      for (auto const key : spec.key_columns) {
+        label += std::to_string(key) + ",";
+      }
+      label += "] casts=" + std::to_string(spec.key_cast_types.size()) +
+               " est_rows=" + std::to_string(rows) +
+               " below=" + op::SiriusPhysicalOperatorToString(child->type);
+      service->describe(id, std::move(label));
+    }
     auto sink = duckdb::make_uniq<op::sirius_physical_exchange_sink>(
       types, rows, service, id, std::move(spec));
     auto source = duckdb::make_uniq<op::sirius_physical_exchange_source>(
@@ -594,6 +606,9 @@ struct rewriter {
     // so every rank reserves the same streams.
     auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
+    for (std::size_t k = 0; k < join.dynamic_filter_plan().admitted_keys().size(); ++k) {
+      service->describe(first + k, "bloom merge key=" + std::to_string(k));
+    }
     install_filter_merge(join,
                          std::make_shared<op::bloom_all_gather_merge>(
                            service, first, join.dynamic_filter_plan().admitted_keys().size(), *gpu),
@@ -811,7 +826,9 @@ struct rewriter {
         // Its own statement: the exchange takes its stream id before the all-gather takes one.
         auto& sink = insert(partition.children[0], std::move(spec), false);
         // The sample, now below the sink, takes its boundaries from every rank's sample.
-        install_sort_boundaries(sample, sink, service, stream(), *gpu);
+        auto const sample_stream = stream();
+        service->describe(sample_stream, "sort sample");
+        install_sort_boundaries(sample, sink, service, sample_stream, *gpu);
         return done(placement::ranged);
       }
 
@@ -846,12 +863,10 @@ void require_same_shape(rewriter& r)
                                       stream,
                                       telemetry::batch_telemetry_info{});
   // The query's last stream id: the rewrite numbers its exchanges up from 1.
-  auto const all = exchange::all_gather(
-    *r.service,
-    exchange::make_stream_id(r.query, (std::uint64_t{1} << exchange::query_stream_bits) - 1),
-    mine,
-    *r.gpu,
-    stream.get());
+  auto const shape_stream =
+    exchange::make_stream_id(r.query, (std::uint64_t{1} << exchange::query_stream_bits) - 1);
+  r.service->describe(shape_stream, "plan shape");
+  auto const all = exchange::all_gather(*r.service, shape_stream, mine, *r.gpu, stream.get());
   std::vector<std::int64_t> theirs(all.size());
   // Held until the copies finish, so nothing spills the hashes meanwhile.
   std::vector<decltype(all.front()->to_read_only())> held;
