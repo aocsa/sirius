@@ -995,8 +995,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   auto const decimal_sum_bounds = decimal_sum_stats_bound_enabled(context)
                                     ? resolve_sum_input_bounds(context, op)
                                     : std::vector<std::optional<std::uint64_t>>{};
-  auto const count_join = detect_dense_count_join(context, op);
-  bool const count_star = count_join && !count_join->counted_value_idx;
+  auto const count_join         = detect_dense_count_join(context, op);
+  bool const count_star         = count_join && !count_join->counted_value_idx;
 
   auto plan = create_plan(*op.children[0]);
 
@@ -1004,10 +1004,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   // join comes back under the projection restoring the logical column order, which the counts'
   // fixed `[key, count]` output replaces.
   auto* join_slot = &plan;
-  while (count_join && (*join_slot)->type == sirius::op::SiriusPhysicalOperatorType::PROJECTION &&
-         std::ranges::all_of(
-           (*join_slot)->Cast<sirius::op::sirius_physical_projection>().select_list,
-           [](auto const& expression) { return expression->is_reference(); })) {
+  while (
+    count_join && (*join_slot)->type == sirius::op::SiriusPhysicalOperatorType::PROJECTION &&
+    std::ranges::all_of((*join_slot)->Cast<sirius::op::sirius_physical_projection>().select_list,
+                        [](auto const& expression) { return expression->is_reference(); })) {
     join_slot = &(*join_slot)->children[0];
   }
   if (count_join && (*join_slot)->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
@@ -1015,8 +1015,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
                     sirius::op::SiriusPhysicalOperatorToString((*join_slot)->type));
   }
   if (count_join && (*join_slot)->type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
-    auto& join       = (*join_slot)->Cast<sirius::op::sirius_physical_hash_join>();
-    auto const& keys = join.prepared_keys();
+    auto& join         = (*join_slot)->Cast<sirius::op::sirius_physical_hash_join>();
+    auto const& keys   = join.prepared_keys();
     bool const streams = duckdb::query_operator_options(context)->stream_right_joins;
     if (join.join_type == duckdb::JoinType::RIGHT && streams && !join.is_mixed_join() &&
         keys.size() == 1 &&
