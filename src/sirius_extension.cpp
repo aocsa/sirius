@@ -108,11 +108,13 @@ extern "C" int cudaProfilerStop();
 #include "sirius_registration.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
+#ifdef SIRIUS_WITH_VSS
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
+#endif
 
 #include <cuda_runtime_api.h>
 
@@ -1691,6 +1693,7 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+#ifdef SIRIUS_WITH_VSS
 struct CreateAnnIndexData : public TableFunctionData {
   std::string table_name;
   std::string column_name;
@@ -2386,6 +2389,7 @@ static void SiriusVectorSearchFunction(ClientContext& context,
   auto& state = data_p.global_state->Cast<SiriusVectorSearchGlobalState>();
   state.reader->get_next_chunk(output);
 }
+#endif  // SIRIUS_WITH_VSS
 
 // sirius_set_session_label('<label>'): sticky per-connection telemetry query
 // group; '' reverts to the default session group.
@@ -2513,6 +2517,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
 
+#ifdef SIRIUS_WITH_VSS
   // sirius_create_ann_index(table, column, metric=>, index_type=>, n_lists=>, schema_name=>)
   TableFunction create_ann_index("sirius_create_ann_index",
                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -2559,6 +2564,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   });
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);
+#endif  // SIRIUS_WITH_VSS
 
   // Drop and rebuild the prefetching caches — a benchmark that wants each
   // iteration to pay its own IO has no other way to get a cold cache.

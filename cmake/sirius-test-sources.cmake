@@ -167,7 +167,6 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_setop_all.cpp
     test/cpp/integration/test_gpu_execution_union.cpp
     test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
-    test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -397,14 +396,6 @@ set(TEST_SOURCES
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
-    test/cpp/vss/test_brute_force_search.cpp
-    test/cpp/vss/test_cudf_raft_interop.cpp
-    test/cpp/vss/test_cuvs_index_cache.cpp
-    test/cpp/vss/test_distance_metric.cpp
-    test/cpp/vss/test_enn_top_k.cpp
-    test/cpp/vss/test_ivf_flat_index.cpp
-    test/cpp/vss/test_pinned_column.cpp
-    test/cpp/vss/test_vector_search.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
@@ -420,6 +411,20 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_describe_parquet_overwrite_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
+if(SIRIUS_WITH_VSS)
+  list(
+    APPEND
+    TEST_SOURCES
+    test/cpp/integration/test_gpu_execution_vector_search.cpp
+    test/cpp/vss/test_brute_force_search.cpp
+    test/cpp/vss/test_cudf_raft_interop.cpp
+    test/cpp/vss/test_cuvs_index_cache.cpp
+    test/cpp/vss/test_distance_metric.cpp
+    test/cpp/vss/test_enn_top_k.cpp
+    test/cpp/vss/test_ivf_flat_index.cpp
+    test/cpp/vss/test_pinned_column.cpp
+    test/cpp/vss/test_vector_search.cpp)
+endif()
 # cmake-format: on
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
