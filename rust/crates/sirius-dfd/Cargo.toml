@@ -1,0 +1,20 @@
+[package]
+name = "sirius-dfd"
+version = "0.1.0"
+edition = "2024"
+description = "Exchange directives for distributed Sirius from DataFusion Distributed's plan of a query."
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace, so that DataFusion stays out of the engine's Rust build.
+[workspace]
+
+[dependencies]
+datafusion = "55"
+# Without "grpc": only the planner is used. No Arrow Flight, no worker.
+datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "9b62f20b6a6bff1b661ad05e8fa8c9c53063dc2f", default-features = false, features = ["parquet", "sql"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+url = "2.5.7"
+
+[dev-dependencies]
+tempfile = "3"

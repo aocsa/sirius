@@ -1,0 +1,11 @@
+# q02.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=dfd
+HASH_JOIN p_partkey=ps_partkey,ps_supplycost=min(ps.ps_supplycost) hash  # stage 14, Partitioned
+HASH_JOIN r_regionkey=n_regionkey broadcast  # stage 7, CollectLeft
+HASH_JOIN n_nationkey=s_nationkey broadcast  # stage 7, CollectLeft
+HASH_JOIN s_suppkey=ps_suppkey hash  # stage 7, Partitioned
+HASH_JOIN p_partkey=ps_partkey hash  # stage 6, Partitioned
+MERGE_GROUP_BY ps_partkey hash  # stage 13, FinalPartitioned
+HASH_JOIN r_regionkey=n_regionkey broadcast  # stage 12, CollectLeft
+HASH_JOIN n_nationkey=s_nationkey broadcast  # stage 12, CollectLeft
+HASH_JOIN s_suppkey=ps_suppkey hash  # stage 12, Partitioned

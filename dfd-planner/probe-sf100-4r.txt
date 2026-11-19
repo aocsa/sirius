@@ -1,0 +1,165 @@
+/scratch/prestouser/aocsa/dfd-refs/queries/q01.sql: ranks=4 target_partitions=36 boundaries=2
+  stage  2 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage  1 -> stage  2  exchange_spec{routing=hash key_columns=[0:l_returnflag, 1:l_linestatus] buckets=4 salted width=4}  senders=4 below=AggregateExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q02.sql: ranks=4 target_partitions=36 boundaries=14
+  stage 14 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=HashJoinExec
+  stage  7 -> stage 14  exchange_spec{routing=hash key_columns=[0:p_partkey, 7:ps_supplycost] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  1 -> stage  7  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  2 -> stage  7  exchange_spec{routing=broadcast width=4}  senders=1 below=DistributedLeafExec
+  stage  3 -> stage  7  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  6 -> stage  7  exchange_spec{routing=hash key_columns=[2:ps_suppkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  4 -> stage  6  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=FilterExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[0:ps_partkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage 13 -> stage 14  exchange_spec{routing=hash key_columns=[1:ps_partkey, 0:min(ps.ps_supplycost)] buckets=4 salted width=4}  senders=4 below=ProjectionExec
+  stage 12 -> stage 13  exchange_spec{routing=hash key_columns=[0:ps_partkey] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  8 -> stage 12  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  9 -> stage 12  exchange_spec{routing=broadcast width=4}  senders=1 below=DistributedLeafExec
+  stage 10 -> stage 12  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage 11 -> stage 12  exchange_spec{routing=hash key_columns=[1:ps_suppkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q03.sql: ranks=4 target_partitions=36 boundaries=5
+  stage  5 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec(TopK)
+  stage  3 -> stage  5  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  1 -> stage  3  exchange_spec{routing=hash key_columns=[0:c_custkey] buckets=4 salted width=4}  senders=2 below=FilterExec
+  stage  2 -> stage  3  exchange_spec{routing=hash key_columns=[1:o_custkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  4 -> stage  5  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q04.sql: ranks=4 target_partitions=36 boundaries=4
+  stage  4 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:o_orderpriority] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage  3  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  2 -> stage  3  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q05.sql: ranks=4 target_partitions=36 boundaries=10
+  stage 10 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage  9 -> stage 10  exchange_spec{routing=hash key_columns=[0:n_name] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  7 -> stage  9  exchange_spec{routing=hash key_columns=[0:o_custkey, 3:s_nationkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  1 -> stage  7  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  2 -> stage  7  exchange_spec{routing=broadcast width=4}  senders=1 below=DistributedLeafExec
+  stage  3 -> stage  7  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  6 -> stage  7  exchange_spec{routing=hash key_columns=[1:l_suppkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  4 -> stage  6  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  8 -> stage  9  exchange_spec{routing=hash key_columns=[0:c_custkey, 1:c_nationkey] buckets=4 salted width=4}  senders=2 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q06.sql: ranks=4 target_partitions=36 boundaries=1
+  stage  1 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=FilterExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q07.sql: ranks=4 target_partitions=36 boundaries=10
+  stage 10 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage  9 -> stage 10  exchange_spec{routing=hash key_columns=[0:supp_nation, 1:cust_nation, 2:l_year] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage  9  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  2 -> stage  9  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  3 -> stage  9  exchange_spec{routing=hash key_columns=[0:c_custkey] buckets=4 salted width=4}  senders=2 below=DistributedLeafExec
+  stage  8 -> stage  9  exchange_spec{routing=hash key_columns=[4:o_custkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  4 -> stage  8  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  7 -> stage  8  exchange_spec{routing=hash key_columns=[1:l_orderkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  5 -> stage  7  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  6 -> stage  7  exchange_spec{routing=hash key_columns=[1:l_suppkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q08.sql: ranks=4 target_partitions=36 boundaries=13
+  stage 13 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=ProjectionExec
+  stage 12 -> stage 13  exchange_spec{routing=hash key_columns=[0:o_year] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage 12  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  2 -> stage 12  exchange_spec{routing=broadcast width=4}  senders=1 below=DistributedLeafExec
+  stage  3 -> stage 12  exchange_spec{routing=broadcast width=4}  senders=1 below=DistributedLeafExec
+  stage  4 -> stage 12  exchange_spec{routing=hash key_columns=[0:c_custkey] buckets=4 salted width=4}  senders=2 below=DistributedLeafExec
+  stage 11 -> stage 12  exchange_spec{routing=hash key_columns=[3:o_custkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  5 -> stage 11  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage 10 -> stage 11  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  6 -> stage 10  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  9 -> stage 10  exchange_spec{routing=hash key_columns=[1:l_suppkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  7 -> stage  9  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=FilterExec
+  stage  8 -> stage  9  exchange_spec{routing=hash key_columns=[1:l_partkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q09.sql: ranks=4 target_partitions=36 boundaries=11
+  stage 11 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage 10 -> stage 11  exchange_spec{routing=hash key_columns=[0:nation, 1:o_year] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage 10  exchange_spec{routing=broadcast width=4}  senders=1 below=DistributedLeafExec
+  stage  2 -> stage 10  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  9 -> stage 10  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  3 -> stage  9  exchange_spec{routing=hash key_columns=[1:ps_suppkey, 0:ps_partkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  8 -> stage  9  exchange_spec{routing=hash key_columns=[2:l_suppkey, 1:l_partkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  4 -> stage  8  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  7 -> stage  8  exchange_spec{routing=hash key_columns=[2:l_suppkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  5 -> stage  7  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=FilterExec
+  stage  6 -> stage  7  exchange_spec{routing=hash key_columns=[1:l_partkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q10.sql: ranks=4 target_partitions=36 boundaries=7
+  stage  7 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec(TopK)
+  stage  6 -> stage  7  exchange_spec{routing=hash key_columns=[0:c_custkey, 1:c_name, 2:c_acctbal, 3:c_phone, 4:n_name, 5:c_address, 6:c_comment] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage  6  exchange_spec{routing=broadcast width=4}  senders=1 below=DistributedLeafExec
+  stage  4 -> stage  6  exchange_spec{routing=hash key_columns=[7:o_orderkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  2 -> stage  4  exchange_spec{routing=hash key_columns=[1:o_custkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:c_custkey] buckets=4 salted width=4}  senders=2 below=DistributedLeafExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q11.sql: ranks=4 target_partitions=36 boundaries=10
+  stage 10 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=ProjectionExec
+  stage  5 -> stage 10  exchange_spec{routing=broadcast width=4}  senders=1 below=ProjectionExec
+  stage  4 -> stage  5  exchange_spec{routing=gather target=0}  senders=4 below=HashJoinExec
+  stage  1 -> stage  4  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  2 -> stage  4  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:ps_suppkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  9 -> stage 10  exchange_spec{routing=hash key_columns=[0:ps_partkey] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  6 -> stage  9  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  7 -> stage  9  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  8 -> stage  9  exchange_spec{routing=hash key_columns=[1:ps_suppkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q12.sql: ranks=4 target_partitions=36 boundaries=4
+  stage  4 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:l_shipmode] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage  3  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  2 -> stage  3  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q13.sql: ranks=4 target_partitions=36 boundaries=4
+  stage  4 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:c_count] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage  3  exchange_spec{routing=hash key_columns=[0:c_custkey] buckets=4 salted width=4}  senders=2 below=DistributedLeafExec
+  stage  2 -> stage  3  exchange_spec{routing=hash key_columns=[1:o_custkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q14.sql: ranks=4 target_partitions=36 boundaries=3
+  stage  3 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=ProjectionExec
+  stage  1 -> stage  3  exchange_spec{routing=hash key_columns=[0:l_partkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  2 -> stage  3  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q15.sql: ranks=4 target_partitions=36 boundaries=6
+  stage  6 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=CoalescePartitionsExec
+  stage  3 -> stage  6  exchange_spec{routing=broadcast width=4}  senders=1 below=AggregateExec
+  stage  2 -> stage  3  exchange_spec{routing=gather target=0}  senders=4 below=ProjectionExec
+  stage  1 -> stage  2  exchange_spec{routing=hash key_columns=[0:l_suppkey] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  4 -> stage  6  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[0:l_suppkey] buckets=4 salted width=4}  senders=4 below=AggregateExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q16.sql: ranks=4 target_partitions=36 boundaries=6
+  stage  6 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[0:p_brand, 1:p_type, 2:p_size] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  4 -> stage  5  exchange_spec{routing=hash key_columns=[0:p_brand, 1:p_type, 2:p_size, 3:alias1] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage  4  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  2 -> stage  4  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=FilterExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:ps_partkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q17.sql: ranks=4 target_partitions=36 boundaries=4
+  stage  4 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=HashJoinExec
+  stage  1 -> stage  4  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=FilterExec
+  stage  2 -> stage  4  exchange_spec{routing=hash key_columns=[0:l_partkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:l_partkey] buckets=4 salted width=4}  senders=4 below=AggregateExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q18.sql: ranks=4 target_partitions=36 boundaries=6
+  stage  6 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=AggregateExec
+  stage  1 -> stage  6  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  4 -> stage  6  exchange_spec{routing=hash key_columns=[2:o_orderkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  2 -> stage  4  exchange_spec{routing=hash key_columns=[0:c_custkey] buckets=4 salted width=4}  senders=2 below=DistributedLeafExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[1:o_custkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q19.sql: ranks=4 target_partitions=36 boundaries=3
+  stage  3 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=HashJoinExec
+  stage  1 -> stage  3  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=FilterExec
+  stage  2 -> stage  3  exchange_spec{routing=hash key_columns=[0:l_partkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q20.sql: ranks=4 target_partitions=36 boundaries=7
+  stage  7 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=HashJoinExec
+  stage  1 -> stage  7  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=HashJoinExec
+  stage  6 -> stage  7  exchange_spec{routing=hash key_columns=[0:ps_suppkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  4 -> stage  6  exchange_spec{routing=hash key_columns=[0:ps_partkey, 1:ps_suppkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  2 -> stage  4  exchange_spec{routing=hash key_columns=[0:p_partkey] buckets=4 salted width=4}  senders=1 below=FilterExec
+  stage  3 -> stage  4  exchange_spec{routing=hash key_columns=[0:ps_partkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[0:l_partkey, 1:l_suppkey] buckets=4 salted width=4}  senders=4 below=AggregateExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q21.sql: ranks=4 target_partitions=36 boundaries=9
+  stage  9 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=SortExec(TopK)
+  stage  8 -> stage  9  exchange_spec{routing=hash key_columns=[0:s_name] buckets=4 salted width=4}  senders=4 below=AggregateExec
+  stage  1 -> stage  8  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  2 -> stage  8  exchange_spec{routing=broadcast width=4}  senders=1 below=FilterExec
+  stage  3 -> stage  8  exchange_spec{routing=hash key_columns=[0:o_orderkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  6 -> stage  8  exchange_spec{routing=hash key_columns=[2:l_orderkey] buckets=4 salted width=4}  senders=4 below=HashJoinExec
+  stage  4 -> stage  6  exchange_spec{routing=hash key_columns=[0:s_suppkey] buckets=4 salted width=4}  senders=1 below=DistributedLeafExec
+  stage  5 -> stage  6  exchange_spec{routing=hash key_columns=[1:l_suppkey] buckets=4 salted width=4}  senders=4 below=FilterExec
+  stage  7 -> stage  8  exchange_spec{routing=hash key_columns=[0:l_orderkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+/scratch/prestouser/aocsa/dfd-refs/queries/q22.sql: ranks=4 target_partitions=36 boundaries=4
+  stage  3 -> stage  0  exchange_spec{routing=gather target=0}  senders=4 below=RepartitionExec
+  stage  1 -> stage  3  exchange_spec{routing=hash key_columns=[0:c_custkey] buckets=4 salted width=4}  senders=2 below=FilterExec
+  stage  2 -> stage  3  exchange_spec{routing=hash key_columns=[0:o_custkey] buckets=4 salted width=4}  senders=4 below=DistributedLeafExec
+  stage  4 -> stage  0  exchange_spec{routing=gather target=0}  senders=2 below=FilterExec

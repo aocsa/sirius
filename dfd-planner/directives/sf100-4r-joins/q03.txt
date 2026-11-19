@@ -1,0 +1,5 @@
+# q03.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=dfd
+MERGE_GROUP_BY l_orderkey,o_orderdate,o_shippriority none  # stage 5, SinglePartitioned
+HASH_JOIN o_orderkey=l_orderkey hash  # stage 5, Partitioned
+HASH_JOIN c_custkey=o_custkey hash  # stage 3, Partitioned

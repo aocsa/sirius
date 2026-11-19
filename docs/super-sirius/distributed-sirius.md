@@ -312,6 +312,43 @@ Running such an operator on each rank's share would return a wrong answer.
 - **Plan-shape check.** Before running, every rank all-gathers a hash of its plan's shape, and
   every rank fails the query if any differs.
 
+### Exchange directives
+
+`exchange_directives` names a file that tells `distribute_plan()` what to do at some of the sites
+where it otherwise decides: a `HASH_JOIN` or a `MERGE_GROUP_BY`. A line names its site by the
+Parquet columns of the site's keys, so the order of the lines does not matter and the same file
+fits whatever join order the plan has. `sirius-dfd` (`rust/crates/sirius-dfd`) writes such a file
+from DataFusion Distributed's plan of the query.
+
+```text
+# TPC-H Q3
+HASH_JOIN o_orderkey=l_orderkey hash          # both sides, on the join keys
+HASH_JOIN c_custkey=o_custkey broadcast       # the side with c_custkey to every rank
+MERGE_GROUP_BY l_orderkey,o_orderdate,o_shippriority none   # no exchange below the merge
+```
+
+| Line | Does |
+|---|---|
+| `HASH_JOIN a=b[,c=d] hash` | hashes both sides; `width=1` runs the join on rank 0 alone |
+| `HASH_JOIN a=b[,c=d] broadcast` | broadcasts the side that `a` and `c` are on; the other stays where it is |
+| `MERGE_GROUP_BY a[,b] hash` | hashes the partial groups, as with no directive |
+| `MERGE_GROUP_BY a[,b] none` | leaves the partial groups where they are |
+
+A site's key columns are read down to the scans through projections, filters and joins; a key
+that is computed, or comes out of an aggregate, has no name, and its site is decided as with no
+directive. So is a site that no line names, or that several lines name (the joins of a self-join).
+A group column that is a key of an inner join below also answers to the other side's key of that
+equality: Q3's merge is named by `l_orderkey` and by `o_orderkey`, whichever the plan kept.
+
+A directive moves an exchange and never changes the answer. Where it would, it is not followed
+and the site is decided as with no directive: a broadcast under a join that emits unmatched
+build rows, a broadcast of the side the plan probes with, and `MERGE_GROUP_BY ... none` unless a
+hash exchange below the merge, on columns among the group's, already put each group's rows on one
+rank (through joins: on the probe side's rank, or for an inner join the hashed build side's). A
+join that a line names is routed as told and is not counted for `exchange_broadcast_bytes`; a join
+that is counted may send its build whole as the query runs, so it proves no group whole. The
+log says which lines named a site and which were not followed (`[exchange directive]`).
+
 ### Adding a distributed behaviour
 
 A distributed plan holds the single-process operators and the two exchange operators, and nothing

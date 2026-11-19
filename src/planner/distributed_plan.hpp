@@ -18,6 +18,7 @@
 
 #include "exchange/fabric.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
@@ -25,9 +26,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace cucascade::memory {
@@ -86,6 +90,43 @@ struct stage_policy {
   std::uint64_t broadcast_bytes = 0;
 };
 
+/// What an external planner tells distribute_plan to do at a join or a grouped merge, which it
+/// names by the scanned columns of the site's keys.
+struct exchange_directive {
+  /// HASH_JOIN or MERGE_GROUP_BY.
+  op::SiriusPhysicalOperatorType site;
+  /// HASH_JOIN: the two columns of each equality, in either order; for a broadcast, the side to
+  /// broadcast first. MERGE_GROUP_BY: the group columns, each as a pair's first.
+  std::vector<std::pair<std::string, std::string>> keys;
+  /// HASH_JOIN: broadcast (of the build side; the probe side stays where it is) or hash (of both
+  /// sides). MERGE_GROUP_BY: hash, or nothing for no exchange below the merge.
+  std::optional<op::exchange_spec::mode> routing;
+  /// A hashed HASH_JOIN: 1 runs it on rank 0 alone, 0 on every rank.
+  exchange::rank_t width = 0;
+};
+
+/// One query's directives, in any order. A site takes the one directive that names its key
+/// columns, read through projections, filters and joins down to the Parquet scans. A site that
+/// no directive names, or that several do, is decided as with no directives; so is every site
+/// when there are none.
+///
+/// A directive moves an exchange and never changes the answer: where it would, it is not
+/// followed, and its site is decided as with no directives. That is a broadcast under a join
+/// that emits unmatched build rows, a broadcast of the side the plan probes with, and no
+/// exchange below a grouped merge unless a hash exchange below it, on columns among the
+/// group's, has put each group's rows on one rank.
+using exchange_directives = std::vector<exchange_directive>;
+
+/// Directives from text, one per line: `HASH_JOIN a=b[,c=d] hash [width=1]`,
+/// `HASH_JOIN a=b[,c=d] broadcast` (a and c on the side to broadcast) or
+/// `MERGE_GROUP_BY a[,b] hash|none`. A `#` starts a comment; lines with nothing else are skipped.
+/// @throws sirius::invalid_input_exception on any other line.
+exchange_directives parse_exchange_directives(std::istream& in);
+
+/// parse_exchange_directives of the file at @p path.
+/// @throws sirius::invalid_input_exception also when the file cannot be read.
+exchange_directives read_exchange_directives(std::string const& path);
+
 /**
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of
  * @p service, each over its own share of the scanned files.
@@ -108,6 +149,8 @@ struct stage_policy {
  * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
  * @param footers Reads a Parquet file's footer; may be empty.
  * @param stages Which stages run on rank 0 alone; by default none does.
+ * @param directives What to do at the joins and grouped merges they name, instead of deciding
+ *        it here; by default nothing.
  * @throws sirius::not_implemented_exception on an operator distributed execution does not
  *         support, rather than a wrong answer; this rank throws before the all-gather.
  * @throws sirius::invalid_input_exception when another rank planned a different shape, on every
@@ -118,9 +161,10 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      cucascade::memory::memory_space& gpu,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle,
-                     parquet_footer_reader footers = {},
-                     deferred_scan_policy deferred = {},
-                     stage_policy stages           = {});
+                     parquet_footer_reader footers  = {},
+                     deferred_scan_policy deferred  = {},
+                     stage_policy stages            = {},
+                     exchange_directives directives = {});
 
 /// Bytes `[start, start + length)` of file `file` (an index into the table's files).
 struct file_byte_range {

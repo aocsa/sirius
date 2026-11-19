@@ -1,0 +1,4 @@
+# q16.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=sirius
+MERGE_GROUP_BY p_brand,p_type,p_size hash  # stage 6, FinalPartitioned
+MERGE_GROUP_BY p_brand,p_type,p_size,ps_suppkey none  # stage 5, SinglePartitioned

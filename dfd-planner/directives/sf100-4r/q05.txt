@@ -1,0 +1,3 @@
+# q05.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=sirius
+MERGE_GROUP_BY n_name hash  # stage 10, FinalPartitioned

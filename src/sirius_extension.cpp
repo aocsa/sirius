@@ -3078,6 +3078,13 @@ static void SetExchangeBroadcastBytes(ClientContext& context, SetScope scope, Va
                    params->exchange_broadcast_bytes);
 }
 
+static void SetExchangeDirectives(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                = get_operator_params(context, scope);
+  params->exchange_directives = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EXCHANGE_DIRECTIVES to {}", params->exchange_directives);
+}
+
 static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                       = get_operator_params(context, scope);
@@ -3608,6 +3615,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.exchange_broadcast_bytes),
                     SetExchangeBroadcastBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "exchange_directives",
+                    "distributed: a file of exchange directives the plan follows; empty = off",
+                    LogicalType::VARCHAR,
+                    Value(operator_defaults.exchange_directives),
+                    SetExchangeDirectives);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_scan_reuse_rewrites",

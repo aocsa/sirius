@@ -1,0 +1,2 @@
+# q22.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=sirius

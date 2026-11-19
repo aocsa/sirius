@@ -1,0 +1,3 @@
+# q22.sql
+# sirius-dfd: ranks=4 target_partitions=16 joins=dfd
+HASH_JOIN c_custkey=o_custkey hash  # stage 3, Partitioned

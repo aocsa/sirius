@@ -48,8 +48,11 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -232,7 +235,8 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
                                     fixture& f,
                                     sirius::planner::parquet_footer_reader const& footers = {},
                                     std::uint64_t query                                   = 7,
-                                    sirius::planner::stage_policy stages                  = {})
+                                    sirius::planner::stage_policy stages                  = {},
+                                    sirius::planner::exchange_directives directives       = {})
 {
   auto const world = static_cast<rank_t>(plans.size());
   std::vector<std::string> errors(world);
@@ -241,7 +245,7 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
     threads.emplace_back([&, r] {
       try {
         sirius::planner::distribute_plan(
-          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers, {}, stages);
+          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers, {}, stages, directives);
       } catch (std::exception const& e) {
         errors[r] = e.what();
       }
@@ -672,6 +676,201 @@ TEST_CASE("a whole build is worth it when it adds fewer bytes than its Bloom mer
   CHECK_FALSE(whole_build_saves_bytes(MB / 2, 10, 4, 0));
   // One rank sends nothing either way.
   CHECK(whole_build_saves_bytes(1000 * MB, 1, 1, 1));
+}
+
+TEST_CASE("exchange directives are read one per line", "[exchange][planner]")
+{
+  using mode = exchange_spec::mode;
+  using keys = std::vector<std::pair<std::string, std::string>>;
+  std::istringstream text(
+    "# TPC-H Q3\n"
+    "\n"
+    "MERGE_GROUP_BY l_orderkey,o_orderdate none  # whole groups\n"
+    "  HASH_JOIN o_orderkey=l_orderkey hash width=1\n"
+    "HASH_JOIN ps_suppkey=l_suppkey,ps_partkey=l_partkey broadcast\n"
+    "MERGE_GROUP_BY l_shipmode hash\n");
+  auto const told = sirius::planner::parse_exchange_directives(text);
+  REQUIRE(told.size() == 4);
+  CHECK(told[0].site == T::MERGE_GROUP_BY);
+  CHECK(told[0].keys == keys{{"l_orderkey", ""}, {"o_orderdate", ""}});
+  CHECK_FALSE(told[0].routing);
+  CHECK(told[1].site == T::HASH_JOIN);
+  CHECK(told[1].keys == keys{{"o_orderkey", "l_orderkey"}});
+  CHECK(told[1].routing == mode::hash);
+  CHECK(told[1].width == 1);
+  CHECK(told[2].keys == keys{{"ps_suppkey", "l_suppkey"}, {"ps_partkey", "l_partkey"}});
+  CHECK(told[2].routing == mode::broadcast);
+  CHECK(told[2].width == 0);
+  CHECK(told[3].routing == mode::hash);
+
+  auto const line = GENERATE(as<std::string>{},
+                             "GPU_SCAN a hash",
+                             "HASH_JOIN",
+                             "HASH_JOIN a=b",
+                             "HASH_JOIN a hash",
+                             "HASH_JOIN a=b, hash",
+                             "HASH_JOIN a=b=c hash",
+                             "HASH_JOIN a=b none",
+                             "HASH_JOIN a=b gather",
+                             "HASH_JOIN a=b hash width=2",
+                             "HASH_JOIN a=b broadcast width=1",
+                             "HASH_JOIN a=b hash width=1 more",
+                             "MERGE_GROUP_BY a=b hash",
+                             "MERGE_GROUP_BY a broadcast",
+                             "MERGE_GROUP_BY a none width=1");
+  std::istringstream bad(line);
+  CHECK_THROWS_AS(sirius::planner::parse_exchange_directives(bad), sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sirius::planner::read_exchange_directives("/no/such/directives"),
+                  sirius::invalid_input_exception);
+}
+
+TEST_CASE("distribute_plan follows the directives that name its sites", "[exchange][planner]")
+{
+  fixture f;
+  // Column names no other table has: a directive names a site by them.
+  f.add_table("fact", "SELECT range AS fk, range % 7 AS fv FROM range(100000)", 20'000);
+  f.add_table("dim", "SELECT range AS dk, range % 5 AS dv FROM range(60000)", 20'000);
+  f.add_table("tiny", "SELECT range AS tk, range AS tv FROM range(10)", 20'000);
+  using mode      = exchange_spec::mode;
+  auto const told = [](std::string const& lines) {
+    std::istringstream text(lines);
+    return sirius::planner::parse_exchange_directives(text);
+  };
+  // What rank 0's plan of @p sql looks like on @p world ranks, rewritten with @p lines. Read here:
+  // the plans hold the ranks' services and must not outlive them.
+  struct seen {
+    /// The routing of the exchange below the join's build side and below its probe side.
+    std::pair<std::optional<mode>, std::optional<mode>> join;
+    /// Whether both of those reach rank 0 alone.
+    bool join_on_rank0 = false;
+    /// Whether the join's build side may go whole as the query runs.
+    bool join_choice = false;
+    /// Whether the grouped merge's PARTITION has no exchange below it.
+    bool groups_left = false;
+    /// Whether the result is gathered from every rank.
+    bool gathered = false;
+  };
+  auto const rewritten = [&](std::string const& sql,
+                             rank_t world,
+                             std::string const& lines,
+                             sirius::planner::stage_policy stages = {}) {
+    ranks c(world, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, world);
+    REQUIRE(distribute(plans, c, f, {}, 7, stages, told(lines)) == std::vector<std::string>(world));
+    seen s;
+    s.gathered = plans[0]->type == T::EXCHANGE_SOURCE;
+    if (auto* join = find(*plans[0], T::HASH_JOIN)) {
+      auto [probe, build] = join_sides(*join);
+      auto const of       = [](sirius_physical_operator* side) {
+        return sink_below(*side) ? std::optional{sink_below(*side)->spec().routing} : std::nullopt;
+      };
+      s.join          = {of(build), of(probe)};
+      s.join_choice   = sink_below(*build) && sink_below(*build)->spec().build_choice != nullptr;
+      s.join_on_rank0 = sink_below(*build) && sink_below(*probe) &&
+                        sink_below(*build)->spec().width == 1 &&
+                        sink_below(*probe)->spec().width == 1;
+    }
+    if (auto* merge = find(*plans[0], T::MERGE_GROUP_BY)) {
+      s.groups_left = sink_below(*merge->children.at(0)) == nullptr;
+    }
+    return s;
+  };
+  auto const hashed    = std::pair{std::optional{mode::hash}, std::optional{mode::hash}};
+  auto const broadcast = std::pair{std::optional{mode::broadcast}, std::optional<mode>{}};
+  auto const big_join  = std::string{"SELECT f.fv, d.dv FROM fact f JOIN dim d ON f.fk = d.dk"};
+  auto const tiny_join = std::string{"SELECT f.fv FROM fact f JOIN tiny t ON f.fk = t.tk"};
+
+  SECTION("a join by itself: a tiny build is broadcast, a large one hashed")
+  {
+    CHECK(rewritten(tiny_join, 3, "").join == broadcast);
+    CHECK(rewritten(big_join, 3, "").join == hashed);
+  }
+
+  SECTION("a tiny build is hashed, whichever side the directive writes first")
+  {
+    CHECK(rewritten(tiny_join, 3, "HASH_JOIN tk=fk hash").join == hashed);
+    CHECK(rewritten(tiny_join, 3, "HASH_JOIN fk=tk hash").join == hashed);
+  }
+
+  SECTION("a large build is broadcast when the directive names it, not when it names the probe")
+  {
+    auto const build_first = rewritten(big_join, 3, "HASH_JOIN dk=fk broadcast").join;
+    auto const probe_first = rewritten(big_join, 3, "HASH_JOIN fk=dk broadcast").join;
+    CHECK((build_first == broadcast) != (probe_first == broadcast));
+    CHECK((build_first == hashed) != (probe_first == hashed));
+  }
+
+  SECTION("a hashed join of width 1 runs on rank 0 alone")
+  {
+    auto const s = rewritten(big_join, 3, "HASH_JOIN fk=dk hash width=1");
+    CHECK(s.join == hashed);
+    CHECK(s.join_on_rank0);
+    CHECK_FALSE(s.gathered);
+  }
+
+  SECTION("a directive is not followed where it would change the answer or names nothing")
+  {
+    // Every rank would emit the unmatched rows of a whole build.
+    CHECK(rewritten("SELECT f.fv, t.tv FROM fact f FULL OUTER JOIN tiny t ON f.fk = t.tk",
+                    2,
+                    "HASH_JOIN tk=fk broadcast")
+            .join == hashed);
+    // Two directives name the join; another names no join of the plan.
+    CHECK(rewritten(tiny_join, 3, "HASH_JOIN tk=fk hash\nHASH_JOIN fk=tk hash").join == broadcast);
+    CHECK(rewritten(tiny_join, 3, "HASH_JOIN dk=fk hash").join == broadcast);
+  }
+
+  SECTION("a grouped merge's input is left where a hash exchange below made its groups whole")
+  {
+    auto const grouped = [&](std::string const& key) {
+      return "SELECT " + key + ", count(*) FROM fact f JOIN dim d ON f.fk = d.dk GROUP BY " + key;
+    };
+    // The join's exchanges are on fk and dk: either key keeps its groups whole.
+    auto const by_probe_key = rewritten(grouped("f.fk"), 3, "MERGE_GROUP_BY fk none");
+    CHECK(by_probe_key.join == hashed);
+    CHECK(by_probe_key.groups_left);
+    CHECK(by_probe_key.gathered);
+    // DuckDB groups by either column of the join's equality: the site answers to both names,
+    // and to one line only.
+    CHECK(rewritten(grouped("d.dk"), 3, "MERGE_GROUP_BY dk none").groups_left);
+    CHECK(rewritten(grouped("d.dk"), 3, "MERGE_GROUP_BY fk none").groups_left);
+    CHECK_FALSE(
+      rewritten(grouped("d.dk"), 3, "MERGE_GROUP_BY dk none\nMERGE_GROUP_BY fk none").groups_left);
+    // With a second column the fact side is wide enough for dim to be broadcast: hashed here.
+    auto const hash_join = std::string{"HASH_JOIN fk=dk hash\n"};
+    CHECK(rewritten(grouped("f.fk, f.fv"), 3, hash_join + "MERGE_GROUP_BY fv,fk none").groups_left);
+    // By itself, and told to hash: exchanged.
+    CHECK_FALSE(rewritten(grouped("f.fk"), 3, "").groups_left);
+    CHECK_FALSE(rewritten(grouped("f.fk"), 3, "MERGE_GROUP_BY fk hash").groups_left);
+    // No exchange below is on a column of the group.
+    CHECK_FALSE(rewritten(grouped("f.fv"), 3, hash_join + "MERGE_GROUP_BY fv none").groups_left);
+    // A broadcast join leaves the probe rows where they were scanned.
+    CHECK_FALSE(
+      rewritten("SELECT f.fk, count(*) FROM fact f JOIN tiny t ON f.fk = t.tk GROUP BY f.fk",
+                3,
+                "MERGE_GROUP_BY fk none")
+        .groups_left);
+    CHECK_FALSE(rewritten("SELECT fk, count(*) FROM fact GROUP BY fk", 3, "MERGE_GROUP_BY fk none")
+                  .groups_left);
+  }
+
+  SECTION("a build that may go whole as the query runs")
+  {
+    auto const sql = std::string{
+      "SELECT b.k, count(*) FROM big b JOIN big2 c ON b.k = c.k "
+      "WHERE b.v < 5 AND c.v < 5 GROUP BY b.k"};
+    sirius::planner::stage_policy const counted{.broadcast_bytes = std::uint64_t{1} << 20};
+    // Its probe rows would stay where they were scanned: it proves no group whole.
+    auto const chosen = rewritten(sql, 3, "MERGE_GROUP_BY k none", counted);
+    REQUIRE(chosen.join_choice);
+    CHECK_FALSE(chosen.groups_left);
+    CHECK(rewritten(sql, 3, "MERGE_GROUP_BY k none").groups_left);
+    // A join told to hash is hashed.
+    auto const hashed_as_told =
+      rewritten(sql, 3, "HASH_JOIN k=k hash\nMERGE_GROUP_BY k none", counted);
+    CHECK_FALSE(hashed_as_told.join_choice);
+    CHECK(hashed_as_told.groups_left);
+  }
 }
 
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")
