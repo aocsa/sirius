@@ -26,8 +26,8 @@
 #include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
-#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/distributed/sample_all_gather_boundaries.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_plan.hpp"
@@ -565,7 +565,9 @@ struct rewriter {
       }
       label += "] casts=" + std::to_string(spec.key_cast_types.size()) +
                (spec.width != 0 ? " width=" + std::to_string(spec.width) : std::string{}) +
-               (!spec.build_choice ? "" : spec.counts_build ? " choice=build" : " choice=probe") +
+               (!spec.build_choice  ? ""
+                : spec.counts_build ? " choice=build"
+                                    : " choice=probe") +
                " est_rows=" + std::to_string(rows) +
                " below=" + op::SiriusPhysicalOperatorToString(child->type);
       service->describe(id, std::move(label));
@@ -596,7 +598,7 @@ struct rewriter {
                        std::shared_ptr<exchange::broadcast_choice> build_choice = nullptr,
                        bool counts_build                                        = false)
   {
-    auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
+    auto& partition  = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
     auto const where = visit(partition.children[0]);
     if (stay_narrow && where == placement::narrow) { return placement::narrow; }
     exchange_spec spec;
@@ -629,9 +631,10 @@ struct rewriter {
   /// @p narrow the join runs on rank 0 alone: its build is whole there, and its Bloom goes from
   /// there to every rank, whose scans it filters.
   /// @return The keys whose filters are merged; 0 when the join's filters are not.
-  std::size_t merge_filters_across_ranks(op::sirius_physical_hash_join& join,
-                                  bool narrow                                             = false,
-                                  std::shared_ptr<exchange::broadcast_choice> whole_build = nullptr)
+  std::size_t merge_filters_across_ranks(
+    op::sirius_physical_hash_join& join,
+    bool narrow                                             = false,
+    std::shared_ptr<exchange::broadcast_choice> whole_build = nullptr)
   {
     if (!join.publishes_dynamic_filters()) { return 0; }
     auto const build_rows = join.children[1]->estimated_cardinality;
@@ -1134,8 +1137,8 @@ bool whole_build_saves_bytes(std::uint64_t build_bytes,
   // Each rank's rows go to n - 1 ranks in place of (n - 1) / n of them.
   auto const added = static_cast<long double>(build_bytes) * (n - 1) * (n - 1) / n;
   // Each rank sizes its merged Bloom for the rows of all ranks (merged_bloom_policy()).
-  auto const keys = op::scaled_bloom_keys(
-    build_rows, 1, op::merged_bloom_min_keys, op::merged_bloom_max_keys);
+  auto const keys =
+    op::scaled_bloom_keys(build_rows, 1, op::merged_bloom_min_keys, op::merged_bloom_max_keys);
   auto const bloom =
     static_cast<long double>(op::bloom_blocks_for(keys) * op::bloom_bytes_per_block);
   return added <= n * (n - 1) * static_cast<long double>(merged_keys) * bloom;

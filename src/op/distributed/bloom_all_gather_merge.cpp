@@ -42,13 +42,14 @@
 
 namespace sirius::op {
 
-bloom_all_gather_merge::bloom_all_gather_merge(std::shared_ptr<exchange::exchange_service> service,
-                                               exchange::stream_id first_stream,
-                                               std::size_t key_count,
-                                               cucascade::memory::memory_space& gpu,
-                                               std::chrono::milliseconds timeout,
-                                               std::optional<exchange::rank_t> only_from,
-                                               std::shared_ptr<exchange::broadcast_choice> whole_build)
+bloom_all_gather_merge::bloom_all_gather_merge(
+  std::shared_ptr<exchange::exchange_service> service,
+  exchange::stream_id first_stream,
+  std::size_t key_count,
+  cucascade::memory::memory_space& gpu,
+  std::chrono::milliseconds timeout,
+  std::optional<exchange::rank_t> only_from,
+  std::shared_ptr<exchange::broadcast_choice> whole_build)
   : _service(std::move(service)),
     _first_stream(first_stream),
     _key_count(key_count),

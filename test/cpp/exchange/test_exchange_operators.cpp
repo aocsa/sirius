@@ -48,9 +48,9 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <future>
 #include <memory>
-#include <functional>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -393,9 +393,8 @@ TEST_CASE("a build within the limit goes whole to every rank, and the probe rows
 {
   ranks c(3);
   int const batches = 2;
-  auto build =
-    build_exchange_all(c, 1, 2, std::uint64_t{1} << 30, {batches, batches, batches});
-  auto want = all_keys(c.world(), batches);
+  auto build = build_exchange_all(c, 1, 2, std::uint64_t{1} << 30, {batches, batches, batches});
+  auto want  = all_keys(c.world(), batches);
   std::sort(want.begin(), want.end());
   for (rank_t r = 0; r < c.world(); ++r) {
     CHECK(build.choices[r]->known() == std::optional<bool>{true});

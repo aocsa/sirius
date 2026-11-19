@@ -57,49 +57,46 @@ exchange_service::exchange_service(fabric& fabric,
                                    cucascade::memory::memory_space* host,
                                    transport::options opts)
 {
-  transport::callbacks cb{[this](stream_id stream,
-                                 rank_t from,
-                                 std::uint64_t batch,
-                                 std::shared_ptr<cucascade::data_batch> data) {
-                            if (from != _rank && data) {
-                              auto const bytes = bytes_of(*data);
-                              std::lock_guard lock{_mutex};
-                              for (auto* t :
-                                   {&_traffic[query_of(stream)], &_stream_traffic[stream].total}) {
-                                t->received_bytes += bytes;
-                                ++t->received_batches;
-                              }
-                            }
-                            if (auto r = receiver_of(stream, {from, batch, data})) {
-                              r->on_batch(from, batch, std::move(data));
-                            }
-                          },
-                          [this](stream_id stream, rank_t from) {
-                            if (auto r = receiver_of(stream, {from, 0, nullptr})) {
-                              r->on_end(from);
-                            }
-                          },
-                          [this](std::exception_ptr error) {
-                            std::map<stream_id, std::shared_ptr<inbound>> receivers;
-                            {
-                              std::lock_guard lock{_mutex};
-                              // Fail-stop: nothing reconnects, so later queries say how to recover.
-                              _error    = std::make_exception_ptr(sirius::internal_exception(
-                                "exchange: the transport to the other ranks failed ({}); restart "
-                                   "every rank to run distributed queries again",
-                                what_of(error)));
-                              receivers = _receivers;
-                            }
-                            for (auto& [stream, r] : receivers) {
-                              r->on_error(error);
-                            }
-                          },
-                          [this](distributed_query_id query, rank_t from, std::string what) {
-                            end_query(
-                              query,
-                              std::make_exception_ptr(sirius::internal_exception(
-                                "exchange: query {} failed on rank {}: {}", query, from, what)));
-                          }};
+  transport::callbacks cb{
+    [this](stream_id stream,
+           rank_t from,
+           std::uint64_t batch,
+           std::shared_ptr<cucascade::data_batch> data) {
+      if (from != _rank && data) {
+        auto const bytes = bytes_of(*data);
+        std::lock_guard lock{_mutex};
+        for (auto* t : {&_traffic[query_of(stream)], &_stream_traffic[stream].total}) {
+          t->received_bytes += bytes;
+          ++t->received_batches;
+        }
+      }
+      if (auto r = receiver_of(stream, {from, batch, data})) {
+        r->on_batch(from, batch, std::move(data));
+      }
+    },
+    [this](stream_id stream, rank_t from) {
+      if (auto r = receiver_of(stream, {from, 0, nullptr})) { r->on_end(from); }
+    },
+    [this](std::exception_ptr error) {
+      std::map<stream_id, std::shared_ptr<inbound>> receivers;
+      {
+        std::lock_guard lock{_mutex};
+        // Fail-stop: nothing reconnects, so later queries say how to recover.
+        _error    = std::make_exception_ptr(sirius::internal_exception(
+          "exchange: the transport to the other ranks failed ({}); restart "
+             "every rank to run distributed queries again",
+          what_of(error)));
+        receivers = _receivers;
+      }
+      for (auto& [stream, r] : receivers) {
+        r->on_error(error);
+      }
+    },
+    [this](distributed_query_id query, rank_t from, std::string what) {
+      end_query(query,
+                std::make_exception_ptr(sirius::internal_exception(
+                  "exchange: query {} failed on rank {}: {}", query, from, what)));
+    }};
   auto started = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
   _rank        = started->rank();
   _world_size  = started->world_size();

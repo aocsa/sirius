@@ -347,11 +347,12 @@ struct whole_build_join {
     std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   dynamic_filter_publish_plan plan;
 
-  explicit whole_build_join(std::shared_ptr<exchange_service> service,
-                            std::size_t min_keys            = 4096,
-                            std::uint64_t cap               = 64 * KiB,
-                            std::optional<rank_t> only_from = std::nullopt,
-                            std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
+  explicit whole_build_join(
+    std::shared_ptr<exchange_service> service,
+    std::size_t min_keys                                            = 4096,
+    std::uint64_t cap                                               = 64 * KiB,
+    std::optional<rank_t> only_from                                 = std::nullopt,
+    std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
     : plan(filter_plan(channel, cap))
   {
     merge_across_ranks(plan,
@@ -874,8 +875,7 @@ TEST_CASE("a rank over its share of a stage waits for no one, and no rank gets a
   CHECK_FALSE(gone.total({5, 1}, utils::default_stream()).has_value());
   std::vector<std::optional<std::uint64_t>> got(2, std::optional<std::uint64_t>{1});
   on_every_rank(2, [&](rank_t r) {
-    sirius::exchange::stage_count count{
-      c.all[r].service, 22, *env().gpu, std::chrono::seconds{30}};
+    sirius::exchange::stage_count count{c.all[r].service, 22, *env().gpu, std::chrono::seconds{30}};
     got[r] = bytes_of(count.total({10, 1}, utils::default_stream()));
   });
   CHECK(got[0] == std::nullopt);
@@ -888,8 +888,7 @@ TEST_CASE("a stage count asked again answers as before, without a second all-gat
   ranks c(2);
   std::vector<std::optional<std::uint64_t>> again(2);
   on_every_rank(2, [&](rank_t r) {
-    sirius::exchange::stage_count count{
-      c.all[r].service, 23, *env().gpu, std::chrono::seconds{30}};
+    sirius::exchange::stage_count count{c.all[r].service, 23, *env().gpu, std::chrono::seconds{30}};
     REQUIRE(bytes_of(count.total({7 + r, 0}, utils::default_stream())) ==
             std::optional<std::uint64_t>{15});
     // The peer is past its all-gather: another would wait out the timeout.
@@ -907,8 +906,7 @@ TEST_CASE("a thread that waits for a stage count gets what the rank's other thre
   ranks c(2);
   std::vector<std::optional<std::uint64_t>> waited(2);
   on_every_rank(2, [&](rank_t r) {
-    sirius::exchange::stage_count count{
-      c.all[r].service, 24, *env().gpu, std::chrono::seconds{30}};
+    sirius::exchange::stage_count count{c.all[r].service, 24, *env().gpu, std::chrono::seconds{30}};
     std::thread reader{[&] { waited[r] = bytes_of(count.wait()); }};
     auto const sum = bytes_of(count.total({40, 0}, utils::default_stream()));
     reader.join();

@@ -72,8 +72,8 @@ class bloom_all_gather_merge final : public cross_rank_filter_merge {
                          exchange::stream_id first_stream,
                          std::size_t key_count,
                          cucascade::memory::memory_space& gpu,
-                         std::chrono::milliseconds timeout          = default_timeout,
-                         std::optional<exchange::rank_t> only_from = std::nullopt,
+                         std::chrono::milliseconds timeout                       = default_timeout,
+                         std::optional<exchange::rank_t> only_from               = std::nullopt,
                          std::shared_ptr<exchange::broadcast_choice> whole_build = nullptr);
 
   void merge(std::span<std::shared_ptr<sirius_dynamic_filter>> membership,

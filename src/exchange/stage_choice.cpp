@@ -41,8 +41,9 @@ namespace {
 
 std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept
 {
-  return b > std::numeric_limits<std::uint64_t>::max() - a ? std::numeric_limits<std::uint64_t>::max()
-                                                           : a + b;
+  return b > std::numeric_limits<std::uint64_t>::max() - a
+           ? std::numeric_limits<std::uint64_t>::max()
+           : a + b;
 }
 
 }  // namespace
@@ -169,9 +170,8 @@ std::optional<bool> broadcast_choice::known() const
 
 bool broadcast_choice::settled(std::optional<stage_load> const& sum) const
 {
-  std::call_once(_weighed, [&] {
-    _whole = sum && sum->bytes <= _limit && (!_worth || _worth(*sum));
-  });
+  std::call_once(_weighed,
+                 [&] { _whole = sum && sum->bytes <= _limit && (!_worth || _worth(*sum)); });
   return _whole;
 }
 
