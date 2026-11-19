@@ -26,6 +26,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -101,6 +103,8 @@ std::optional<std::uint64_t> stage_count::answer(std::unique_lock<std::mutex>& l
 
 std::optional<std::uint64_t> stage_count::gather(std::uint64_t mine, ::cuda::stream_ref stream)
 {
+  // The caller may be a thread of its own, not one of the GPU's task threads.
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_gpu->get_device_id()}};
   auto const mr = _gpu->get_default_allocator();
   cudf::numeric_scalar<std::int64_t> const value{static_cast<std::int64_t>(mine), true, stream, mr};
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -129,6 +133,23 @@ std::optional<std::uint64_t> stage_count::gather(std::uint64_t mine, ::cuda::str
                        : sum + add;
   }
   return sum;
+}
+
+broadcast_choice::broadcast_choice(std::shared_ptr<exchange_service> service,
+                                   stream_id stream,
+                                   std::uint64_t limit_bytes,
+                                   cucascade::memory::memory_space& gpu,
+                                   std::chrono::milliseconds timeout)
+  : _count(service, stream, gpu, timeout),
+    _limit(limit_bytes),
+    _share(limit_bytes / service->world_size())
+{
+}
+
+std::optional<bool> broadcast_choice::known() const
+{
+  if (!_count.resolved()) { return std::nullopt; }
+  return fits(_count.wait());
 }
 
 }  // namespace sirius::exchange

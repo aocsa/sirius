@@ -18,9 +18,11 @@
 // hash, range, broadcast and gather routing, ordered gather, early arrivals, and failure.
 
 #include "catch.hpp"
+#include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
+#include "exchange/stage_choice.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
@@ -212,6 +214,93 @@ std::vector<std::unique_ptr<sirius_physical_exchange_source>> exchange_all(
   return sources;
 }
 
+/// What build_exchange_all leaves: each rank's source, and its choice.
+struct chosen_build {
+  std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
+  std::vector<std::shared_ptr<sirius::exchange::broadcast_choice>> choices;
+};
+
+/// Every rank sinks @p batches[rank] batches through the build side's EXCHANGE_SINK of a join
+/// that chooses at run time, at @p limit bytes, between a hashed build and one whole on every
+/// rank, then ends. A thread per rank: each rank's end waits for the other ranks' counts.
+chosen_build build_exchange_all(ranks& c,
+                                stream_id stream,
+                                stream_id count_stream,
+                                std::uint64_t limit,
+                                std::vector<int> const& batches)
+{
+  auto const world = c.world();
+  chosen_build out;
+  for (rank_t r = 0; r < world; ++r) {
+    std::set<rank_t> senders;
+    for (rank_t s = 0; s < world; ++s) {
+      senders.insert(s);
+    }
+    out.sources.push_back(std::make_unique<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[r].service, stream, senders, false));
+    out.choices.push_back(std::make_shared<sirius::exchange::broadcast_choice>(
+      c.all[r].service, count_stream, limit, *env().gpu, std::chrono::seconds{60}));
+  }
+  std::vector<std::exception_ptr> errors(world);
+  std::vector<std::thread> threads;
+  for (rank_t r = 0; r < world; ++r) {
+    threads.emplace_back([&, r] {
+      try {
+        exchange_spec spec;
+        spec.key_columns  = {0};
+        spec.build_choice = out.choices[r];
+        spec.counts_build = true;
+        // Its destructor waits for the choice and for what the sink held to be sent.
+        sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+        for (int i = 0; i < batches[r]; ++i) {
+          sink_batch(sink, key_value_batch(r, i));
+        }
+        sink.finalize_operator();
+      } catch (...) {
+        errors[r] = std::current_exception();
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  for (auto const& e : errors) {
+    if (e) { std::rethrow_exception(e); }
+  }
+  return out;
+}
+
+/// Every rank sinks @p batches batches through the probe side's EXCHANGE_SINK of the join whose
+/// build chose @p choices, then ends; returns each rank's source.
+std::vector<std::unique_ptr<sirius_physical_exchange_source>> probe_exchange_all(
+  ranks& c,
+  stream_id stream,
+  std::vector<std::shared_ptr<sirius::exchange::broadcast_choice>> const& choices,
+  int batches)
+{
+  auto const world = c.world();
+  std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
+  for (rank_t r = 0; r < world; ++r) {
+    std::set<rank_t> senders;
+    for (rank_t s = 0; s < world; ++s) {
+      senders.insert(s);
+    }
+    sources.push_back(std::make_unique<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[r].service, stream, senders, false));
+  }
+  for (rank_t r = 0; r < world; ++r) {
+    exchange_spec spec;
+    spec.key_columns  = {0};
+    spec.build_choice = choices[r];
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+    for (int i = 0; i < batches; ++i) {
+      sink_batch(sink, key_value_batch(r, i));
+    }
+    sink.finalize_operator();
+  }
+  return sources;
+}
+
 std::vector<std::int64_t> all_keys(rank_t world, int batches)
 {
   std::vector<std::int64_t> keys;
@@ -294,6 +383,126 @@ TEST_CASE("a hash exchange of width 1 sends every row to rank 0 and no row elsew
   for (rank_t r = 1; r < c.world(); ++r) {
     CHECK(flat(drain(*sources[r])).empty());
   }
+}
+
+TEST_CASE("a build within the limit goes whole to every rank, and the probe rows stay",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  int const batches = 2;
+  auto build =
+    build_exchange_all(c, 1, 2, std::uint64_t{1} << 30, {batches, batches, batches});
+  auto want = all_keys(c.world(), batches);
+  std::sort(want.begin(), want.end());
+  for (rank_t r = 0; r < c.world(); ++r) {
+    CHECK(build.choices[r]->known() == std::optional<bool>{true});
+    auto got = flat(drain(*build.sources[r]));
+    std::sort(got.begin(), got.end());
+    CHECK(got == want);
+  }
+  // Every rank's build is whole: a probe row finds its matches where it is.
+  auto probe = probe_exchange_all(c, 3, build.choices, batches);
+  for (rank_t r = 0; r < c.world(); ++r) {
+    auto got = flat(drain(*probe[r]));
+    std::vector<std::int64_t> mine;
+    for (int i = 0; i < batches; ++i) {
+      auto k = keys_of(*key_value_batch(r, i));
+      mine.insert(mine.end(), k.begin(), k.end());
+    }
+    std::sort(got.begin(), got.end());
+    CHECK(got == mine);
+  }
+}
+
+TEST_CASE("a rank over its share of the limit settles a hashed build, each row to one rank",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  auto const one = sirius::get_batch_rows_and_bytes(*key_value_batch(0, 0)).bytes;
+  REQUIRE(one > 0);
+  // A share of two batches: rank 0 holds four, the others one each.
+  std::vector<int> const batches{4, 1, 1};
+  auto build = build_exchange_all(c, 1, 2, 3 * 2 * one, batches);
+  std::vector<std::int64_t> want;
+  for (rank_t from = 0; from < c.world(); ++from) {
+    for (int i = 0; i < batches[from]; ++i) {
+      auto k = keys_of(*key_value_batch(from, i));
+      want.insert(want.end(), k.begin(), k.end());
+    }
+  }
+  std::vector<std::int64_t> got;
+  std::size_t ranks_with_rows = 0;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    CHECK(build.choices[r]->known() == std::optional<bool>{false});
+    auto const rows = flat(drain(*build.sources[r]));
+    ranks_with_rows += !rows.empty();
+    got.insert(got.end(), rows.begin(), rows.end());
+  }
+  std::sort(got.begin(), got.end());
+  std::sort(want.begin(), want.end());
+  CHECK(got == want);
+  CHECK(ranks_with_rows == c.world());
+  // A hashed build: the probe rows are hashed as well, each to one rank.
+  auto probe = probe_exchange_all(c, 3, build.choices, 1);
+  std::vector<std::int64_t> probed;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    auto const rows = flat(drain(*probe[r]));
+    probed.insert(probed.end(), rows.begin(), rows.end());
+  }
+  auto all = all_keys(c.world(), 1);
+  std::sort(probed.begin(), probed.end());
+  std::sort(all.begin(), all.end());
+  CHECK(probed == all);
+}
+
+TEST_CASE("the probe side is hashed while its build's choice is open", "[exchange][operators]")
+{
+  ranks c(3);
+  std::vector<std::shared_ptr<sirius::exchange::broadcast_choice>> open;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    open.push_back(std::make_shared<sirius::exchange::broadcast_choice>(
+      c.all[r].service, 2, std::uint64_t{1} << 30, *env().gpu));
+  }
+  auto probe = probe_exchange_all(c, 3, open, 1);
+  std::vector<std::int64_t> probed;
+  bool from_another_rank = false;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    for (auto const k : flat(drain(*probe[r]))) {
+      from_another_rank |= k / 1'000'000 != r;
+      probed.push_back(k);
+    }
+  }
+  auto all = all_keys(c.world(), 1);
+  std::sort(probed.begin(), probed.end());
+  std::sort(all.begin(), all.end());
+  CHECK(probed == all);
+  CHECK(from_another_rank);
+}
+
+TEST_CASE("an exchange sink rejects a build choice that does not fit its routing",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  auto const choice = std::make_shared<sirius::exchange::broadcast_choice>(
+    c.all[0].service, 2, std::uint64_t{1} << 30, *env().gpu);
+  exchange_spec broadcast;
+  broadcast.routing      = mode::broadcast;
+  broadcast.build_choice = choice;
+  CHECK_THROWS_AS(
+    sirius_physical_exchange_sink(key_value_types(), 0, c.all[0].service, 1, broadcast),
+    sirius::invalid_input_exception);
+  exchange_spec narrow;
+  narrow.key_columns  = {0};
+  narrow.width        = 1;
+  narrow.build_choice = choice;
+  CHECK_THROWS_AS(sirius_physical_exchange_sink(key_value_types(), 0, c.all[0].service, 1, narrow),
+                  sirius::invalid_input_exception);
+  exchange_spec uncounted;
+  uncounted.key_columns  = {0};
+  uncounted.counts_build = true;
+  CHECK_THROWS_AS(
+    sirius_physical_exchange_sink(key_value_types(), 0, c.all[0].service, 1, uncounted),
+    sirius::invalid_input_exception);
 }
 
 TEST_CASE("range exchange sends each row to the rank whose range holds it", "[exchange][operators]")

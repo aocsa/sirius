@@ -26,11 +26,14 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <thread>
 #include <vector>
 
 namespace sirius::exchange {
+class broadcast_choice;
 class exchange_service;
-}
+}  // namespace sirius::exchange
 
 namespace sirius::op {
 
@@ -68,6 +71,13 @@ struct exchange_spec {
   /// hash: only ranks 0 to width - 1 receive rows; 0 = every rank. Every rank still gets the
   /// stream's end, so a rank that receives no row hands on its one empty batch.
   exchange::rank_t width = 0;
+  /// hash: a join's run-time choice between this routing and a build sent whole to every rank
+  /// (exchange::broadcast_choice); null = none. With counts_build this is the build side: the
+  /// sink holds its input, counts it, and settles the choice when the input ends. Without, the
+  /// probe side: its rows are hashed until the choice is known, and stay on their rank once the
+  /// build went whole. Either way every rank's whole build meets each probe row once.
+  std::shared_ptr<exchange::broadcast_choice> build_choice;
+  bool counts_build = false;
 };
 
 /**
@@ -128,11 +138,34 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   void on_finalize_operator() override;
 
  private:
+  /// Where route() sends a batch: as the spec says or, once a join's build went whole to every
+  /// rank, the build side's rows to every rank and the probe side's to this one.
+  enum class route_to : std::uint8_t { spec, every_rank, this_rank };
+
   /// The slices of @p batch, one per rank; empty for a rank that gets none of it.
   std::vector<std::shared_ptr<cucascade::data_batch>> route(
     cucascade::read_only_data_batch const& batch,
     std::shared_ptr<cucascade::data_batch> const& handle,
-    ::cuda::stream_ref stream);
+    ::cuda::stream_ref stream,
+    route_to where = route_to::spec);
+
+  /// What execute() made of some input: batches, and the rank of each. A batch whose rank is the
+  /// world size is a whole input batch, made beside its hashed slices while the build's choice
+  /// was open: one or the other is sent.
+  struct routed_batches {
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    std::vector<std::size_t> destinations;
+  };
+
+  /// Sends each batch to its rank; with @p whole_build a whole input batch to every rank in
+  /// place of its slices.
+  void send(std::span<std::shared_ptr<cucascade::data_batch> const> batches,
+            std::span<std::size_t const> destinations,
+            bool whole_build);
+  /// counts_build: settles the choice with the bytes this rank held, and sends what it held.
+  void settle_build();
+  /// Ends the stream to every rank that may receive it.
+  void close_streams();
 
   std::shared_ptr<exchange::exchange_service> _service;
   exchange::stream_id _stream;
@@ -147,6 +180,14 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   std::unique_ptr<cudf::table> _input_schema;
   /// null_keys_to_every_rank: a row of this rank's input has gone to every rank.
   std::atomic<bool> _every_rank_has_a_row{false};
+  /// counts_build: the input held while the choice is open, and its bytes.
+  std::mutex _held_mutex;
+  std::vector<routed_batches> _held;
+  std::uint64_t _held_bytes = 0;
+  /// counts_build: settles the choice and ends the stream once the input has ended. It waits for
+  /// every rank, which the thread that finalizes a pipeline, under its status lock, must not.
+  /// Last, so that it has ended before the members it uses go.
+  std::jthread _settling;
 };
 
 }  // namespace sirius::op

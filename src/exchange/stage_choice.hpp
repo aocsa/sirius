@@ -92,4 +92,52 @@ class stage_count {
   std::exception_ptr _error;
 };
 
+/**
+ * @brief Whether a join's build goes whole to every rank, chosen alike on every rank from the
+ * bytes the ranks really hold.
+ *
+ * The build side's exchange sinks hold their input and count it. A build of at most the limit
+ * over all ranks goes whole to every rank: the probe rows then stay where they are, and each
+ * rank's filters hold every key. A larger build is hashed, as planned. A rank holds at most its
+ * share, the limit split evenly: one that passes it calls over(), which settles a hashed build
+ * without waiting for the other ranks.
+ */
+class broadcast_choice {
+ public:
+  broadcast_choice(std::shared_ptr<exchange_service> service,
+                   stream_id stream,
+                   std::uint64_t limit_bytes,
+                   cucascade::memory::memory_space& gpu,
+                   std::chrono::milliseconds timeout = stage_count::default_timeout);
+
+  /// The bytes one rank may hold before it must call over().
+  [[nodiscard]] std::uint64_t share() const noexcept { return _share; }
+
+  /// This rank holds more than its share: the build is hashed. Does not wait.
+  void over() { _count.over(); }
+
+  /// This rank's input ended with @p held_bytes held. Blocks as stage_count::total().
+  /// @return Whether the build goes whole to every rank.
+  [[nodiscard]] bool decide(std::uint64_t held_bytes, ::cuda::stream_ref stream)
+  {
+    return fits(_count.total(held_bytes, stream));
+  }
+
+  /// The choice, once this rank has it; nothing before. @throws as stage_count::total().
+  [[nodiscard]] std::optional<bool> known() const;
+
+  /// The choice; blocks until this rank has it. @throws as stage_count::wait().
+  [[nodiscard]] bool wait() const { return fits(_count.wait()); }
+
+ private:
+  [[nodiscard]] bool fits(std::optional<std::uint64_t> sum) const noexcept
+  {
+    return sum && *sum <= _limit;
+  }
+
+  stage_count _count;
+  std::uint64_t _limit;
+  std::uint64_t _share;
+};
+
 }  // namespace sirius::exchange
