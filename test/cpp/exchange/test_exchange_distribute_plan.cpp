@@ -597,13 +597,16 @@ TEST_CASE("distribute_plan lets a hashed join send a small build whole, chosen a
           "[exchange][planner]")
 {
   fixture f;
-  auto const sql =
+  // Filtered builds: a build that covers its whole key domain publishes no filter to merge.
+  auto const merged =
+    std::string{"SELECT b.v, c.v FROM big b JOIN big2 c ON b.k = c.k WHERE b.v < 5 AND c.v < 5"};
+  auto const unmerged =
     std::string{"SELECT b.k, count(*) FROM big b JOIN big2 c ON b.k = c.k GROUP BY b.k"};
 
   SECTION("with a limit, the two sides share one choice and the build side counts for it")
   {
     ranks c(3, f.gpu());
-    auto plans = plan_on_every_rank(f, sql, 3);
+    auto plans = plan_on_every_rank(f, merged, 3);
     REQUIRE(distribute(plans, c, f, {}, 7, {.broadcast_bytes = std::uint64_t{1} << 20}) ==
             std::vector<std::string>(3));
     auto* join = find(*plans[0], T::HASH_JOIN);
@@ -623,7 +626,7 @@ TEST_CASE("distribute_plan lets a hashed join send a small build whole, chosen a
   SECTION("without a limit there is no choice")
   {
     ranks c(3, f.gpu());
-    auto plans = plan_on_every_rank(f, sql, 3);
+    auto plans = plan_on_every_rank(f, merged, 3);
     REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
     auto* join = find(*plans[0], T::HASH_JOIN);
     REQUIRE(join);
@@ -634,6 +637,41 @@ TEST_CASE("distribute_plan lets a hashed join send a small build whole, chosen a
       CHECK_FALSE(sink_below(*side)->spec().counts_build);
     }
   }
+
+  SECTION("a join with no filter to merge gets no choice, whatever the limit")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, unmerged, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.broadcast_bytes = std::uint64_t{1} << 20}) ==
+            std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK_FALSE(sink_below(*side)->spec().build_choice);
+      CHECK_FALSE(sink_below(*side)->spec().counts_build);
+    }
+  }
+}
+
+TEST_CASE("a whole build is worth it when it adds fewer bytes than its Bloom merge sends",
+          "[exchange][planner]")
+{
+  using sirius::planner::whole_build_saves_bytes;
+  constexpr std::uint64_t MB = 1'000'000;
+  // 4 ranks: a whole build adds 2.25 times its bytes. A merged Bloom for 1 M keys is 65536
+  // blocks, 2 MiB, and its merge sends 12 copies: 25 MB.
+  CHECK(whole_build_saves_bytes(8 * MB, 1'000'000, 4, 1));
+  CHECK_FALSE(whole_build_saves_bytes(16 * MB, 1'000'000, 4, 1));
+  // Two merged keys save twice that.
+  CHECK(whole_build_saves_bytes(16 * MB, 1'000'000, 4, 2));
+  // A merged Bloom has at least 2^16 keys, 128 KiB: 12 copies outweigh a build of 0.5 MB.
+  CHECK(whole_build_saves_bytes(MB / 2, 10, 4, 1));
+  // No merged filter: nothing known to save.
+  CHECK_FALSE(whole_build_saves_bytes(MB / 2, 10, 4, 0));
+  // One rank sends nothing either way.
+  CHECK(whole_build_saves_bytes(1000 * MB, 1, 1, 1));
 }
 
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")

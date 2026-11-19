@@ -264,7 +264,7 @@ single-process plan already partitions:
 | `HASH_JOIN`, each side `CONCAT → PARTITION → input` | `hash` on that `PARTITION`'s join keys and casts, below it |
 | the same, with a small build side | `broadcast` of the build side; the probe side stays where it is |
 | the same, with both sides estimated within `exchange_stage_bytes` | `hash` of width 1 on each side: the join runs on rank 0 alone, and a group-by, a sort and the result above it stay there with no exchange |
-| the same, with `exchange_broadcast_bytes` set | `hash` on each side, with a choice made as the query runs: the build side's sinks hold and count their input, and a build of at most that many bytes over all ranks goes whole to every rank while the probe side keeps its rows; a larger build is hashed as planned |
+| the same, with `exchange_broadcast_bytes` set | `hash` on each side, with a choice made as the query runs: the build side's sinks hold and count their input, and a build of at most that many bytes over all ranks goes whole to every rank, when that moves fewer bytes between ranks, while the probe side keeps its rows; any other build is hashed as planned |
 | `NESTED_LOOP_JOIN`, each side `CONCAT → PARTITION → input` | `broadcast` of the build side; the probe side stays where it is |
 | `DENSE_COUNT_JOIN`, each side `PARTITION → input` | `hash` on the join key, both sides |
 | `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side |

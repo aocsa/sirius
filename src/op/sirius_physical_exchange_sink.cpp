@@ -357,7 +357,9 @@ void sirius_physical_exchange_sink::sink(const operator_data& input_data,
   auto const whole_batch = static_cast<std::size_t>(_service->world_size());
   for (std::size_t i = 0; i < batches.size(); ++i) {
     if (routed.destinations()[i] == whole_batch) {
-      _held_bytes += get_batch_rows_and_bytes(*batches[i]).bytes;
+      auto const size = get_batch_rows_and_bytes(*batches[i]);
+      _held_bytes += size.bytes;
+      _held_rows += size.rows.value_or(0);
     }
   }
   _held.push_back({batches, routed.destinations()});
@@ -406,10 +408,10 @@ void sirius_physical_exchange_sink::settle_build()
 {
   try {
     std::unique_lock lock{_held_mutex};
-    auto const held  = std::exchange(_held, {});
-    auto const bytes = _held_bytes;
+    auto const held = std::exchange(_held, {});
+    exchange::stage_load const load{_held_bytes, _held_rows};
     lock.unlock();
-    bool const whole_build = _spec.build_choice->decide(bytes, cudf::get_default_stream());
+    bool const whole_build = _spec.build_choice->decide(load, cudf::get_default_stream());
     for (auto const& h : held) {
       send(h.batches, h.destinations, whole_build);
     }

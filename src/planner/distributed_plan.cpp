@@ -26,6 +26,7 @@
 #include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/distributed/sample_all_gather_boundaries.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
@@ -627,11 +628,12 @@ struct rewriter {
   /// alone would drop rows other ranks' builds match, so every rank's Bloom is merged. With
   /// @p narrow the join runs on rank 0 alone: its build is whole there, and its Bloom goes from
   /// there to every rank, whose scans it filters.
-  void merge_filters_across_ranks(op::sirius_physical_hash_join& join,
+  /// @return The keys whose filters are merged; 0 when the join's filters are not.
+  std::size_t merge_filters_across_ranks(op::sirius_physical_hash_join& join,
                                   bool narrow                                             = false,
                                   std::shared_ptr<exchange::broadcast_choice> whole_build = nullptr)
   {
-    if (!join.publishes_dynamic_filters()) { return; }
+    if (!join.publishes_dynamic_filters()) { return 0; }
     auto const build_rows = join.children[1]->estimated_cardinality;
     // A right semi or anti join publishes before its probe side drains; a merge would make that
     // wait on every rank's build.
@@ -639,7 +641,7 @@ struct rewriter {
         join.join_type == duckdb::JoinType::RIGHT_ANTI) {
       join.cancel_dynamic_filter_publication();
       shape += "f";
-      return;
+      return 0;
     }
     // One stream per admitted key: key k merges on first + k. The keys are fixed while planning,
     // so every rank reserves the same streams.
@@ -662,6 +664,7 @@ struct rewriter {
       // Rank 0 alone holds a narrow join's build: all of its keys, not one part in the ranks.
       narrow ? 1 : service->world_size());
     shape += narrow ? "F0" : "F";
+    return join.dynamic_filter_plan().admitted_keys().size();
   }
 
   placement visit(duckdb::unique_ptr<op::sirius_physical_operator>& slot)
@@ -720,17 +723,25 @@ struct rewriter {
         // A build that really holds few bytes goes whole to every rank, as the small estimated
         // one above does, and the probe rows stay: the build side's sinks count it as it runs.
         std::shared_ptr<exchange::broadcast_choice> choice;
+        exchange::stream_id count_stream{};
         if (!narrow && stages.broadcast_bytes > 0 &&
             emits_build_rows_only_with_probe(join.join_type) &&
             join.join_type != duckdb::JoinType::MARK) {
-          auto const count_stream = stream();
-          service->describe(count_stream, "build bytes");
-          choice = std::make_shared<exchange::broadcast_choice>(
+          count_stream = stream();
+          choice       = std::make_shared<exchange::broadcast_choice>(
             service, count_stream, stages.broadcast_bytes, *gpu);
+        }
+        auto const merged_keys = merge_filters_across_ranks(join, narrow, choice);
+        // With no merge to save, nothing known when the build must go says whole is worth it.
+        if (merged_keys == 0) { choice.reset(); }
+        if (choice) {
+          service->describe(count_stream, "build bytes");
           // With the limit: ranks that differ in it would choose differently as they run.
           shape += "C" + std::to_string(stages.broadcast_bytes);
+          choice->weigh([world, merged_keys](exchange::stage_load const& held) {
+            return whole_build_saves_bytes(held.bytes, held.rows, world, merged_keys);
+          });
         }
-        merge_filters_across_ranks(join, narrow, choice);
         if (narrow) {
           shape += "N";
           to_rank0_below(probe);
@@ -1110,6 +1121,24 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
     throw sirius::not_implemented_exception(
       "distributed execution: a plan that carries its own byte ranges");
   }
+}
+
+bool whole_build_saves_bytes(std::uint64_t build_bytes,
+                             std::uint64_t build_rows,
+                             std::uint64_t ranks,
+                             std::size_t merged_keys) noexcept
+{
+  if (merged_keys == 0) { return false; }
+  if (ranks < 2) { return true; }
+  auto const n = static_cast<long double>(ranks);
+  // Each rank's rows go to n - 1 ranks in place of (n - 1) / n of them.
+  auto const added = static_cast<long double>(build_bytes) * (n - 1) * (n - 1) / n;
+  // Each rank sizes its merged Bloom for the rows of all ranks (merged_bloom_policy()).
+  auto const keys = op::scaled_bloom_keys(
+    build_rows, 1, op::merged_bloom_min_keys, op::merged_bloom_max_keys);
+  auto const bloom =
+    static_cast<long double>(op::bloom_blocks_for(keys) * op::bloom_bytes_per_block);
+  return added <= n * (n - 1) * static_cast<long double>(merged_keys) * bloom;
 }
 
 void install_filter_merge(op::sirius_physical_hash_join& join,

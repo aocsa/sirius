@@ -180,10 +180,11 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   std::unique_ptr<cudf::table> _input_schema;
   /// null_keys_to_every_rank: a row of this rank's input has gone to every rank.
   std::atomic<bool> _every_rank_has_a_row{false};
-  /// counts_build: the input held while the choice is open, and its bytes.
+  /// counts_build: the input held while the choice is open, and its bytes and rows.
   std::mutex _held_mutex;
   std::vector<routed_batches> _held;
   std::uint64_t _held_bytes = 0;
+  std::uint64_t _held_rows  = 0;
   /// counts_build: settles the choice and ends the stream once the input has ended. It waits for
   /// every rank, which the thread that finalizes a pipeline, under its status lock, must not.
   /// Last, so that it has ended before the members it uses go.

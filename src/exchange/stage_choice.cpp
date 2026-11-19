@@ -31,11 +31,21 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <array>
 #include <limits>
 #include <utility>
 #include <vector>
 
 namespace sirius::exchange {
+namespace {
+
+std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept
+{
+  return b > std::numeric_limits<std::uint64_t>::max() - a ? std::numeric_limits<std::uint64_t>::max()
+                                                           : a + b;
+}
+
+}  // namespace
 
 stage_count::stage_count(std::shared_ptr<exchange_service> service,
                          stream_id stream,
@@ -57,14 +67,14 @@ void stage_count::over()
   leave_all_gather(*_service, _stream);
 }
 
-std::optional<std::uint64_t> stage_count::total(std::uint64_t mine, ::cuda::stream_ref stream)
+std::optional<stage_load> stage_count::total(stage_load mine, ::cuda::stream_ref stream)
 {
   {
     std::unique_lock lock{_mutex};
     if (_state != state::open) { return answer(lock); }
     _state = state::gathering;
   }
-  std::optional<std::uint64_t> sum;
+  std::optional<stage_load> sum;
   std::exception_ptr error;
   try {
     sum = gather(mine, stream);
@@ -85,13 +95,13 @@ bool stage_count::resolved() const
   return _state == state::resolved;
 }
 
-std::optional<std::uint64_t> stage_count::wait() const
+std::optional<stage_load> stage_count::wait() const
 {
   std::unique_lock lock{_mutex};
   return answer(lock);
 }
 
-std::optional<std::uint64_t> stage_count::answer(std::unique_lock<std::mutex>& lock) const
+std::optional<stage_load> stage_count::answer(std::unique_lock<std::mutex>& lock) const
 {
   if (!_changed.wait_for(lock, _timeout, [this] { return _state == state::resolved; })) {
     throw sirius::internal_exception(
@@ -101,36 +111,41 @@ std::optional<std::uint64_t> stage_count::answer(std::unique_lock<std::mutex>& l
   return _sum;
 }
 
-std::optional<std::uint64_t> stage_count::gather(std::uint64_t mine, ::cuda::stream_ref stream)
+std::optional<stage_load> stage_count::gather(stage_load mine, ::cuda::stream_ref stream)
 {
   // The caller may be a thread of its own, not one of the GPU's task threads.
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_gpu->get_device_id()}};
   auto const mr = _gpu->get_default_allocator();
-  cudf::numeric_scalar<std::int64_t> const value{static_cast<std::int64_t>(mine), true, stream, mr};
+  // One row: bytes, rows.
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::make_column_from_scalar(value, 1, stream, mr));
+  for (auto const count : {mine.bytes, mine.rows}) {
+    cudf::numeric_scalar<std::int64_t> const value{
+      static_cast<std::int64_t>(count), true, stream, mr};
+    columns.push_back(cudf::make_column_from_scalar(value, 1, stream, mr));
+  }
   auto batch =
     make_data_batch(std::make_unique<cudf::table>(std::move(columns)), *_gpu, stream, {});
   auto const counts =
     all_gather(*_service, _stream, std::move(batch), *_gpu, stream.get(), _timeout);
 
   // A rank that went over left no table.
-  std::vector<std::int64_t> theirs(counts.size());
+  std::vector<std::array<std::int64_t, 2>> theirs(counts.size());
   for (std::size_t r = 0; r < counts.size(); ++r) {
     if (!counts[r]) { return std::nullopt; }
-    CUDF_CUDA_TRY(cudaMemcpyAsync(&theirs[r],
-                                  get_cudf_table_view(*counts[r]).column(0).data<std::int64_t>(),
-                                  sizeof(std::int64_t),
-                                  cudaMemcpyDeviceToHost,
-                                  stream.get()));
+    auto const view = get_cudf_table_view(*counts[r]);
+    for (cudf::size_type c = 0; c < 2; ++c) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(&theirs[r][c],
+                                    view.column(c).data<std::int64_t>(),
+                                    sizeof(std::int64_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+    }
   }
   CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-  std::uint64_t sum = 0;
-  for (auto const bytes : theirs) {
-    auto const add = static_cast<std::uint64_t>(bytes);
-    sum            = add > std::numeric_limits<std::uint64_t>::max() - sum
-                       ? std::numeric_limits<std::uint64_t>::max()
-                       : sum + add;
+  stage_load sum;
+  for (auto const& held : theirs) {
+    sum.bytes = saturating_add(sum.bytes, static_cast<std::uint64_t>(held[0]));
+    sum.rows  = saturating_add(sum.rows, static_cast<std::uint64_t>(held[1]));
   }
   return sum;
 }
@@ -149,7 +164,15 @@ broadcast_choice::broadcast_choice(std::shared_ptr<exchange_service> service,
 std::optional<bool> broadcast_choice::known() const
 {
   if (!_count.resolved()) { return std::nullopt; }
-  return fits(_count.wait());
+  return settled(_count.wait());
+}
+
+bool broadcast_choice::settled(std::optional<stage_load> const& sum) const
+{
+  std::call_once(_weighed, [&] {
+    _whole = sum && sum->bytes <= _limit && (!_worth || _worth(*sum));
+  });
+  return _whole;
 }
 
 }  // namespace sirius::exchange

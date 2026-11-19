@@ -177,6 +177,22 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
 /// when its build CONCAT (`children[1]`) finalizes:
 /// a peer's merge waits on this rank's part, and that peer's probe may be what this rank's probe
 /// waits on, so the join's own finalize is too late.
+/**
+ * @brief Whether a hashed join's build, sent whole to every rank, moves fewer bytes between ranks
+ * than the exchanges it replaces.
+ *
+ * Whole, every rank sends its build rows to every other rank in place of one part in @p ranks of
+ * them. That saves the join's Bloom merge: @p merged_keys filters, sized for @p build_rows, from
+ * every rank to every other. It saves the probe's exchange as well, but by how much no rank knows
+ * when the build must go: the probe rows reach it filtered, and the planner's estimate of them
+ * has been 20 times too high and more. So the probe counts for nothing, and a join with no
+ * merged filter (@p merged_keys of 0) is never worth it.
+ */
+[[nodiscard]] bool whole_build_saves_bytes(std::uint64_t build_bytes,
+                                           std::uint64_t build_rows,
+                                           std::uint64_t ranks,
+                                           std::size_t merged_keys) noexcept;
+
 void install_filter_merge(op::sirius_physical_hash_join& join,
                           std::shared_ptr<op::cross_rank_filter_merge> merge,
                           std::size_t ranks);

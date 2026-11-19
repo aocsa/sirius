@@ -95,6 +95,12 @@ struct ranks {
   }
 };
 
+/// The bytes of a stage count's answer.
+std::optional<std::uint64_t> bytes_of(std::optional<sirius::exchange::stage_load> const& sum)
+{
+  return sum ? std::optional<std::uint64_t>{sum->bytes} : std::nullopt;
+}
+
 /// Runs @p work(rank) on one thread per rank, all at once; rethrows the first failure.
 template <typename Work>
 void on_every_rank(rank_t world, Work work)
@@ -619,7 +625,7 @@ TEST_CASE("a rank whose build went whole to every rank publishes its own Bloom a
   on_every_rank(3, [&](rank_t r) {
     whole[r] = std::make_shared<sirius::exchange::broadcast_choice>(
       c.all[r].service, 25, std::uint64_t{1} << 30, *env().gpu, std::chrono::seconds{30});
-    decided[r] = whole[r]->decide(1000, utils::default_stream());
+    decided[r] = whole[r]->decide({1000, 10}, utils::default_stream());
   });
   REQUIRE(decided == std::vector<int>(3, 1));
   // Rank 0 alone publishes: an all-gather would wait out the other ranks and publish nothing.
@@ -837,18 +843,21 @@ TEST_CASE("a rank that leaves an all-gather does not wait, and the others go on 
   }
 }
 
-TEST_CASE("every rank gets the sum of the bytes the ranks hold for a stage",
+TEST_CASE("every rank gets the sum of the bytes and rows the ranks hold for a stage",
           "[exchange][collectives]")
 {
   ranks c(3);
   std::vector<std::optional<std::uint64_t>> got(3);
+  std::vector<std::uint64_t> rows(3);
   on_every_rank(3, [&](rank_t r) {
     sirius::exchange::stage_count count{c.all[r].service, 21, *env().gpu};
-    got[r] = count.total((r + 1) * 1000, utils::default_stream());
+    got[r] = bytes_of(count.total({(r + 1) * 1000, r + 10}, utils::default_stream()));
     CHECK(count.resolved());
+    rows[r] = count.wait().value_or(sirius::exchange::stage_load{}).rows;
   });
   for (rank_t r = 0; r < 3; ++r) {
     CHECK(got[r] == std::optional<std::uint64_t>{6000});
+    CHECK(rows[r] == 33);
   }
 }
 
@@ -860,14 +869,14 @@ TEST_CASE("a rank over its share of a stage waits for no one, and no rank gets a
   // Before the others start: it must not need them.
   gone.over();
   CHECK(gone.resolved());
-  CHECK(gone.wait() == std::nullopt);
+  CHECK_FALSE(gone.wait().has_value());
   // Its input ends later: it has its answer, and no all-gather runs for it.
-  CHECK(gone.total(5, utils::default_stream()) == std::nullopt);
+  CHECK_FALSE(gone.total({5, 1}, utils::default_stream()).has_value());
   std::vector<std::optional<std::uint64_t>> got(2, std::optional<std::uint64_t>{1});
   on_every_rank(2, [&](rank_t r) {
     sirius::exchange::stage_count count{
       c.all[r].service, 22, *env().gpu, std::chrono::seconds{30}};
-    got[r] = count.total(10, utils::default_stream());
+    got[r] = bytes_of(count.total({10, 1}, utils::default_stream()));
   });
   CHECK(got[0] == std::nullopt);
   CHECK(got[1] == std::nullopt);
@@ -881,11 +890,12 @@ TEST_CASE("a stage count asked again answers as before, without a second all-gat
   on_every_rank(2, [&](rank_t r) {
     sirius::exchange::stage_count count{
       c.all[r].service, 23, *env().gpu, std::chrono::seconds{30}};
-    REQUIRE(count.total(7 + r, utils::default_stream()) == std::optional<std::uint64_t>{15});
+    REQUIRE(bytes_of(count.total({7 + r, 0}, utils::default_stream())) ==
+            std::optional<std::uint64_t>{15});
     // The peer is past its all-gather: another would wait out the timeout.
-    again[r] = count.total(100, utils::default_stream());
+    again[r] = bytes_of(count.total({100, 0}, utils::default_stream()));
     count.over();
-    CHECK(count.wait() == std::optional<std::uint64_t>{15});
+    CHECK(bytes_of(count.wait()) == std::optional<std::uint64_t>{15});
   });
   CHECK(again[0] == std::optional<std::uint64_t>{15});
   CHECK(again[1] == std::optional<std::uint64_t>{15});
@@ -899,8 +909,8 @@ TEST_CASE("a thread that waits for a stage count gets what the rank's other thre
   on_every_rank(2, [&](rank_t r) {
     sirius::exchange::stage_count count{
       c.all[r].service, 24, *env().gpu, std::chrono::seconds{30}};
-    std::thread reader{[&] { waited[r] = count.wait(); }};
-    auto const sum = count.total(40, utils::default_stream());
+    std::thread reader{[&] { waited[r] = bytes_of(count.wait()); }};
+    auto const sum = bytes_of(count.total({40, 0}, utils::default_stream()));
     reader.join();
     CHECK(sum == std::optional<std::uint64_t>{80});
   });

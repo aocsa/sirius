@@ -50,6 +50,7 @@
 #include <condition_variable>
 #include <future>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -227,7 +228,8 @@ chosen_build build_exchange_all(ranks& c,
                                 stream_id stream,
                                 stream_id count_stream,
                                 std::uint64_t limit,
-                                std::vector<int> const& batches)
+                                std::vector<int> const& batches,
+                                std::function<bool(sirius::exchange::stage_load const&)> worth = {})
 {
   auto const world = c.world();
   chosen_build out;
@@ -240,6 +242,7 @@ chosen_build build_exchange_all(ranks& c,
       key_value_types(), 0, c.all[r].service, stream, senders, false));
     out.choices.push_back(std::make_shared<sirius::exchange::broadcast_choice>(
       c.all[r].service, count_stream, limit, *env().gpu, std::chrono::seconds{60}));
+    if (worth) { out.choices.back()->weigh(worth); }
   }
   std::vector<std::exception_ptr> errors(world);
   std::vector<std::thread> threads;
@@ -453,6 +456,42 @@ TEST_CASE("a rank over its share of the limit settles a hashed build, each row t
   std::sort(probed.begin(), probed.end());
   std::sort(all.begin(), all.end());
   CHECK(probed == all);
+}
+
+TEST_CASE("a build within the limit is hashed when the join finds whole not worth it",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  int const batches = 2;
+  std::mutex mutex;
+  std::vector<sirius::exchange::stage_load> weighed;
+  auto build = build_exchange_all(c,
+                                  1,
+                                  2,
+                                  std::uint64_t{1} << 30,
+                                  {batches, batches, batches},
+                                  [&](sirius::exchange::stage_load const& held) {
+                                    std::lock_guard lock{mutex};
+                                    weighed.push_back(held);
+                                    return false;
+                                  });
+  std::vector<std::int64_t> got;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    CHECK(build.choices[r]->known() == std::optional<bool>{false});
+    auto const rows = flat(drain(*build.sources[r]));
+    got.insert(got.end(), rows.begin(), rows.end());
+  }
+  auto want = all_keys(c.world(), batches);
+  std::sort(got.begin(), got.end());
+  std::sort(want.begin(), want.end());
+  CHECK(got == want);
+  // Each rank weighs once, and the same build: all of its bytes and rows.
+  auto const one = sirius::get_batch_rows_and_bytes(*key_value_batch(0, 0)).bytes;
+  REQUIRE(weighed.size() == c.world());
+  for (auto const& held : weighed) {
+    CHECK(held.rows == std::uint64_t{c.world()} * batches * rows_per_batch);
+    CHECK(held.bytes == std::uint64_t{c.world()} * batches * one);
+  }
 }
 
 TEST_CASE("the probe side is hashed while its build's choice is open", "[exchange][operators]")
