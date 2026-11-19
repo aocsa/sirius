@@ -19,6 +19,7 @@
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
+#include "downgrade/repository_labels.hpp"
 #include "downgrade/spill_policy.hpp"
 #include "log/logging.hpp"
 
@@ -32,6 +33,7 @@
 #include <exception>
 #include <format>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -268,6 +270,16 @@ void downgrade_executor::processing_loop()
     };
     target_tier_stats host_target_stats, disk_target_stats;
 
+    // Bytes this request moved out of each repository, by the operator and port that read it.
+    struct consumer_tier_stats {
+      std::size_t host_batches = 0;
+      std::size_t host_bytes   = 0;
+      std::size_t disk_batches = 0;
+      std::size_t disk_bytes   = 0;
+    };
+    std::mutex consumer_stats_mutex;
+    std::map<std::string, consumer_tier_stats> consumer_stats;
+
     cucascade::memory::memory_space* source_space = nullptr;
     std::vector<const cucascade::memory::memory_space*> target_spaces;
     size_t host_end_idx      = 0;
@@ -373,10 +385,14 @@ void downgrade_executor::processing_loop()
 
       // === TIER 1: Data repositories ===
       // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
-      // query: outer loop DESCENDING by query id (newest query first), inner loop in
-      // get_repositories() order — ascending {operator_id, port_id} — with early stop once the
+      // query: outer loop DESCENDING by query id (newest query first), inner loop in REVERSE
+      // get_repositories() order — descending {operator_id, port_id} — with early stop once the
       // reservation is satisfied. Operator ids restart at 0 per query, so ordering is
       // (query id, operator id) rather than a single global counter.
+      //
+      // A repository is keyed by its CONSUMER's operator id, and ids follow the topological
+      // pipeline order, so descending order offers the data that is read last first and keeps
+      // the input of the operator about to run resident.
       //
       // Newest-first is the fairness policy: query ids are monotonic, so the newest query is the
       // one that has made the least progress, and spilling it costs the least re-materialization
@@ -398,11 +414,12 @@ void downgrade_executor::processing_loop()
         if (!borrow) { continue; }
         if (req->satisfied.load() || pool_interrupted || target_completed()) break;
         auto repos = manager->get_repositories();
-        for (auto* repo : repos) {
+        for (auto* repo : std::views::reverse(repos)) {
           if (req->satisfied.load() || target_completed()) break;
 
           convertible_data_batch_provider provider(repo);
-          auto candidates = provider.get_all_convertible(
+          auto const consumer = downgrade::repository_label(repo);
+          auto candidates     = provider.get_all_convertible(
             source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
 
           // Snapshot candidate sizes so target-carrying requests can right-size their final pick
@@ -465,6 +482,9 @@ void downgrade_executor::processing_loop()
                &repo_stats,
                &host_target_stats,
                &disk_target_stats,
+               &consumer_stats_mutex,
+               &consumer_stats,
+               consumer,
                predicate_satisfied]() mutable {
                 absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
                   planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -479,15 +499,28 @@ void downgrade_executor::processing_loop()
                     req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                     repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
                     repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                    consumer_tier_stats moved;
                     for (size_t i = 0; i < result->size(); ++i) {
                       if ((*result)[i] == 0) continue;
                       if (i < host_end_idx) {
                         host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
                         host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                        ++moved.host_batches;
+                        moved.host_bytes += (*result)[i];
                       } else {
                         disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
                         disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                        ++moved.disk_batches;
+                        moved.disk_bytes += (*result)[i];
                       }
+                    }
+                    {
+                      std::lock_guard<std::mutex> guard(consumer_stats_mutex);
+                      auto& total = consumer_stats[consumer];
+                      total.host_batches += moved.host_batches;
+                      total.host_bytes += moved.host_bytes;
+                      total.disk_batches += moved.disk_batches;
+                      total.disk_bytes += moved.disk_bytes;
                     }
                     predicate_satisfied(req_ptr);
                   }
@@ -708,6 +741,21 @@ void downgrade_executor::processing_loop()
           host_target_stats.bytes.load(std::memory_order_relaxed),
           disk_target_stats.batches.load(std::memory_order_relaxed),
           disk_target_stats.bytes.load(std::memory_order_relaxed));
+
+        if (!consumer_stats.empty()) {
+          std::string by_consumer;
+          for (auto const& [consumer, moved] : consumer_stats) {
+            by_consumer += std::format("{}{}: to_host {}/{}, to_disk {}/{}",
+                                       by_consumer.empty() ? "" : "; ",
+                                       consumer,
+                                       moved.host_batches,
+                                       moved.host_bytes,
+                                       moved.disk_batches,
+                                       moved.disk_bytes);
+          }
+          SIRIUS_LOG_DEBUG(
+            "[downgrade] [{}] by consumer (batches/bytes): {}", _source_label, by_consumer);
+        }
       });
     }
 

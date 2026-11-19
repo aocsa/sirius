@@ -32,6 +32,24 @@ connections to one DatabaseInstance. It bounds initialization through retirement
 queries wait in a cancellable FIFO queue. See [Concurrent queries](concurrent-queries.md) for
 the maintenance, error and multi-GPU contracts.
 
+### Distributed launch section (`sirius.distributed`)
+
+Sirius accepts a `sirius.distributed` section and ignores it. The distributed launch scripts
+(`pixi run sirius-gateway`, `sirius-node`, `sirius-client`) read it, through
+`scripts/sirius_distributed_config.py`, from the same file Sirius loads: the gateway's name,
+ports, networks, the GPUs per node, and UCX transports. Each key sets an environment variable;
+one you export wins over the file. Any error in the section, such as an unknown key, stops the
+scripts with nothing applied. See the
+[distributed quick start](distributed-quickstart.md#configure) for every key.
+
+```yaml
+sirius:
+  distributed:
+    cluster: tpch
+    gateway: { min_ranks: 8, networks: 10.87.140.0/24 }
+    node: { gpus: all }
+```
+
 ### `SIRIUS_DISABLE`
 
 Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
@@ -89,7 +107,7 @@ config.load_from_file("/path/to/config.yaml");  // Optional
 ```yaml
 sirius:
   max_concurrent_queries: 1
-  topology: { num_gpus: 1 }
+  topology: { num_gpus: all }
   memory:
     gpu:
       usage_limit_fraction: 0.95
@@ -136,7 +154,7 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_gpus` | int | all visible GPUs | Non-negative number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
+| `num_gpus` | `all` or int | `all` | `all` uses every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`). A positive count uses that many. `0`, a negative count, or any other value is an error. Mutually exclusive with `gpu_ids`. |
 | `gpu_ids` | list of int | — | Non-empty list of unique, non-negative GPU device IDs. Mutually exclusive with `num_gpus`. |
 | `gpus_per_query` | int | `0` (all) | How many GPUs each query is allocated at admission time. `0` uses all active GPUs. Values exceeding the active GPU count are clamped to the full set. |
 
@@ -324,7 +342,11 @@ See [Thread Pool Configuration](#thread-pool-configuration) for rounding, limits
 
 Thread pool (fixed default `num_threads: 4`). Task creation
 policy and within-branch priority are internal: Sirius currently creates tasks
-on demand and prioritizes source-side pipelines first. The former
+on demand and prioritizes source-side pipelines first. Setting the environment
+variable `SIRIUS_PRIORITY_DOWNSTREAM_FIRST=1` reverses that ranking, so pipelines
+closer to the result run first and consume what the scans produced before more
+is read; at 16 ranks it keeps a large shuffle join from piling up its probe
+input (TPC-H SF100000 Q3). The former
 `sirius.executor.task_creator.strategy` and
 `sirius.executor.task_creator.priority_order` keys have been removed;
 configurations that still contain either key must delete it.
@@ -372,7 +394,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | 18 | Metadata-producer worker threads; fixed default. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
+| `backend` | enum: `native`, `gds` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `gds` reads local files into GPU memory with cuFile (GPUDirect Storage), see [`scan_manager.gds`](#scan_managergds--gpudirect-storage-backend-srciogds); `s3://` reads still go through native REST. `gds` is single-GPU only: a multi-GPU configuration with `gds` is rejected. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
@@ -610,6 +632,26 @@ sirius:
           user_space_rx: record_layer
           recv_placement: automatic
 ```
+
+### `scan_manager.gds` — GPUDirect Storage backend (`src/io/gds/`)
+
+Used when `backend: gds`. Local files are read into GPU memory with cuFile, with no copy through
+host memory. This backend runs without the prefetching cache and the readahead.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `num_threads` | int (**1–64**) | 32 | Threads that issue cuFile reads: the bound on reads in flight per process. On GPFS 32 and 64 were fastest, 128 slower, and at 256 a read stopped returning, so more than 64 is rejected. |
+| `task_size` | bytes (**> 0**) | 16Mi | Bytes per cuFile read. A larger read is cut into pieces of this size. |
+| `require` | bool | true | Refuse to start unless cuFile reports GDS available with its POSIX fallback off, and fail reads once cuFile serves most reads through POSIX (after the first GiB; cuFile reads a few KiB at a time through POSIX even under GDS). With `false` these are logged only. |
+| `max_gb_per_s` | number (**>= 0**) | 0 | Most bytes per second a process starts reading through cuFile, in GB/s; 0 is no cap. With more `num_threads`, data GPFS serves fast (read lately) would otherwise run a storage NIC at the rate that stalled rails; the cap holds that while reads of other data, which GPFS serves at about 1.2 GB/s per thread, gain from the threads. The cap is per process; a NIC carries the sum of the processes that share it. |
+| `slow_read_ms_per_mib` | number (**>= 0**) | 5 | Reads fail with "GDS reads slowed down" once they stay slower than this many milliseconds per MiB for two seconds; 0 turns the check off. Measured on GPFS: 0.8–1.2 ms per MiB when healthy, 10–62 on a path that was going bad. |
+| `read_timeout_s` | int (**> 0**) | 10 | A cuFile read in flight longer than this ends the process with status 70. cuFile reads cannot be cancelled, and failing the query instead would free buffers a stuck read still writes to. `scripts/sirius_rank_node.sh` does not restart a rank that exits with 70. |
+
+cuFile falls back to POSIX reads without an error while its own configuration has
+`allow_compat_mode: true`, so `require: true` needs a cuFile configuration with that turned off.
+`scripts/gds/cufile_json.sh <dir>` writes such a copy of the node's file; `scripts/sirius_rank_node.sh`
+does it for each rank when `SIRIUS_GDS=1` is set. See [Scan](scan.md#gpudirect-storage-backend) for
+the start-up line, the per-query proof line and the first test to run on a new machine.
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
@@ -1079,6 +1121,10 @@ SET enable_compressed_materialization = false;
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 | `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim join's outer rows |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
+| `enable_narrowing_expression_pushdown` | true | Compute a projection's DECIMAL or DOUBLE `+`, `-`, `*` expression below the inner join under it when its inputs come from one join side, are used nowhere else, and are wider than the result (TPC-H q9's `amount`). |
+| `enable_late_dimension_join` | true | Join a small unfiltered lookup table after the aggregation instead of below the joins when its columns are only GROUP BY keys: the aggregate groups by the foreign key, the lookup table is joined to its groups, and a second aggregate merges them (TPC-H q9's `nation`). Only for `sum`, `min` and `max`, when DuckDB estimates at most 1,000,000 groups and lookup rows, and when the rows it estimates into the aggregate would stop carrying at least one GPU's downgrade threshold of lookup columns, so small data keeps its plan. |
+| `enable_complete_group_having` | true | Distributed execution: when the Parquet footers prove a GROUP BY key never spans two row groups (apart from row-group boundary values), apply the HAVING above the merge to each scan batch's partial groups before the exchange (TPC-H Q18). |
+| `enable_scan_reuse_rewrites` | true | Rewrite logical plans that read the same rows twice so they read them once (`src/planner/scan_reuse_rewrites.hpp`): an IN-subquery's aggregate reused by the outer query (TPC-H Q18), a correlated MIN/MAX/AVG subquery over the outer query's own rows (Q17, Q2), a join computed twice (Q11). Standalone and distributed. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -1148,7 +1194,13 @@ connected, none of these settings can change, on any connection.
 |----------|---------|-------------|
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
-| `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
+| `sirius_exchange_host_staging` | `auto` | How exchange writes reach a peer. `auto`: over the NVLink fabric where it reaches the peer (`sirius_exchange_mnnvl`), else over TCP lanes to ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without peer access. `never`: the fabric where it reaches the peer, else NIXL to every peer, other hosts included. `always`: the mirror for every same-host peer and TCP lanes to other hosts, also where the fabric reaches. `remote`: TCP lanes to every peer (tests). Same on every rank; set it before `sirius_exchange_rank`, which connects. |
+| `sirius_exchange_mnnvl` | `auto` | `auto`, `require` or `off` put the exchange's rings in fabric memory, so that GPUs on other nodes of the NVLink domain write them over NVLink. `auto` falls back to `cudaMalloc` with a warning; `require` fails instead. Same on every rank. |
+| `sirius_exchange_frame_bytes` | 16777216 | The exchange's frame size; a positive multiple of 256 up to 1 GiB. One write covers up to half a peer's receive frames, or one frame over TCP lanes. Same on every rank. |
+| `sirius_exchange_send_frames` | 32 | Send frames, shared by all peers; they bound the bytes in flight. Same on every rank. |
+| `sirius_exchange_recv_frames_per_peer` | 16 | Receive frames (credits) each peer may fill; ring memory grows with this times the peers. A TCP lane carries one frame, so fewer frames than lanes leave lanes idle. Same on every rank. |
+| `sirius_exchange_tcp_lanes` | 0 | TCP lanes per rank to ranks on other hosts (at most 64). 0 shares 16 among the ranks on this host, at least 2 each. Set it before `sirius_exchange_rank`. |
+| `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the [gateway](distributed-gateway.md) on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
 
 ### Pinned Tables
 

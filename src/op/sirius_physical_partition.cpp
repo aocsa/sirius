@@ -146,7 +146,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto record_actual_bytes = [&] {
     // Only successful executions contribute to the final projection-error report. In particular,
     // an OOM-rescheduled task must not count the same input once for every attempt.
-    if (_enable_size_estimation && input_batch_ro.get_data()) {
+    if (input_batch_ro.get_data()) {
       _actual_bytes.fetch_add(input_batch_ro.get_data()->get_size_in_bytes(),
                               std::memory_order_relaxed);
     }
@@ -428,6 +428,19 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
       }
     }
     if (auto readiness = _exchange->hint()) { return readiness; }
+    // The layout was sized from the deferred scan while this input was still arriving: its
+    // barrier no longer holds it, and each batch is partitioned when it arrives.
+    if (_exchange->scan_holds() && _exchange->is_sizing_input(*this) && ports.size() == 1) {
+      auto const* input = ports.begin()->second;
+      if (input->repo && input->repo->total_size() > 0) {
+        return task_creation_hint{TaskCreationHint::READY, this};
+      }
+      if (input->src_pipeline && !input->src_pipeline->is_pipeline_finished()) {
+        auto* producer = &(input->src_pipeline->get_operators()[0].get());
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      }
+      return std::nullopt;
+    }
   } else {
     auto const fixed = layout();
     if (!fixed) {
@@ -456,12 +469,22 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
 void sirius_physical_partition::on_input_batch_pushed(std::string_view port,
                                                       cucascade::data_batch& batch)
 {
+  if (_count_received) {
+    if (auto arrived = batch.try_to_read_only(); arrived && arrived->get_data()) {
+      _received_bytes.fetch_add(arrived->get_data()->get_uncompressed_data_size_in_bytes(),
+                                std::memory_order_relaxed);
+    }
+  }
   if (_input_observer) { _input_observer->on_arrival(port, batch); }
 }
 
 void sirius_physical_partition::on_finalize_operator()
 {
   if (_input_observer) { _input_observer->finalize_input(); }
+  SIRIUS_LOG_DEBUG("sirius_physical_partition id {} input total: {} bytes, partitions {}",
+                   this->get_operator_id(),
+                   _actual_bytes.load(std::memory_order_relaxed),
+                   layout() ? layout()->placement->num_partitions() : 0);
   if (!_enable_size_estimation) { return; }
   std::lock_guard<std::mutex> guard(lock);
   auto const actual = _actual_bytes.load(std::memory_order_relaxed);

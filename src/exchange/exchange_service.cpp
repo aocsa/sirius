@@ -16,11 +16,14 @@
 
 #include "exchange/exchange_service.hpp"
 
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 
+#include <algorithm>
 #include <exception>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,6 +42,11 @@ std::string what_of(std::exception_ptr const& error)
   }
 }
 
+std::uint64_t bytes_of(cucascade::data_batch& batch)
+{
+  return batch.to_read_only().get_data()->get_size_in_bytes();
+}
+
 }  // namespace
 
 exchange_service::exchange_service(fabric& fabric,
@@ -52,6 +60,13 @@ exchange_service::exchange_service(fabric& fabric,
                                  rank_t from,
                                  std::uint64_t batch,
                                  std::shared_ptr<cucascade::data_batch> data) {
+                            if (from != _rank && data) {
+                              auto const bytes = bytes_of(*data);
+                              std::lock_guard lock{_mutex};
+                              auto& t = _traffic[query_of(stream)];
+                              t.received_bytes += bytes;
+                              ++t.received_batches;
+                            }
                             if (auto r = receiver_of(stream, {from, batch, data})) {
                               r->on_batch(from, batch, std::move(data));
                             }
@@ -134,16 +149,13 @@ void exchange_service::abort(distributed_query_id query, std::string const& what
 
 bool exchange_service::wait_sent(distributed_query_id query, std::chrono::milliseconds timeout)
 {
-  {
-    std::lock_guard lock{_mutex};
-    if (!_transport) { return true; }
-  }
-  return _transport->wait_sent(query, timeout);
+  auto const running = running_transport();
+  return !running || running->wait_sent(query, timeout);
 }
 
 void exchange_service::shutdown()
 {
-  std::unique_ptr<transport> stopped;
+  std::shared_ptr<transport> stopped;
   {
     std::lock_guard lock{_mutex};
     if (!_error) {
@@ -155,8 +167,9 @@ void exchange_service::shutdown()
     _held.clear();
     _receivers.clear();
   }
-  // Outside the lock: the engine thread calls back into this service until it is joined.
-  stopped.reset();
+  // Outside the lock: the engine thread calls back into this service until it is joined. A
+  // sender still inside the transport wakes, and holds it until it returns.
+  if (stopped) { stopped->stop(); }
 }
 
 void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receiver)
@@ -195,16 +208,24 @@ void exchange_service::send(stream_id stream,
                             rank_t to,
                             std::shared_ptr<cucascade::data_batch> batch)
 {
+  auto const bytes = to != _rank && batch ? bytes_of(*batch) : 0;
+  std::shared_ptr<transport> running;
   {
     std::lock_guard lock{_mutex};
+    if (bytes > 0) {
+      auto& t = _traffic[query_of(stream)];
+      t.sent_bytes += bytes;
+      ++t.sent_batches;
+    }
     if (_error) { std::rethrow_exception(_error); }
     // A peer failed this query: stop producing for it. close() still goes through, since sinks
     // and all-gathers close their streams on the way out.
     if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
       std::rethrow_exception(it->second);
     }
+    running = _transport;
   }
-  _transport->send(stream, to, std::move(batch));
+  running->send(stream, to, std::move(batch));
   // An abort that arrived meanwhile may have woken this sender without queueing its batch: it
   // fails like one that started after the abort.
   std::lock_guard lock{_mutex};
@@ -217,7 +238,13 @@ void exchange_service::send(stream_id stream,
 void exchange_service::close(stream_id stream, rank_t to)
 {
   throw_if_failed();
-  _transport->close(stream, to);
+  if (auto const running = running_transport()) { running->close(stream, to); }
+}
+
+std::shared_ptr<transport> exchange_service::running_transport()
+{
+  std::lock_guard lock{_mutex};
+  return _transport;
 }
 
 void exchange_service::throw_if_failed()
@@ -238,21 +265,59 @@ void exchange_service::detach(stream_id stream)
 bool exchange_service::retired(distributed_query_id query) const
 {
   // Queries are numbered from 1; streams of query 0 belong to no query and never retire.
-  return query != 0 && (query <= _retired || _retired_above.contains(query));
+  if (query == 0) { return false; }
+  if (query <= _retired) { return true; }
+  auto const after = _retired_above.upper_bound(query);
+  return after != _retired_above.begin() && query <= std::prev(after)->second;
 }
 
-void exchange_service::forget(distributed_query_id query)
+void exchange_service::forget(distributed_query_id query) { forget_range(query, query); }
+
+void exchange_service::forget_range(distributed_query_id first, distributed_query_id last)
 {
+  first = std::max<distributed_query_id>(first, 1);
+  if (first > last) { return; }
   std::lock_guard lock{_mutex};
-  if (retired(query)) { return; }
-  _retired_above.insert(query);
-  while (_retired_above.erase(_retired + 1) > 0) {
-    ++_retired;
+  // Merge [first, last] with the ranges it overlaps or touches, then advance the watermark.
+  // Numbers stay below distributed_query_limit, so hi + 1 cannot wrap.
+  auto lo = first;
+  auto hi = last;
+  auto it = _retired_above.upper_bound(lo);
+  if (it != _retired_above.begin()) {
+    if (auto const before = std::prev(it); before->second + 1 >= lo) {
+      lo = before->first;
+      hi = std::max(hi, before->second);
+      it = _retired_above.erase(before);
+    }
   }
-  std::erase_if(_detached, [query](stream_id stream) { return query_of(stream) == query; });
-  std::erase_if(_held, [query](auto const& h) { return query_of(h.first) == query; });
-  _aborted.erase(query);
-  if (_transport) { _transport->forget(query); }
+  while (it != _retired_above.end() && it->first <= hi + 1) {
+    hi = std::max(hi, it->second);
+    it = _retired_above.erase(it);
+  }
+  if (lo <= _retired + 1) {
+    _retired = std::max(_retired, hi);
+  } else {
+    _retired_above.emplace(lo, hi);
+  }
+  auto const in_range = [first, last](distributed_query_id query) {
+    return query >= first && query <= last;
+  };
+  std::erase_if(_detached, [&](stream_id stream) { return in_range(query_of(stream)); });
+  std::erase_if(_held, [&](auto const& h) { return in_range(query_of(h.first)); });
+  _aborted.erase(_aborted.lower_bound(first), _aborted.upper_bound(last));
+  for (auto t = _traffic.lower_bound(first); t != _traffic.end() && t->first <= last;) {
+    SIRIUS_LOG_INFO(
+      "exchange: query {} on rank {}: sent {:.3f} GB in {} batches, received {:.3f} GB in {} "
+      "batches",
+      t->first,
+      _rank,
+      static_cast<double>(t->second.sent_bytes) / 1e9,
+      t->second.sent_batches,
+      static_cast<double>(t->second.received_bytes) / 1e9,
+      t->second.received_batches);
+    t = _traffic.erase(t);
+  }
+  if (_transport) { _transport->forget(first, last); }
 }
 
 }  // namespace sirius::exchange

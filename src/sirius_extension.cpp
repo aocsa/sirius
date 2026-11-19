@@ -19,6 +19,7 @@
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "exchange/exchange_runtime.hpp"
+#include "exchange/rank_control.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -2546,6 +2547,9 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo set_session_label_info(set_session_label);
   catalog.CreateTableFunction(transaction, set_session_label_info);
 
+  // Lets a distributed gateway restart this rank to join a new set of peers.
+  sirius::exchange::register_rank_control_functions(instance);
+
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
     "profiler_start", {}, ProfilerStartFunction, ProfilerBind, ProfilerInit);
@@ -2770,6 +2774,59 @@ static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value
     sirius::exchange::parse_host_staging(StringValue::Get(parameter));
 }
 
+static void SetExchangeMnnvl(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto value = StringValue::Get(parameter);
+  static_cast<void>(sirius::exchange::parse_mnnvl(value));
+  get_operator_params(context, scope)->exchange_mnnvl = std::move(value);
+}
+
+static void SetExchangeFrameBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0 || bytes % 256 != 0 || bytes > sirius::exchange::max_frame_bytes) {
+    throw InvalidInputException(
+      "sirius_exchange_frame_bytes must be a positive multiple of 256 up to %llu, not %llu",
+      static_cast<unsigned long long>(sirius::exchange::max_frame_bytes),
+      bytes);
+  }
+  get_operator_params(context, scope)->exchange_frame_bytes = bytes;
+}
+
+/// Parses a frame count setting @p name: 1 to max_ring_frames.
+static uint32_t ring_frames(char const* name, Value& parameter)
+{
+  auto const frames = UBigIntValue::Get(parameter);
+  if (frames == 0 || frames > sirius::exchange::max_ring_frames) {
+    throw InvalidInputException(
+      "%s must be 1 to %u, not %llu", name, sirius::exchange::max_ring_frames, frames);
+  }
+  return static_cast<uint32_t>(frames);
+}
+
+static void SetExchangeSendFrames(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->exchange_send_frames =
+    ring_frames("sirius_exchange_send_frames", parameter);
+}
+
+static void SetExchangeTcpLanes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const lanes = UBigIntValue::Get(parameter);
+  if (lanes > sirius::exchange::max_tcp_lanes) {
+    throw InvalidInputException("sirius_exchange_tcp_lanes must be 0 (automatic) to %u, not %llu",
+                                sirius::exchange::max_tcp_lanes,
+                                lanes);
+  }
+  get_operator_params(context, scope)->exchange_tcp_lanes = static_cast<uint32_t>(lanes);
+}
+
+static void SetExchangeRecvFramesPerPeer(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->exchange_recv_frames_per_peer =
+    ring_frames("sirius_exchange_recv_frames_per_peer", parameter);
+}
+
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const rank = UBigIntValue::Get(parameter);
@@ -2788,6 +2845,11 @@ static void SetExchangeRank(ClientContext& context, SetScope scope, Value& param
     }
   }
   params->exchange_rank = next.exchange_rank;
+}
+
+static void SetDistributedQueryId(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->distributed_query_id = UBigIntValue::Get(parameter);
 }
 
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -3048,6 +3110,40 @@ static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope,
   params->enable_exists_minmax_rewrite = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_EXISTS_MINMAX_REWRITE to {}",
                    params->enable_exists_minmax_rewrite);
+}
+
+static void SetEnableNarrowingExpressionPushdown(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto* params                                 = get_operator_params(context, scope);
+  params->enable_narrowing_expression_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_NARROWING_EXPRESSION_PUSHDOWN to {}",
+                   params->enable_narrowing_expression_pushdown);
+}
+
+static void SetEnableLateDimensionJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->enable_late_dimension_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_LATE_DIMENSION_JOIN to {}",
+                   params->enable_late_dimension_join);
+}
+
+static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_complete_group_having = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_COMPLETE_GROUP_HAVING to {}",
+                   params->enable_complete_group_having);
+}
+
+static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->enable_scan_reuse_rewrites = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_SCAN_REUSE_REWRITES to {}",
+                   params->enable_scan_reuse_rewrites);
 }
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -3671,6 +3767,34 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     SetEnableExistsMinmaxRewrite);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "enable_narrowing_expression_pushdown",
+                    "runtime override for computing narrowing expressions below inner joins",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_narrowing_expression_pushdown),
+                    SetEnableNarrowingExpressionPushdown);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_late_dimension_join",
+                    "runtime override for joining lookup tables after the aggregation",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_late_dimension_join),
+                    SetEnableLateDimensionJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_complete_group_having",
+                    "distributed: drop partial groups proven whole that fail the HAVING",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_complete_group_having),
+                    SetEnableCompleteGroupHaving);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_scan_reuse_rewrites",
+                    "rewrite plans that read the same rows twice so they read them once",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_scan_reuse_rewrites),
+                    SetEnableScanReuseRewrites);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "dense_count_join_max_bytes",
                     "internal test hook for the dense count-join histogram budget",
                     LogicalType::UBIGINT,
@@ -3772,12 +3896,59 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetExchangeRank);
   config.AddExtensionOption(
     "sirius_exchange_host_staging",
-    "Distributed execution: auto, always or never send the exchange's writes to a peer through "
-    "its pinned host mirror instead of NIXL; auto does so where GPUs lack peer access. Set "
-    "before sirius_exchange_rank, which connects",
+    "Distributed execution: how the exchange's writes reach a peer. auto: over TCP lanes to "
+    "ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without "
+    "peer access; always: the mirror for every same-host peer; never: NIXL to every peer; "
+    "remote: TCP lanes to every peer. Same on every rank; set before sirius_exchange_rank, "
+    "which connects",
     LogicalType::VARCHAR,
     Value("auto"),
     SetExchangeHostStaging);
+  config.AddExtensionOption(
+    "sirius_exchange_mnnvl",
+    "Distributed execution: auto, require or off put the exchange's rings in fabric memory, so "
+    "that GPUs on other nodes of the NVLink domain write them over NVLink. auto falls back to "
+    "cudaMalloc with a warning; require fails instead. Same on every rank; set before "
+    "sirius_exchange_rank",
+    LogicalType::VARCHAR,
+    Value("auto"),
+    SetExchangeMnnvl);
+  config.AddExtensionOption(
+    "sirius_exchange_frame_bytes",
+    "Distributed execution: the exchange's frame size in bytes; one write covers up to half a "
+    "peer's receive frames (one frame over TCP lanes). Same on every rank; set before "
+    "sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(16ull << 20),
+    SetExchangeFrameBytes);
+  config.AddExtensionOption(
+    "sirius_exchange_send_frames",
+    "Distributed execution: send frames, shared by all peers; they bound the bytes in flight. "
+    "Same on every rank; set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(32),
+    SetExchangeSendFrames);
+  config.AddExtensionOption(
+    "sirius_exchange_tcp_lanes",
+    "Distributed execution: TCP lanes (connections, each with its own thread) per rank to ranks "
+    "on other hosts; 0 shares 16 among the ranks on this host. Set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(0),
+    SetExchangeTcpLanes);
+  config.AddExtensionOption(
+    "sirius_exchange_recv_frames_per_peer",
+    "Distributed execution: receive frames (credits) each peer may fill; GPU memory grows with "
+    "it times the peers, and a TCP lane carries one. Same on every rank; set before "
+    "sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(16),
+    SetExchangeRecvFramesPerPeer);
+  config.AddExtensionOption("sirius_distributed_query_id",
+                            "Distributed execution: number of the next distributed query, set by "
+                            "a gateway; must increase. 0 numbers queries per process",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0),
+                            SetDistributedQueryId);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

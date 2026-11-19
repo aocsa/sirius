@@ -23,7 +23,10 @@
 #include "planner/sirius_plan_delim_aggregate_reuse.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/join_dimension_after_aggregate.hpp"
+#include "transparent/narrow_outer_join_counts.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
+#include "transparent/push_narrowing_expressions.hpp"
 
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -70,31 +73,13 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
 /// The option as `query_operator_options` resolves it, without creating the session's overrides:
 /// those snapshot the global configuration, which would stop the session from seeing later
 /// changes to it.
-bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
+bool operator_option_enabled(duckdb::ClientContext& context, bool sirius::operator_params::* option)
 {
   auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_delim_aggregate_reuse;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_delim_aggregate_reuse;
-  }
+  if (state && state->execution_options) { return (*state->execution_options).*option; }
+  if (state && state->operator_overrides) { return (*state->operator_overrides).*option; }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
-}
-
-/// The option as `query_operator_options` resolves it, without creating the session's overrides.
-bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
-{
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_exists_minmax_rewrite;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_exists_minmax_rewrite;
-  }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+  return runtime && runtime->get_config().get_operator_params().*option;
 }
 
 /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
@@ -102,15 +87,7 @@ bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
 std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
 {
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!runtime) { return 0; }
-  std::uint64_t budget = 0;
-  for (auto const& space : runtime->get_config().get_memory_space_configs()) {
-    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
-    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
-    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
-    budget                        = budget == 0 ? threshold : std::min(budget, threshold);
-  }
-  return budget;
+  return runtime ? runtime->get_config().smallest_gpu_downgrade_threshold() : 0;
 }
 
 using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
@@ -392,7 +369,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
       sirius::op::scan::capture_bound_read_views(*captured, context));
     auto copy = copy_logical_plan(*captured, context);
     // Runs before the EXISTS rewrite, whose recorded count a failure here would otherwise discard.
-    if (delim_aggregate_reuse_enabled(context)) {
+    if (operator_option_enabled(context, &sirius::operator_params::enable_delim_aggregate_reuse)) {
       try {
         sirius::planner::reuse_delim_rows_for_subquery_aggregates(
           context, input.optimizer.binder, copy);
@@ -403,7 +380,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
         copy = copy_logical_plan(*captured, context);
       }
     }
-    if (exists_minmax_rewrite_enabled(context)) {
+    if (operator_option_enabled(context, &sirius::operator_params::enable_exists_minmax_rewrite)) {
       try {
         ctx->record_exists_minmax_rewrites(sirius::planner::rewrite_correlated_inequality_exists(
           context, input.optimizer.binder, copy, gpu_memory_budget(context)));
@@ -412,6 +389,18 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
           "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",
           sirius::sanitized_message(e));
         copy = copy_logical_plan(*captured, context);
+      }
+    }
+    narrow_outer_join_counts(*copy, input.optimizer.binder);
+    if (operator_option_enabled(context,
+                                &sirius::operator_params::enable_narrowing_expression_pushdown)) {
+      push_narrowing_expressions(*copy, input.optimizer.binder);
+    }
+    if (operator_option_enabled(context, &sirius::operator_params::enable_late_dimension_join)) {
+      // Lookup columns that fit in one GPU do not make a join spill. With the GPU memory
+      // unknown, nothing moves.
+      if (auto const budget = gpu_memory_budget(context); budget > 0) {
+        join_dimensions_after_aggregate(context, copy, input.optimizer.binder, budget);
       }
     }
     conn_state->set_captured_plan(std::move(copy));

@@ -263,8 +263,26 @@ struct operator_params {
   std::vector<std::string> exchange_peers;
   /// This process's rank among exchange_peers.
   uint32_t exchange_rank = 0;
-  /// Distributed execution: whether the exchange host-stages its writes to peers.
+  /// Distributed execution: "auto", "always", "never" or "remote" host-stage the exchange's writes
+  /// to peers (sirius::exchange::host_staging).
   exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
+  /// Distributed execution: "auto", "require" or "off" put the exchange's rings in fabric memory,
+  /// so that GPUs on other nodes of the NVLink domain write them over NVLink.
+  std::string exchange_mnnvl = "auto";
+  /// Distributed execution: the exchange's frame size; a positive multiple of 256.
+  uint64_t exchange_frame_bytes = 16ull << 20;
+  /// Distributed execution: send frames, shared by all peers.
+  uint32_t exchange_send_frames = 32;
+  /// Distributed execution: receive frames (credits) each peer may fill; over TCP lanes, one per
+  /// lane in flight.
+  uint32_t exchange_recv_frames_per_peer = 16;
+  /// Distributed execution: TCP lanes per rank to ranks on other hosts; 0 shares 16 among the
+  /// ranks on this host.
+  uint32_t exchange_tcp_lanes = 0;
+
+  /// Nonzero: the number of the next distributed query, set by a gateway that numbers every
+  /// rank's queries. Must increase; zero numbers queries per process.
+  uint64_t distributed_query_id = 0;
 
   /// More than one rank: plans are split across processes and exchange rows.
   [[nodiscard]] bool distributed() const noexcept { return exchange_peers.size() > 1; }
@@ -339,10 +357,31 @@ struct operator_params {
   /// same. See `reuse_delim_rows_for_subquery_aggregates`.
   bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
 
+  /// Size RIGHT hash joins from their build side so a build that fits runs BUILD_PROBE, streaming
+  /// the probe instead of folding each probe partition whole.
+  bool stream_right_joins = true;
+
   /// Rewrite sibling correlated `[NOT] EXISTS (... t.k = outer.k AND t.x <> outer.x)` over the
   /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
   /// `rewrite_correlated_inequality_exists`.
   bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
+
+  /// Compute a projection's expression below the inner join under it when that narrows the rows.
+  /// See `push_narrowing_expressions`.
+  bool enable_narrowing_expression_pushdown = true;
+
+  /// Join a lookup table whose columns are only GROUP BY keys after the aggregation. See
+  /// `join_dimensions_after_aggregate`.
+  bool enable_late_dimension_join = true;
+
+  /// Distributed execution: apply a HAVING above a grouped aggregate's merge to the partial
+  /// groups that the Parquet footers prove already whole (see op::complete_group_having).
+  bool enable_complete_group_having = true;
+
+  /// Rewrite plans that read the same rows twice so they read them once
+  /// (planner/scan_reuse_rewrites.hpp): TPC-H Q18's IN-subquery aggregate, Q17's and Q2's
+  /// correlated aggregate over the outer query's own rows, Q11's repeated join.
+  bool enable_scan_reuse_rewrites = true;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
@@ -515,6 +554,10 @@ struct sirius_config {
 
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
+
+  /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving
+  /// data off it. 0 when no GPU capacity is configured.
+  [[nodiscard]] std::uint64_t smallest_gpu_downgrade_threshold() const;
 
   [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 

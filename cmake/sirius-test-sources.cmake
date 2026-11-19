@@ -61,6 +61,7 @@ set(TEST_SOURCES
     test/cpp/exchange/test_exchange_distribute_plan.cpp
     test/cpp/exchange/test_exchange_nixl.cpp
     test/cpp/exchange/test_exchange_operators.cpp
+    test/cpp/exchange/test_exchange_path.cpp
     test/cpp/exchange/test_exchange_plan_reuse.cpp
     test/cpp/exchange/test_exchange_query_windows.cpp
     test/cpp/exchange/test_exchange_transport.cpp
@@ -122,6 +123,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_cte.cpp
     test/cpp/integration/test_gpu_execution_decimal_avg.cpp
+    test/cpp/integration/test_gpu_execution_scan_reuse.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
@@ -205,6 +207,7 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/cuda/test_device_copy_batch.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_gds_ioctx.cpp
     test/cpp/io/test_path_utils.cpp
     test/cpp/io/rest/test_rest_datasource_integration.cpp
     test/cpp/log/test_cucascade_bridge.cpp
@@ -309,6 +312,10 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
+    test/cpp/planner/test_build_side_choice.cpp
+    test/cpp/planner/test_join_dimension_after_aggregate.cpp
+    test/cpp/planner/test_push_narrowing_expressions.cpp
+    test/cpp/planner/test_scan_reuse_rewrites.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_scan_column_origin.cpp
