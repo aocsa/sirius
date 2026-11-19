@@ -408,8 +408,7 @@ void gds_ioctx::shutdown() noexcept
     _held_report->cv.notify_all();
     // Its last lines are logged before the caller can tear the logger down; a second is
     // all it gets, since one of its log calls may be stuck.
-    _held_report->cv.wait_for(
-      lock, std::chrono::seconds(1), [this] { return _held_report->done; });
+    _held_report->cv.wait_for(lock, std::chrono::seconds(1), [this] { return _held_report->done; });
   }
 }
 
@@ -846,10 +845,9 @@ void gds_ioctx::watchdog_loop()
         } catch (...) {  // The default handler below still ends it when the log answers.
         }
       }
-      SIRIUS_LOG_ERROR(
-        "[gds] a read has been in flight for {} s (limit {} s); ending the process.",
-        (now - oldest) / 1'000'000'000,
-        _config.read_timeout.count());
+      SIRIUS_LOG_ERROR("[gds] a read has been in flight for {} s (limit {} s); ending the process.",
+                       (now - oldest) / 1'000'000'000,
+                       _config.read_timeout.count());
       // A request cannot be settled, and so cannot release its object, without
       // this mutex: the objects named below stay alive while it is held.
       std::lock_guard live_lock{_live_mutex};
