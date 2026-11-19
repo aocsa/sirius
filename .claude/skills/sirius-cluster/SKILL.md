@@ -67,7 +67,30 @@ names machines that are in no cluster.
 4. `CLUSTER=<name> cluster.sh nodes` to confirm every node answers.
 
 `CLUSTER=<name>` picks the cluster for every other command; it may be left out
-while only one is set up. Removing a cluster is deleting its files in
+while only one is set up.
+
+### Cloud instances (launched by `aws-ec2`)
+
+Instances have no alias in `~/.ssh/config`, and their addresses change with every
+launch. Write the aliases to a file of their own, outside `~/.ssh`, and export
+`SSH_CONFIG=<that file>` before every `cluster.sh` command: `hosts` lists it and
+every `ssh` and `scp` reads it. One `Host <name>` block per instance with its
+public address as `HostName`, and `User`, `IdentityFile` (the launch key),
+`IdentitiesOnly yes`, `StrictHostKeyChecking accept-new` and
+`UserKnownHostsFile /dev/null` for all of them. Then:
+
+- `init` records the private address of each instance, which is the one the
+  instances reach each other by. After `init`, set `ZENO_WORK` in
+  `clusters/<name>.env` to a folder on the instance store
+  (`/opt/dlami/nvme/work` on the Deep Learning AMI): the default is under
+  `$HOME`, on the root volume.
+- An instance the user launched for this work is theirs alone and is thrown
+  away, so with their yes you may install Pixi on it and give the first instance
+  `ssh` to the others (a key made on the first instance, added to the others'
+  `authorized_keys`). Never copy a key from this machine to an instance.
+- Launching, the security group and terminating stay with `aws-ec2`: copy the
+  run folders off first, and end with its `status`, not only `cluster.sh status`.
+  `references/gotchas.md` has what was seen on AWS. Removing a cluster is deleting its files in
 `clusters/` (ask first).
 
 ## The rule that matters most: leave the nodes as you found them
