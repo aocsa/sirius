@@ -20,6 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/stage_choice.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
@@ -41,22 +42,47 @@
 
 namespace sirius::op {
 
-bloom_all_gather_merge::bloom_all_gather_merge(std::shared_ptr<exchange::exchange_service> service,
-                                               exchange::stream_id first_stream,
-                                               std::size_t key_count,
-                                               cucascade::memory::memory_space& gpu,
-                                               std::chrono::milliseconds timeout)
+bloom_all_gather_merge::bloom_all_gather_merge(
+  std::shared_ptr<exchange::exchange_service> service,
+  exchange::stream_id first_stream,
+  std::size_t key_count,
+  cucascade::memory::memory_space& gpu,
+  std::chrono::milliseconds timeout,
+  std::optional<exchange::rank_t> only_from,
+  std::shared_ptr<exchange::broadcast_choice> whole_build)
   : _service(std::move(service)),
     _first_stream(first_stream),
     _key_count(key_count),
     _gpu(&gpu),
-    _timeout(timeout)
+    _timeout(timeout),
+    _only_from(only_from),
+    _whole_build(std::move(whole_build))
 {
 }
 
 void bloom_all_gather_merge::merge(std::span<std::shared_ptr<sirius_dynamic_filter>> membership,
                                    ::cuda::stream_ref stream)
 {
+  if (_whole_build) {
+    // The build's stream has ended on this rank, so its choice is known here.
+    bool whole = false;
+    try {
+      whole = _whole_build->wait();
+    } catch (std::exception const& e) {
+      // A failed choice has aborted the query. As after a failed merge, nothing is published.
+      SIRIUS_LOG_WARN("[publish_dynamic_filters] the build's choice failed: {}", e.what());
+      for (auto& filter : membership) {
+        filter.reset();
+      }
+      leave_merges(0, membership.size());
+      return;
+    }
+    // Whole on every rank: this rank's filters hold every key, and every rank leaves.
+    if (whole) {
+      leave_merges(0, membership.size());
+      return;
+    }
+  }
   // A rank's contribution: rep | family | scale | storage bytes | the Bloom's words, as UINT32.
   constexpr std::size_t header = 4;
   auto const mr                = _gpu->get_default_allocator();
@@ -75,12 +101,17 @@ void bloom_all_gather_merge::merge(std::span<std::shared_ptr<sirius_dynamic_filt
       auto* bloom = dynamic_cast<sirius_dynamic_bloom_filter*>(membership[k].get());
       std::array<std::uint32_t, header> head{};
       std::shared_ptr<cucascade::data_batch> mine;
+      // From one rank: only that rank's build has rows, so only it sends its filter.
+      bool const sends = !_only_from || *_only_from == _service->rank();
       if (bloom) {
         auto const bytes = bloom->storage_bytes();
         head             = {static_cast<std::uint32_t>(bloom->domain().rep),
                             static_cast<std::uint32_t>(bloom->domain().family),
                             static_cast<std::uint32_t>(bloom->domain().scale),
                             static_cast<std::uint32_t>(bytes)};
+      }
+      if (bloom && sends) {
+        auto const bytes = bloom->storage_bytes();
         auto column      = cudf::make_numeric_column(
           cudf::data_type{cudf::type_id::UINT32},
           static_cast<cudf::size_type>(header + bytes / sizeof(std::uint32_t)),
@@ -112,6 +143,47 @@ void bloom_all_gather_merge::merge(std::span<std::shared_ptr<sirius_dynamic_filt
         return;
       }
       if (!bloom) { continue; }
+      if (_only_from) {
+        // The sending rank's filter holds every key. Every other rank takes a copy of it, at its
+        // size: this rank's own filter is that of an empty build.
+        if (sends) { continue; }
+        auto const& from = all.at(*_only_from);
+        std::array<std::uint32_t, header> theirs{};
+        if (from) {
+          RMM_CUDA_TRY(
+            cudaMemcpyAsync(theirs.data(),
+                            sirius::get_cudf_table_view(*from).column(0).data<std::uint32_t>(),
+                            sizeof(theirs),
+                            cudaMemcpyDeviceToHost,
+                            stream.get()));
+          stream.sync();
+        }
+        if (!from || theirs[0] != head[0] || theirs[1] != head[1] || theirs[2] != head[2] ||
+            theirs[3] == 0) {
+          SIRIUS_LOG_DEBUG(
+            "[publish_dynamic_filters] key {}: rank {} sent no filter, or one of another kind; "
+            "nothing published for it.",
+            k,
+            *_only_from);
+          membership[k].reset();
+          continue;
+        }
+        try {
+          auto copy = bloom->empty_of(theirs[3], stream, mr);
+          copy->merge_from(
+            sirius::get_cudf_table_view(*from).column(0).data<std::uint32_t>() + header,
+            theirs[3],
+            stream);
+          // `all` must outlive the OR queued on `stream`.
+          stream.sync();
+          membership[k] = std::move(copy);
+        } catch (...) {
+          auto error = std::current_exception();
+          stream.sync();
+          std::rethrow_exception(error);
+        }
+        continue;
+      }
       // Each rank sized its Bloom from its own rows (scaled_bloom_keys), so the sizes may differ
       // by powers of two; every rank folds them all onto the smallest, the same on every rank
       // since every rank reads every header.

@@ -74,6 +74,18 @@ struct deferred_scan_policy {
   std::uint64_t min_bytes = 0;    ///< The smallest scan, over all ranks, that is deferred.
 };
 
+/// Which stages distribute_plan keeps on rank 0 instead of on every rank. Zero turns a rule off.
+struct stage_policy {
+  /// An ORDER BY of at most this many estimated rows is gathered to rank 0 and sorted there.
+  std::uint64_t gather_sort_rows = 0;
+  /// A hashed join whose two inputs are estimated at this many bytes or fewer in all runs on
+  /// rank 0 alone, and so does what is above it, until an operator spreads its rows again.
+  std::uint64_t stage_bytes = 0;
+  /// A hashed join's build side is counted as it runs: a build of at most this many bytes over
+  /// all ranks goes whole to every rank, and the probe rows stay where they are.
+  std::uint64_t broadcast_bytes = 0;
+};
+
 /**
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of
  * @p service, each over its own share of the scanned files.
@@ -95,6 +107,7 @@ struct deferred_scan_policy {
  * @param query This query's number, the same on every rank: its exchanges' stream ids.
  * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
  * @param footers Reads a Parquet file's footer; may be empty.
+ * @param stages Which stages run on rank 0 alone; by default none does.
  * @throws sirius::not_implemented_exception on an operator distributed execution does not
  *         support, rather than a wrong answer; this rank throws before the all-gather.
  * @throws sirius::invalid_input_exception when another rank planned a different shape, on every
@@ -106,7 +119,8 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle,
                      parquet_footer_reader footers = {},
-                     deferred_scan_policy deferred = {});
+                     deferred_scan_policy deferred = {},
+                     stage_policy stages           = {});
 
 /// Bytes `[start, start + length)` of file `file` (an index into the table's files).
 struct file_byte_range {
@@ -163,6 +177,22 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
 /// when its build CONCAT (`children[1]`) finalizes:
 /// a peer's merge waits on this rank's part, and that peer's probe may be what this rank's probe
 /// waits on, so the join's own finalize is too late.
+/**
+ * @brief Whether a hashed join's build, sent whole to every rank, moves fewer bytes between ranks
+ * than the exchanges it replaces.
+ *
+ * Whole, every rank sends its build rows to every other rank in place of one part in @p ranks of
+ * them. That saves the join's Bloom merge: @p merged_keys filters, sized for @p build_rows, from
+ * every rank to every other. It saves the probe's exchange as well, but by how much no rank knows
+ * when the build must go: the probe rows reach it filtered, and the planner's estimate of them
+ * has been 20 times too high and more. So the probe counts for nothing, and a join with no
+ * merged filter (@p merged_keys of 0) is never worth it.
+ */
+[[nodiscard]] bool whole_build_saves_bytes(std::uint64_t build_bytes,
+                                           std::uint64_t build_rows,
+                                           std::uint64_t ranks,
+                                           std::size_t merged_keys) noexcept;
+
 void install_filter_merge(op::sirius_physical_hash_join& join,
                           std::shared_ptr<op::cross_rank_filter_merge> merge,
                           std::size_t ranks);

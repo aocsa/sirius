@@ -11,5 +11,6 @@ target_sources(
           nixl_fabric.cpp
           path_choice.cpp
           rank_control.cpp
+          stage_choice.cpp
           transport.cpp
           wire.cpp)

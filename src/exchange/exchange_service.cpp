@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <format>
 #include <iterator>
 #include <string>
 #include <utility>
@@ -56,47 +57,46 @@ exchange_service::exchange_service(fabric& fabric,
                                    cucascade::memory::memory_space* host,
                                    transport::options opts)
 {
-  transport::callbacks cb{[this](stream_id stream,
-                                 rank_t from,
-                                 std::uint64_t batch,
-                                 std::shared_ptr<cucascade::data_batch> data) {
-                            if (from != _rank && data) {
-                              auto const bytes = bytes_of(*data);
-                              std::lock_guard lock{_mutex};
-                              auto& t = _traffic[query_of(stream)];
-                              t.received_bytes += bytes;
-                              ++t.received_batches;
-                            }
-                            if (auto r = receiver_of(stream, {from, batch, data})) {
-                              r->on_batch(from, batch, std::move(data));
-                            }
-                          },
-                          [this](stream_id stream, rank_t from) {
-                            if (auto r = receiver_of(stream, {from, 0, nullptr})) {
-                              r->on_end(from);
-                            }
-                          },
-                          [this](std::exception_ptr error) {
-                            std::map<stream_id, std::shared_ptr<inbound>> receivers;
-                            {
-                              std::lock_guard lock{_mutex};
-                              // Fail-stop: nothing reconnects, so later queries say how to recover.
-                              _error    = std::make_exception_ptr(sirius::internal_exception(
-                                "exchange: the transport to the other ranks failed ({}); restart "
-                                   "every rank to run distributed queries again",
-                                what_of(error)));
-                              receivers = _receivers;
-                            }
-                            for (auto& [stream, r] : receivers) {
-                              r->on_error(error);
-                            }
-                          },
-                          [this](distributed_query_id query, rank_t from, std::string what) {
-                            end_query(
-                              query,
-                              std::make_exception_ptr(sirius::internal_exception(
-                                "exchange: query {} failed on rank {}: {}", query, from, what)));
-                          }};
+  transport::callbacks cb{
+    [this](stream_id stream,
+           rank_t from,
+           std::uint64_t batch,
+           std::shared_ptr<cucascade::data_batch> data) {
+      if (from != _rank && data) {
+        auto const bytes = bytes_of(*data);
+        std::lock_guard lock{_mutex};
+        for (auto* t : {&_traffic[query_of(stream)], &_stream_traffic[stream].total}) {
+          t->received_bytes += bytes;
+          ++t->received_batches;
+        }
+      }
+      if (auto r = receiver_of(stream, {from, batch, data})) {
+        r->on_batch(from, batch, std::move(data));
+      }
+    },
+    [this](stream_id stream, rank_t from) {
+      if (auto r = receiver_of(stream, {from, 0, nullptr})) { r->on_end(from); }
+    },
+    [this](std::exception_ptr error) {
+      std::map<stream_id, std::shared_ptr<inbound>> receivers;
+      {
+        std::lock_guard lock{_mutex};
+        // Fail-stop: nothing reconnects, so later queries say how to recover.
+        _error    = std::make_exception_ptr(sirius::internal_exception(
+          "exchange: the transport to the other ranks failed ({}); restart "
+             "every rank to run distributed queries again",
+          what_of(error)));
+        receivers = _receivers;
+      }
+      for (auto& [stream, r] : receivers) {
+        r->on_error(error);
+      }
+    },
+    [this](distributed_query_id query, rank_t from, std::string what) {
+      end_query(query,
+                std::make_exception_ptr(sirius::internal_exception(
+                  "exchange: query {} failed on rank {}: {}", query, from, what)));
+    }};
   auto started = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
   _rank        = started->rank();
   _world_size  = started->world_size();
@@ -204,6 +204,12 @@ void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receive
   }
 }
 
+void exchange_service::describe(stream_id stream, std::string label)
+{
+  std::lock_guard lock{_mutex};
+  _stream_labels[stream] = std::move(label);
+}
+
 void exchange_service::send(stream_id stream,
                             rank_t to,
                             std::shared_ptr<cucascade::data_batch> batch)
@@ -213,9 +219,13 @@ void exchange_service::send(stream_id stream,
   {
     std::lock_guard lock{_mutex};
     if (bytes > 0) {
-      auto& t = _traffic[query_of(stream)];
-      t.sent_bytes += bytes;
-      ++t.sent_batches;
+      auto& of_stream = _stream_traffic[stream];
+      for (auto* t : {&_traffic[query_of(stream)], &of_stream.total}) {
+        t->sent_bytes += bytes;
+        ++t->sent_batches;
+      }
+      of_stream.sent_bytes_to.resize(_world_size);
+      of_stream.sent_bytes_to[to] += bytes;
     }
     if (_error) { std::rethrow_exception(_error); }
     // A peer failed this query: stop producing for it. close() still goes through, since sinks
@@ -305,6 +315,32 @@ void exchange_service::forget_range(distributed_query_id first, distributed_quer
   std::erase_if(_detached, [&](stream_id stream) { return in_range(query_of(stream)); });
   std::erase_if(_held, [&](auto const& h) { return in_range(query_of(h.first)); });
   _aborted.erase(_aborted.lower_bound(first), _aborted.upper_bound(last));
+  for (auto t = _stream_traffic.lower_bound(static_cast<stream_id>(first) << query_stream_bits);
+       t != _stream_traffic.end() && query_of(t->first) <= last;) {
+    auto const label = _stream_labels.find(t->first);
+    std::string peers;
+    for (rank_t to = 0; to < t->second.sent_bytes_to.size(); ++to) {
+      if (t->second.sent_bytes_to[to] == 0) { continue; }
+      peers += std::format("{}to rank {}: {:.3f} GB",
+                           peers.empty() ? "; " : ", ",
+                           to,
+                           static_cast<double>(t->second.sent_bytes_to[to]) / 1e9);
+    }
+    SIRIUS_LOG_INFO(
+      "exchange: query {} stream {} on rank {}: {}: sent {:.3f} GB in {} batches, received "
+      "{:.3f} GB in {} batches{}",
+      query_of(t->first),
+      t->first & ((stream_id{1} << query_stream_bits) - 1),
+      _rank,
+      label == _stream_labels.end() ? "unlabelled" : label->second,
+      static_cast<double>(t->second.total.sent_bytes) / 1e9,
+      t->second.total.sent_batches,
+      static_cast<double>(t->second.total.received_bytes) / 1e9,
+      t->second.total.received_batches,
+      peers);
+    t = _stream_traffic.erase(t);
+  }
+  std::erase_if(_stream_labels, [&](auto const& l) { return in_range(query_of(l.first)); });
   for (auto t = _traffic.lower_bound(first); t != _traffic.end() && t->first <= last;) {
     SIRIUS_LOG_INFO(
       "exchange: query {} on rank {}: sent {:.3f} GB in {} batches, received {:.3f} GB in {} "

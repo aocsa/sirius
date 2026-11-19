@@ -3055,6 +3055,29 @@ static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope,
                    params->enable_complete_group_having);
 }
 
+static void SetExchangeGatherSortRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                      = get_operator_params(context, scope);
+  params->exchange_gather_sort_rows = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EXCHANGE_GATHER_SORT_ROWS to {}",
+                   params->exchange_gather_sort_rows);
+}
+
+static void SetExchangeStageBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                 = get_operator_params(context, scope);
+  params->exchange_stage_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EXCHANGE_STAGE_BYTES to {}", params->exchange_stage_bytes);
+}
+
+static void SetExchangeBroadcastBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                     = get_operator_params(context, scope);
+  params->exchange_broadcast_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EXCHANGE_BROADCAST_BYTES to {}",
+                   params->exchange_broadcast_bytes);
+}
+
 static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                       = get_operator_params(context, scope);
@@ -3564,6 +3587,27 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_complete_group_having),
                     SetEnableCompleteGroupHaving);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "exchange_gather_sort_rows",
+                    "distributed: sort an ORDER BY of at most this many rows on rank 0; 0 = off",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.exchange_gather_sort_rows),
+                    SetExchangeGatherSortRows);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "exchange_stage_bytes",
+                    "distributed: run a hashed join of at most this many bytes on rank 0; 0 = off",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.exchange_stage_bytes),
+                    SetExchangeStageBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "exchange_broadcast_bytes",
+                    "distributed: send a join's build of at most this many bytes whole; 0 = off",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.exchange_broadcast_bytes),
+                    SetExchangeBroadcastBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_scan_reuse_rewrites",

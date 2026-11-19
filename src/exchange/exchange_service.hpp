@@ -79,6 +79,10 @@ class exchange_service {
   /// @throws the exchange's error once it has failed.
   void close(stream_id stream, rank_t to);
 
+  /// Names what @p stream carries (routing, keys) in the traffic line logged when its query
+  /// retires.
+  void describe(stream_id stream, std::string label);
+
   /// See transport::wait_sent. True once shut down: the transport freed what it held.
   [[nodiscard]] bool wait_sent(distributed_query_id query, std::chrono::milliseconds timeout);
 
@@ -138,6 +142,14 @@ class exchange_service {
     std::uint64_t received_batches{0};
   };
   std::map<distributed_query_id, traffic> _traffic;
+  /// The same for each stream, with the bytes sent to each rank, and what the planner said the
+  /// stream carries; logged with _traffic.
+  struct stream_traffic {
+    traffic total;
+    std::vector<std::uint64_t> sent_bytes_to;
+  };
+  std::map<stream_id, stream_traffic> _stream_traffic;
+  std::map<stream_id, std::string> _stream_labels;
   /// Every query from 1 to this one has retired here, and so has each range in _retired_above.
   distributed_query_id _retired{0};
   /// Disjoint, non-adjacent ranges above _retired + 1: first query to last query, both retired.

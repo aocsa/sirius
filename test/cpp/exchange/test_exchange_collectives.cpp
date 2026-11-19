@@ -23,6 +23,7 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
+#include "exchange/stage_choice.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
@@ -93,6 +94,12 @@ struct ranks {
     }
   }
 };
+
+/// The bytes of a stage count's answer.
+std::optional<std::uint64_t> bytes_of(std::optional<sirius::exchange::stage_load> const& sum)
+{
+  return sum ? std::optional<std::uint64_t>{sum->bytes} : std::nullopt;
+}
 
 /// Runs @p work(rank) on one thread per rank, all at once; rethrows the first failure.
 template <typename Work>
@@ -245,10 +252,17 @@ dynamic_filter_publish_plan filter_plan(
 std::shared_ptr<sirius::op::bloom_all_gather_merge> merge_over(
   std::shared_ptr<exchange_service> service,
   dynamic_filter_publish_plan const& plan,
-  std::chrono::milliseconds timeout = std::chrono::seconds{30})
+  std::chrono::milliseconds timeout                               = std::chrono::seconds{30},
+  std::optional<rank_t> only_from                                 = std::nullopt,
+  std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
 {
-  return std::make_shared<sirius::op::bloom_all_gather_merge>(
-    std::move(service), 41, plan.admitted_keys().size(), *env().gpu, timeout);
+  return std::make_shared<sirius::op::bloom_all_gather_merge>(std::move(service),
+                                                              41,
+                                                              plan.admitted_keys().size(),
+                                                              *env().gpu,
+                                                              timeout,
+                                                              only_from,
+                                                              std::move(whole_build));
 }
 
 /// Merges @p plan's filters across ranks. Each rank sizes its Bloom from its rows times the
@@ -257,10 +271,13 @@ void merge_across_ranks(dynamic_filter_publish_plan& plan,
                         std::shared_ptr<exchange_service> service,
                         std::size_t min_keys,
                         std::size_t max_keys              = std::size_t{1} << 30,
-                        std::chrono::milliseconds timeout = std::chrono::seconds{30})
+                        std::chrono::milliseconds timeout = std::chrono::seconds{30},
+                        std::optional<rank_t> only_from   = std::nullopt,
+                        std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
 {
-  auto const ranks = service->world_size();
-  auto merge       = merge_over(std::move(service), plan, timeout);
+  // A build that is whole on one rank holds all of its keys there.
+  auto const ranks = only_from ? rank_t{1} : service->world_size();
+  auto merge = merge_over(std::move(service), plan, timeout, only_from, std::move(whole_build));
   plan.set_cross_rank_merge(
     std::move(merge), sirius::op::merged_bloom_policy(plan.policy(), ranks, min_keys, max_keys));
 }
@@ -330,12 +347,21 @@ struct whole_build_join {
     std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   dynamic_filter_publish_plan plan;
 
-  explicit whole_build_join(std::shared_ptr<exchange_service> service,
-                            std::size_t min_keys = 4096,
-                            std::uint64_t cap    = 64 * KiB)
+  explicit whole_build_join(
+    std::shared_ptr<exchange_service> service,
+    std::size_t min_keys                                            = 4096,
+    std::uint64_t cap                                               = 64 * KiB,
+    std::optional<rank_t> only_from                                 = std::nullopt,
+    std::shared_ptr<sirius::exchange::broadcast_choice> whole_build = nullptr)
     : plan(filter_plan(channel, cap))
   {
-    merge_across_ranks(plan, std::move(service), min_keys);
+    merge_across_ranks(plan,
+                       std::move(service),
+                       min_keys,
+                       std::size_t{1} << 30,
+                       std::chrono::seconds{30},
+                       only_from,
+                       std::move(whole_build));
   }
 
   sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
@@ -562,6 +588,57 @@ TEST_CASE("whole-build ranks merge even when one build is empty and another's ta
   CHECK(published_bloom(*joins[1]->channel) == nullptr);
 }
 
+TEST_CASE("a merge from one rank gives every rank that rank's Bloom, at its size",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // The join runs on rank 0 alone: 20000 build keys there, empty builds on ranks 1 and 2.
+  ranks c(3);
+  std::vector<std::unique_ptr<whole_build_join>> joins;
+  for (rank_t r = 0; r < 3; ++r) {
+    joins.push_back(
+      std::make_unique<whole_build_join>(c.all[r].service, 4096, 64 * KiB, rank_t{0}));
+  }
+  auto const keys = sequence(0, 1, 20000);
+  on_every_rank(3, [&](rank_t r) {
+    auto const build = r == 0 ? keys_table(0, 1, 20000) : keys_table(0, 1, 0);
+    static_cast<void>(joins[r]->publish(build->view()));
+  });
+  auto const* whole = published_bloom(*joins[0]->channel);
+  REQUIRE(whole != nullptr);
+  // 20000 keys: 1250 blocks, rounded up to 2048 (64 KiB), not the 8 KiB of an empty build.
+  CHECK(whole->storage_bytes() == 64 * KiB);
+  for (rank_t r = 0; r < 3; ++r) {
+    auto const* bloom = published_bloom(*joins[r]->channel);
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == whole->storage_bytes());
+    CHECK(members(*bloom, keys) == keys.size());
+    CHECK(members(*bloom, sequence(1'000'000, 1, 6000)) < 100);
+  }
+}
+
+TEST_CASE("a rank whose build went whole to every rank publishes its own Bloom and gathers none",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(3);
+  // Every rank's build sinks held few bytes: the build went whole to every rank.
+  std::vector<std::shared_ptr<sirius::exchange::broadcast_choice>> whole(3);
+  std::vector<int> decided(3, 0);
+  on_every_rank(3, [&](rank_t r) {
+    whole[r] = std::make_shared<sirius::exchange::broadcast_choice>(
+      c.all[r].service, 25, std::uint64_t{1} << 30, *env().gpu, std::chrono::seconds{30});
+    decided[r] = whole[r]->decide({1000, 10}, utils::default_stream());
+  });
+  REQUIRE(decided == std::vector<int>(3, 1));
+  // Rank 0 alone publishes: an all-gather would wait out the other ranks and publish nothing.
+  whole_build_join join(c.all[0].service, 4096, 64 * KiB, std::nullopt, whole[0]);
+  auto const keys = sequence(0, 1, 20000);
+  static_cast<void>(join.publish(keys_table(0, 1, 20000)->view()));
+  auto const* bloom = published_bloom(*join.channel);
+  REQUIRE(bloom != nullptr);
+  CHECK(members(*bloom, keys) == keys.size());
+  CHECK(members(*bloom, sequence(1'000'000, 1, 6000)) < 100);
+}
+
 TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter merge",
           "[exchange][collectives][dynamic_filter]")
 {
@@ -765,6 +842,78 @@ TEST_CASE("a rank that leaves an all-gather does not wait, and the others go on 
     CHECK(got[r][2] == nullptr);
     CHECK(keys_of(*got[r][1]).front() == 1000);
   }
+}
+
+TEST_CASE("every rank gets the sum of the bytes and rows the ranks hold for a stage",
+          "[exchange][collectives]")
+{
+  ranks c(3);
+  std::vector<std::optional<std::uint64_t>> got(3);
+  std::vector<std::uint64_t> rows(3);
+  on_every_rank(3, [&](rank_t r) {
+    sirius::exchange::stage_count count{c.all[r].service, 21, *env().gpu};
+    got[r] = bytes_of(count.total({(r + 1) * 1000, r + 10}, utils::default_stream()));
+    CHECK(count.resolved());
+    rows[r] = count.wait().value_or(sirius::exchange::stage_load{}).rows;
+  });
+  for (rank_t r = 0; r < 3; ++r) {
+    CHECK(got[r] == std::optional<std::uint64_t>{6000});
+    CHECK(rows[r] == 33);
+  }
+}
+
+TEST_CASE("a rank over its share of a stage waits for no one, and no rank gets a sum",
+          "[exchange][collectives]")
+{
+  ranks c(3);
+  sirius::exchange::stage_count gone{c.all[2].service, 22, *env().gpu};
+  // Before the others start: it must not need them.
+  gone.over();
+  CHECK(gone.resolved());
+  CHECK_FALSE(gone.wait().has_value());
+  // Its input ends later: it has its answer, and no all-gather runs for it.
+  CHECK_FALSE(gone.total({5, 1}, utils::default_stream()).has_value());
+  std::vector<std::optional<std::uint64_t>> got(2, std::optional<std::uint64_t>{1});
+  on_every_rank(2, [&](rank_t r) {
+    sirius::exchange::stage_count count{c.all[r].service, 22, *env().gpu, std::chrono::seconds{30}};
+    got[r] = bytes_of(count.total({10, 1}, utils::default_stream()));
+  });
+  CHECK(got[0] == std::nullopt);
+  CHECK(got[1] == std::nullopt);
+}
+
+TEST_CASE("a stage count asked again answers as before, without a second all-gather",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  std::vector<std::optional<std::uint64_t>> again(2);
+  on_every_rank(2, [&](rank_t r) {
+    sirius::exchange::stage_count count{c.all[r].service, 23, *env().gpu, std::chrono::seconds{30}};
+    REQUIRE(bytes_of(count.total({7 + r, 0}, utils::default_stream())) ==
+            std::optional<std::uint64_t>{15});
+    // The peer is past its all-gather: another would wait out the timeout.
+    again[r] = bytes_of(count.total({100, 0}, utils::default_stream()));
+    count.over();
+    CHECK(bytes_of(count.wait()) == std::optional<std::uint64_t>{15});
+  });
+  CHECK(again[0] == std::optional<std::uint64_t>{15});
+  CHECK(again[1] == std::optional<std::uint64_t>{15});
+}
+
+TEST_CASE("a thread that waits for a stage count gets what the rank's other thread gathers",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  std::vector<std::optional<std::uint64_t>> waited(2);
+  on_every_rank(2, [&](rank_t r) {
+    sirius::exchange::stage_count count{c.all[r].service, 24, *env().gpu, std::chrono::seconds{30}};
+    std::thread reader{[&] { waited[r] = bytes_of(count.wait()); }};
+    auto const sum = bytes_of(count.total({40, 0}, utils::default_stream()));
+    reader.join();
+    CHECK(sum == std::optional<std::uint64_t>{80});
+  });
+  CHECK(waited[0] == std::optional<std::uint64_t>{80});
+  CHECK(waited[1] == std::optional<std::uint64_t>{80});
 }
 
 TEST_CASE("all-gather gives every rank every rank's table, in rank order",

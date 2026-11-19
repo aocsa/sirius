@@ -20,12 +20,14 @@
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/stage_choice.hpp"
 #include "exchange/wire.hpp"
 #include "expression/ast/utils.hpp"
 #include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
 #include "op/distributed/sample_all_gather_boundaries.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_plan.hpp"
@@ -88,7 +90,14 @@ enum class placement {
   spread,  ///< Across ranks, each rank holding some.
   ranged,  ///< Across ranks, rank i holding the i-th range of a sort order.
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
+  narrow,  ///< On rank 0; the other ranks run the same operators over no rows.
 };
+
+/// Whether a subtree's rows are on rank 0 alone.
+constexpr bool on_rank0(placement where) noexcept
+{
+  return where == placement::rank0 || where == placement::narrow;
+}
 
 /// A hash join whose estimated build has fewer rows publishes no merged Bloom filters.
 constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
@@ -220,6 +229,7 @@ struct rewriter {
   std::map<op::sirius_physical_operator const*, placement> cte_scans;
   parquet_footer_reader footers;
   deferred_scan_policy deferred;
+  stage_policy stages;
 
   exchange::stream_id stream() { return exchange::make_stream_id(query, next_stream++); }
 
@@ -544,6 +554,24 @@ struct rewriter {
     for (auto const key : spec.key_columns) {
       shape += std::to_string(key) + ",";
     }
+    if (spec.width != 0) { shape += "w" + std::to_string(spec.width); }
+    if (spec.build_choice) { shape += spec.counts_build ? "cb" : "cp"; }
+    {
+      static constexpr std::array<std::string_view, 4> modes{
+        "hash", "range", "broadcast", "gather"};
+      auto label = std::string{modes[static_cast<std::size_t>(spec.routing)]} + " keys=[";
+      for (auto const key : spec.key_columns) {
+        label += std::to_string(key) + ",";
+      }
+      label += "] casts=" + std::to_string(spec.key_cast_types.size()) +
+               (spec.width != 0 ? " width=" + std::to_string(spec.width) : std::string{}) +
+               (!spec.build_choice  ? ""
+                : spec.counts_build ? " choice=build"
+                                    : " choice=probe") +
+               " est_rows=" + std::to_string(rows) +
+               " below=" + op::SiriusPhysicalOperatorToString(child->type);
+      service->describe(id, std::move(label));
+    }
     auto sink = duckdb::make_uniq<op::sirius_physical_exchange_sink>(
       types, rows, service, id, std::move(spec));
     auto source = duckdb::make_uniq<op::sirius_physical_exchange_source>(
@@ -563,24 +591,52 @@ struct rewriter {
 
   /// A hash exchange on @p partition's keys, between it and its input. An input on rank 0 alone
   /// (a gathered aggregate) is spread from there; the other ranks' copies of it hold no rows.
+  /// With @p stay_narrow, an input on rank 0 alone (placement::narrow) is left there.
   placement hash_below(op::sirius_physical_operator& partition_node,
-                       bool null_keys_to_every_rank = false)
+                       bool null_keys_to_every_rank                             = false,
+                       bool stay_narrow                                         = false,
+                       std::shared_ptr<exchange::broadcast_choice> build_choice = nullptr,
+                       bool counts_build                                        = false)
   {
-    auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
-    visit(partition.children[0]);
+    auto& partition  = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
+    auto const where = visit(partition.children[0]);
+    if (stay_narrow && where == placement::narrow) { return placement::narrow; }
     exchange_spec spec;
     spec.key_columns             = partition.partition_keys();
     spec.key_cast_types          = partition.specification().key_cast_types;
     spec.null_keys_to_every_rank = null_keys_to_every_rank;
+    spec.build_choice            = std::move(build_choice);
+    spec.counts_build            = counts_build && spec.build_choice != nullptr;
     insert(partition.children[0], std::move(spec), false);
     return placement::spread;
   }
 
-  /// After hash exchanges a rank's build holds only its share of the keys: a filter from it
-  /// alone would drop rows other ranks' builds match, so every rank's Bloom is merged.
-  void merge_filters_across_ranks(op::sirius_physical_hash_join& join)
+  /// Brings @p partition_node's input to rank 0 alone, for a stage that runs there: a hash
+  /// exchange of width 1, so that every other rank's source still hands on its one empty batch
+  /// and the operators above run there over no rows. An input already narrow stays.
+  placement to_rank0_below(op::sirius_physical_operator& partition_node)
   {
-    if (!join.publishes_dynamic_filters()) { return; }
+    auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
+    if (visit(partition.children[0]) == placement::narrow) { return placement::narrow; }
+    exchange_spec spec;
+    spec.key_columns    = partition.partition_keys();
+    spec.key_cast_types = partition.specification().key_cast_types;
+    spec.width          = 1;
+    insert(partition.children[0], std::move(spec), false);
+    return placement::narrow;
+  }
+
+  /// After hash exchanges a rank's build holds only its share of the keys: a filter from it
+  /// alone would drop rows other ranks' builds match, so every rank's Bloom is merged. With
+  /// @p narrow the join runs on rank 0 alone: its build is whole there, and its Bloom goes from
+  /// there to every rank, whose scans it filters.
+  /// @return The keys whose filters are merged; 0 when the join's filters are not.
+  std::size_t merge_filters_across_ranks(
+    op::sirius_physical_hash_join& join,
+    bool narrow                                             = false,
+    std::shared_ptr<exchange::broadcast_choice> whole_build = nullptr)
+  {
+    if (!join.publishes_dynamic_filters()) { return 0; }
     auto const build_rows = join.children[1]->estimated_cardinality;
     // A right semi or anti join publishes before its probe side drains; a merge would make that
     // wait on every rank's build.
@@ -588,17 +644,30 @@ struct rewriter {
         join.join_type == duckdb::JoinType::RIGHT_ANTI) {
       join.cancel_dynamic_filter_publication();
       shape += "f";
-      return;
+      return 0;
     }
     // One stream per admitted key: key k merges on first + k. The keys are fixed while planning,
     // so every rank reserves the same streams.
     auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
-    install_filter_merge(join,
-                         std::make_shared<op::bloom_all_gather_merge>(
-                           service, first, join.dynamic_filter_plan().admitted_keys().size(), *gpu),
-                         service->world_size());
-    shape += "F";
+    for (std::size_t k = 0; k < join.dynamic_filter_plan().admitted_keys().size(); ++k) {
+      service->describe(
+        first + k, (narrow ? "bloom from rank 0 key=" : "bloom merge key=") + std::to_string(k));
+    }
+    install_filter_merge(
+      join,
+      std::make_shared<op::bloom_all_gather_merge>(
+        service,
+        first,
+        join.dynamic_filter_plan().admitted_keys().size(),
+        *gpu,
+        op::bloom_all_gather_merge::default_timeout,
+        narrow ? std::optional<exchange::rank_t>{0} : std::nullopt,
+        std::move(whole_build)),
+      // Rank 0 alone holds a narrow join's build: all of its keys, not one part in the ranks.
+      narrow ? 1 : service->world_size());
+    shape += narrow ? "F0" : "F";
+    return join.dynamic_filter_plan().admitted_keys().size();
   }
 
   placement visit(duckdb::unique_ptr<op::sirius_physical_operator>& slot)
@@ -647,16 +716,48 @@ struct rewriter {
           visit(build.children[0]);
           insert(
             build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-          return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+          return done(on_rank0(probe_rows) ? probe_rows : placement::spread);
         }
-        merge_filters_across_ranks(join);
+        // A join whose two inputs fit one rank's budget runs on rank 0 alone: nothing above it
+        // needs an exchange until an operator spreads its rows again.
+        auto const pbytes = estimated_bytes(*probe.children[0]);
+        bool const narrow = stages.stage_bytes > 0 && bbytes <= stages.stage_bytes &&
+                            pbytes <= stages.stage_bytes - bbytes;
+        // A build that really holds few bytes goes whole to every rank, as the small estimated
+        // one above does, and the probe rows stay: the build side's sinks count it as it runs.
+        std::shared_ptr<exchange::broadcast_choice> choice;
+        exchange::stream_id count_stream{};
+        if (!narrow && stages.broadcast_bytes > 0 &&
+            emits_build_rows_only_with_probe(join.join_type) &&
+            join.join_type != duckdb::JoinType::MARK) {
+          count_stream = stream();
+          choice       = std::make_shared<exchange::broadcast_choice>(
+            service, count_stream, stages.broadcast_bytes, *gpu);
+        }
+        auto const merged_keys = merge_filters_across_ranks(join, narrow, choice);
+        // With no merge to save, nothing known when the build must go says whole is worth it.
+        if (merged_keys == 0) { choice.reset(); }
+        if (choice) {
+          service->describe(count_stream, "build bytes");
+          // With the limit: ranks that differ in it would choose differently as they run.
+          shape += "C" + std::to_string(stages.broadcast_bytes);
+          choice->weigh([world, merged_keys](exchange::stage_load const& held) {
+            return whole_build_saves_bytes(held.bytes, held.rows, world, merged_keys);
+          });
+        }
+        if (narrow) {
+          shape += "N";
+          to_rank0_below(probe);
+          to_rank0_below(build);
+          return done(placement::narrow);
+        }
         defer_probe_scan(join, probe.Cast<op::sirius_physical_partition>());
         // Each side's rows meet their matches once both are exchanged on the join keys. A MARK
         // join's NULL build keys match nothing yet turn a missed probe row's mark NULL, so every
         // rank needs them; its sink also sends every rank one build row, so that a NULL probe
         // key's mark is NULL on any rank once the build has rows.
-        hash_below(probe);
-        hash_below(build, join.join_type == duckdb::JoinType::MARK);
+        hash_below(probe, false, false, choice);
+        hash_below(build, join.join_type == duckdb::JoinType::MARK, false, choice, true);
         return done(placement::spread);
       }
 
@@ -726,7 +827,7 @@ struct rewriter {
         auto const probe_rows = visit(probe.children[0]);
         visit(build.children[0]);
         insert(build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-        return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+        return done(on_rank0(probe_rows) ? probe_rows : placement::spread);
       }
 
       case T::DENSE_COUNT_JOIN: {
@@ -762,13 +863,13 @@ struct rewriter {
             throw sirius::not_implemented_exception(
               "distributed execution: COUNT(DISTINCT) with grouping sets");
           }
-          visit(grouped.children[0]);
+          if (visit(grouped.children[0]) == placement::narrow) { return done(placement::narrow); }
           exchange_spec spec;
           spec.key_columns = grouped.group_idx;
           insert(grouped.children[0], std::move(spec), false);
           return done(placement::spread);
         }
-        return done(hash_below(partition));
+        return done(hash_below(partition, false, /*stay_narrow=*/true));
       }
 
       case T::MERGE_AGGREGATE: {
@@ -795,7 +896,16 @@ struct rewriter {
         auto& sample =
           expect(*partition.children[0], T::SORT_SAMPLE).Cast<op::sirius_physical_sort_sample>();
         auto& order = expect(*sample.children[0], T::ORDER_BY);
-        if (visit(order.children[0]) == placement::rank0) { return done(placement::rank0); }
+        // Its rows are on rank 0 alone already: the sort runs there as on one GPU.
+        if (auto const where = visit(order.children[0]); on_rank0(where)) { return done(where); }
+        if (stages.gather_sort_rows > 0 &&
+            order.children[0]->estimated_cardinality <= stages.gather_sort_rows) {
+          // Few rows: rank 0 gets them all and sorts them as one GPU does. No sample all-gather,
+          // no range exchange.
+          shape += "g";
+          insert(order.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
+          return done(placement::rank0);
+        }
         exchange_spec spec;
         spec.routing = exchange_spec::mode::range;
         for (auto const& o : sample.orders) {
@@ -811,7 +921,9 @@ struct rewriter {
         // Its own statement: the exchange takes its stream id before the all-gather takes one.
         auto& sink = insert(partition.children[0], std::move(spec), false);
         // The sample, now below the sink, takes its boundaries from every rank's sample.
-        install_sort_boundaries(sample, sink, service, stream(), *gpu);
+        auto const sample_stream = stream();
+        service->describe(sample_stream, "sort sample");
+        install_sort_boundaries(sample, sink, service, sample_stream, *gpu);
         return done(placement::ranged);
       }
 
@@ -846,12 +958,10 @@ void require_same_shape(rewriter& r)
                                       stream,
                                       telemetry::batch_telemetry_info{});
   // The query's last stream id: the rewrite numbers its exchanges up from 1.
-  auto const all = exchange::all_gather(
-    *r.service,
-    exchange::make_stream_id(r.query, (std::uint64_t{1} << exchange::query_stream_bits) - 1),
-    mine,
-    *r.gpu,
-    stream.get());
+  auto const shape_stream =
+    exchange::make_stream_id(r.query, (std::uint64_t{1} << exchange::query_stream_bits) - 1);
+  r.service->describe(shape_stream, "plan shape");
+  auto const all = exchange::all_gather(*r.service, shape_stream, mine, *r.gpu, stream.get());
   std::vector<std::int64_t> theirs(all.size());
   // Held until the copies finish, so nothing spills the hashes meanwhile.
   std::vector<decltype(all.front()->to_read_only())> held;
@@ -882,14 +992,16 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle,
                      parquet_footer_reader footers,
-                     deferred_scan_policy deferred)
+                     deferred_scan_policy deferred,
+                     stage_policy stages)
 {
   rewriter r{service, &gpu, query, &lifecycle};
   r.footers  = std::move(footers);
   r.deferred = std::move(deferred);
+  r.stages   = stages;
   try {
     auto const where = r.visit(plan);
-    if (where != placement::rank0) {
+    if (!on_rank0(where)) {
       r.insert(plan,
                exchange_spec{.routing = exchange_spec::mode::gather},
                /*ordered=*/where == placement::ranged);
@@ -1012,6 +1124,24 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
     throw sirius::not_implemented_exception(
       "distributed execution: a plan that carries its own byte ranges");
   }
+}
+
+bool whole_build_saves_bytes(std::uint64_t build_bytes,
+                             std::uint64_t build_rows,
+                             std::uint64_t ranks,
+                             std::size_t merged_keys) noexcept
+{
+  if (merged_keys == 0) { return false; }
+  if (ranks < 2) { return true; }
+  auto const n = static_cast<long double>(ranks);
+  // Each rank's rows go to n - 1 ranks in place of (n - 1) / n of them.
+  auto const added = static_cast<long double>(build_bytes) * (n - 1) * (n - 1) / n;
+  // Each rank sizes its merged Bloom for the rows of all ranks (merged_bloom_policy()).
+  auto const keys =
+    op::scaled_bloom_keys(build_rows, 1, op::merged_bloom_min_keys, op::merged_bloom_max_keys);
+  auto const bloom =
+    static_cast<long double>(op::bloom_blocks_for(keys) * op::bloom_bytes_per_block);
+  return added <= n * (n - 1) * static_cast<long double>(merged_keys) * bloom;
 }
 
 void install_filter_merge(op::sirius_physical_hash_join& join,

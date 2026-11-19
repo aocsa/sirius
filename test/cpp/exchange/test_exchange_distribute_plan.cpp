@@ -231,7 +231,8 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
                                     ranks& c,
                                     fixture& f,
                                     sirius::planner::parquet_footer_reader const& footers = {},
-                                    std::uint64_t query                                   = 7)
+                                    std::uint64_t query                                   = 7,
+                                    sirius::planner::stage_policy stages                  = {})
 {
   auto const world = static_cast<rank_t>(plans.size());
   std::vector<std::string> errors(world);
@@ -240,7 +241,7 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
     threads.emplace_back([&, r] {
       try {
         sirius::planner::distribute_plan(
-          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers);
+          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers, {}, stages);
       } catch (std::exception const& e) {
         errors[r] = e.what();
       }
@@ -503,6 +504,174 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   CHECK(distributed->types == planned.types);
   CHECK(distributed->estimated_cardinality == planned.estimated_cardinality);
   CHECK(distributed->children.size() == 1);
+}
+
+TEST_CASE("distribute_plan gathers a small ORDER BY to rank 0 and sorts it there",
+          "[exchange][planner]")
+{
+  fixture f;
+  auto const sql = std::string{"SELECT k, v FROM big ORDER BY v DESC NULLS FIRST, k"};
+
+  SECTION("at or below the row limit")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 2);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.gather_sort_rows = 1'000'000'000}) ==
+            std::vector<std::string>(2));
+    // The sorted rows are on rank 0 already: no gather on top, no range exchange, and the
+    // sample takes no boundaries from other ranks.
+    CHECK(plans[0]->type != T::EXCHANGE_SOURCE);
+    auto* partition = find(*plans[0], T::SORT_PARTITION);
+    REQUIRE(partition);
+    CHECK_FALSE(sink_below(*partition));
+    auto* sample = find(*plans[0], T::SORT_SAMPLE);
+    REQUIRE(sample);
+    CHECK(sample->Cast<sirius::op::sirius_physical_sort_sample>().cross_rank_boundaries() ==
+          nullptr);
+    auto* order = find(*plans[0], T::ORDER_BY);
+    REQUIRE(order);
+    REQUIRE(sink_below(*order));
+    CHECK(sink_below(*order)->spec().routing == exchange_spec::mode::gather);
+  }
+
+  SECTION("above the row limit the range exchange stays")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 2);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.gather_sort_rows = 1}) == std::vector<std::string>(2));
+    auto* partition = find(*plans[0], T::SORT_PARTITION);
+    REQUIRE(partition);
+    REQUIRE(sink_below(*partition));
+    CHECK(sink_below(*partition)->spec().routing == exchange_spec::mode::range);
+  }
+}
+
+TEST_CASE("distribute_plan runs a join whose inputs fit the stage budget on rank 0 alone",
+          "[exchange][planner]")
+{
+  fixture f;
+  auto const sql =
+    std::string{"SELECT b.k, count(*) FROM big b JOIN big2 c ON b.k = c.k GROUP BY b.k"};
+
+  SECTION("within the budget")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.stage_bytes = std::uint64_t{1} << 40}) ==
+            std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK(sink_below(*side)->spec().routing == exchange_spec::mode::hash);
+      CHECK(sink_below(*side)->spec().width == 1);
+    }
+    // The group-by and the result stay on rank 0: no exchange above the join.
+    auto* merge = find(*plans[0], T::MERGE_GROUP_BY);
+    REQUIRE(merge);
+    CHECK_FALSE(sink_below(*merge->children.at(0)));
+    CHECK(plans[0]->type != T::EXCHANGE_SOURCE);
+  }
+
+  SECTION("above the budget every rank takes part, as with no budget")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.stage_bytes = 1}) == std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK(sink_below(*side)->spec().width == 0);
+    }
+    auto* merge = find(*plans[0], T::MERGE_GROUP_BY);
+    REQUIRE(merge);
+    CHECK(sink_below(*merge->children.at(0)));
+    CHECK(plans[0]->type == T::EXCHANGE_SOURCE);
+  }
+}
+
+TEST_CASE("distribute_plan lets a hashed join send a small build whole, chosen as it runs",
+          "[exchange][planner]")
+{
+  fixture f;
+  // Filtered builds: a build that covers its whole key domain publishes no filter to merge.
+  auto const merged =
+    std::string{"SELECT b.v, c.v FROM big b JOIN big2 c ON b.k = c.k WHERE b.v < 5 AND c.v < 5"};
+  auto const unmerged =
+    std::string{"SELECT b.k, count(*) FROM big b JOIN big2 c ON b.k = c.k GROUP BY b.k"};
+
+  SECTION("with a limit, the two sides share one choice and the build side counts for it")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, merged, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.broadcast_bytes = std::uint64_t{1} << 20}) ==
+            std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    REQUIRE(sink_below(*probe));
+    REQUIRE(sink_below(*build));
+    auto const& probe_spec = sink_below(*probe)->spec();
+    auto const& build_spec = sink_below(*build)->spec();
+    CHECK(build_spec.routing == exchange_spec::mode::hash);
+    REQUIRE(build_spec.build_choice);
+    CHECK(build_spec.counts_build);
+    CHECK(probe_spec.build_choice == build_spec.build_choice);
+    CHECK_FALSE(probe_spec.counts_build);
+  }
+
+  SECTION("without a limit there is no choice")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, merged, 3);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK_FALSE(sink_below(*side)->spec().build_choice);
+      CHECK_FALSE(sink_below(*side)->spec().counts_build);
+    }
+  }
+
+  SECTION("a join with no filter to merge gets no choice, whatever the limit")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, unmerged, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.broadcast_bytes = std::uint64_t{1} << 20}) ==
+            std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK_FALSE(sink_below(*side)->spec().build_choice);
+      CHECK_FALSE(sink_below(*side)->spec().counts_build);
+    }
+  }
+}
+
+TEST_CASE("a whole build is worth it when it adds fewer bytes than its Bloom merge sends",
+          "[exchange][planner]")
+{
+  using sirius::planner::whole_build_saves_bytes;
+  constexpr std::uint64_t MB = 1'000'000;
+  // 4 ranks: a whole build adds 2.25 times its bytes. A merged Bloom for 1 M keys is 65536
+  // blocks, 2 MiB, and its merge sends 12 copies: 25 MB.
+  CHECK(whole_build_saves_bytes(8 * MB, 1'000'000, 4, 1));
+  CHECK_FALSE(whole_build_saves_bytes(16 * MB, 1'000'000, 4, 1));
+  // Two merged keys save twice that.
+  CHECK(whole_build_saves_bytes(16 * MB, 1'000'000, 4, 2));
+  // A merged Bloom has at least 2^16 keys, 128 KiB: 12 copies outweigh a build of 0.5 MB.
+  CHECK(whole_build_saves_bytes(MB / 2, 10, 4, 1));
+  // No merged filter: nothing known to save.
+  CHECK_FALSE(whole_build_saves_bytes(MB / 2, 10, 4, 0));
+  // One rank sends nothing either way.
+  CHECK(whole_build_saves_bytes(1000 * MB, 1, 1, 1));
 }
 
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")

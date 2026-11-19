@@ -535,6 +535,15 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] std::shared_ptr<sirius_dynamic_bloom_filter> folded_to(
     std::size_t bytes, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const;
 
+  /**
+   * @brief An empty filter of @p bytes in this filter's domain, on its GPU: what merge_from() of a
+   * filter of that size, built elsewhere, turns into a copy of it.
+   *
+   * @throw std::invalid_argument when @p bytes is not a power-of-two number of blocks
+   */
+  [[nodiscard]] std::shared_ptr<sirius_dynamic_bloom_filter> empty_of(
+    std::size_t bytes, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const;
+
  private:
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
     cudf::column_view const& probe,

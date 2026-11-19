@@ -201,7 +201,7 @@ check of every value. It writes `summary.md` with GB/s per phase next to raw NIX
 
 | Mode | Routes | Notes |
 |---|---|---|
-| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `null_keys_to_every_rank`, a row with a NULL in a key column goes to every rank |
+| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `null_keys_to_every_rank`, a row with a NULL in a key column goes to every rank. With a `width`, only the first `width` ranks receive rows; every rank still gets the stream's end |
 | `range` | by the key columns against world − 1 boundaries | Input batches sorted on the keys; each rank's rows are one sorted run, cut at `lower_bound` as `SORT_PARTITION` cuts |
 | `broadcast` | every row to every rank | |
 | `gather` | every row to one rank | |
@@ -226,7 +226,10 @@ neither routed nor sent, so a range exchange needs no boundaries when no rank ha
 - A failed exchange is the exception of the source's next task.
 
 `exchange_service` is one process's end of every exchange. It holds what arrives for a stream
-before the stream's source is planned, and replays it when the source attaches.
+before the stream's source is planned, and replays it when the source attaches. When a query
+retires, each rank logs one line per stream: what the planner said it carries (routing, key
+columns, estimated rows, the operator below; or `bloom merge`, `sort sample`, `plan shape`), the
+GB and batches sent and received, and the GB sent to each rank. A line for the whole query follows.
 
 ### Collectives (`src/exchange/all_gather.*`)
 
@@ -260,6 +263,8 @@ single-process plan already partitions:
 |---|---|
 | `HASH_JOIN`, each side `CONCAT → PARTITION → input` | `hash` on that `PARTITION`'s join keys and casts, below it |
 | the same, with a small build side | `broadcast` of the build side; the probe side stays where it is |
+| the same, with both sides estimated within `exchange_stage_bytes` | `hash` of width 1 on each side: the join runs on rank 0 alone, and a group-by, a sort and the result above it stay there with no exchange |
+| the same, with `exchange_broadcast_bytes` set | `hash` on each side, with a choice made as the query runs: the build side's sinks hold and count their input, and a build of at most that many bytes over all ranks goes whole to every rank, when that moves fewer bytes between ranks, while the probe side keeps its rows; any other build is hashed as planned |
 | `NESTED_LOOP_JOIN`, each side `CONCAT → PARTITION → input` | `broadcast` of the build side; the probe side stays where it is |
 | `DENSE_COUNT_JOIN`, each side `PARTITION → input` | `hash` on the join key, both sides |
 | `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side |
@@ -268,6 +273,7 @@ single-process plan already partitions:
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
 | `MERGE_TOP_N → TOP_N` | `gather` to rank 0, between them; a row outside its rank's top N is outside the overall top N |
 | `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
+| the same, with at most `exchange_gather_sort_rows` estimated rows | `gather` to rank 0, below `ORDER_BY`; the whole sort runs there |
 | the result | `gather` to rank 0, ordered after a distributed sort |
 
 `GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. A `CTE`
@@ -367,6 +373,10 @@ These rules are the publication policy that `merged_bloom_policy()` gives a merg
 ranks, uncapped) and
 `publish_when_empty_or_drained` (an empty build or drained targets still take part). With one
 rank, all three keep their defaults and the publisher behaves as on one GPU.
+
+A join that runs on rank 0 alone (`exchange_stage_bytes`) has its whole build there. Rank 0 sizes
+its Bloom for its own rows and sends it to every rank, one copy each; the other ranks, whose
+builds are empty, publish a copy of it to their scans. No rank sends a filter to rank 0.
 
 A join whose build is broadcast publishes from its whole build, as on one GPU, with nothing to
 merge. A join that hashes both sides and whose estimated build is under 2^14 rows publishes no

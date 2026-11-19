@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/stage_choice.hpp"
 #include "exchange/wire.hpp"
 #include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
@@ -28,9 +29,13 @@
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -121,6 +126,25 @@ sirius_physical_exchange_sink::sirius_physical_exchange_sink(
     throw sirius::invalid_input_exception(
       "exchange sink: gather to rank {} of {}", _spec.target, _service->world_size());
   }
+  if (_spec.width != 0 && (_spec.routing != mode::hash || _spec.width > _service->world_size())) {
+    throw sirius::invalid_input_exception(
+      "exchange sink: a width of {} needs hash routing and that many ranks; there are {}",
+      _spec.width,
+      _service->world_size());
+  }
+  if (_spec.build_choice &&
+      (_spec.routing != mode::hash || _spec.width != 0 || _spec.null_keys_to_every_rank)) {
+    throw sirius::invalid_input_exception(
+      "exchange sink: a build choice needs hash routing to every rank, NULL keys as other rows");
+  }
+  if (_spec.counts_build && !_spec.build_choice) {
+    throw sirius::invalid_input_exception("exchange sink: no build choice to count for");
+  }
+}
+
+exchange::rank_t sirius_physical_exchange_sink::receivers() const noexcept
+{
+  return _spec.width == 0 ? _service->world_size() : _spec.width;
 }
 
 void sirius_physical_exchange_sink::set_range_boundaries(
@@ -147,6 +171,15 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> slices;
   std::vector<std::size_t> ranks;
   bool row_to_every_rank = false;
+  // With one receiver every row is on it already: nothing is copied to other ranks.
+  bool const null_keys_to_receivers = _spec.null_keys_to_every_rank && receivers() > 1;
+  // A join's build that went whole to every rank: the build side sends its rows so, and the
+  // probe side keeps its own. While the choice is open the build side makes both forms.
+  auto const whole_build = _spec.build_choice ? _spec.build_choice->known() : std::nullopt;
+  auto const where       = !whole_build.value_or(false) ? route_to::spec
+                           : _spec.counts_build         ? route_to::every_rank
+                                                        : route_to::this_rank;
+  bool const choice_open = _spec.counts_build && !whole_build;
   if (!batches.empty()) {
     std::lock_guard lock{_input_schema_mutex};
     if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batches.front())); }
@@ -154,7 +187,7 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   for (std::size_t b = 0; b < handles.size(); ++b) {
     // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
     if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
-    if (_spec.null_keys_to_every_rank && !row_to_every_rank &&
+    if (null_keys_to_receivers && !row_to_every_rank &&
         !_every_rank_has_a_row.load(std::memory_order_acquire)) {
       auto* space = batches[b].get_memory_space();
       if (space == nullptr) {
@@ -166,20 +199,20 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
         *space,
         stream,
         batch_telemetry());
-      for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+      for (exchange::rank_t r = 0; r < receivers(); ++r) {
         slices.push_back(row);
         ranks.push_back(r);
       }
       row_to_every_rank = true;
     }
     std::vector<std::shared_ptr<cucascade::data_batch>> routed;
-    auto split = _spec.null_keys_to_every_rank
+    auto split = null_keys_to_receivers
                    ? split_null_keys(batches[b], _spec.key_columns, stream, batch_telemetry())
                    : std::nullopt;
     if (!split) {
-      routed = route(batches[b], handles[b], stream);
+      routed = route(batches[b], handles[b], stream, where);
     } else {
-      for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+      for (exchange::rank_t r = 0; r < receivers(); ++r) {
         slices.push_back(split->null_keys);
         ranks.push_back(r);
       }
@@ -192,6 +225,10 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
       if (!routed[r] || get_cudf_table_view(*routed[r]).num_rows() == 0) { continue; }
       slices.push_back(std::move(routed[r]));
       ranks.push_back(r);
+    }
+    if (choice_open) {
+      slices.push_back(route(batches[b], handles[b], stream, route_to::every_rank).front());
+      ranks.push_back(_service->world_size());
     }
   }
   // Only now: a task rescheduled after an OOM above must send its row again. Two tasks racing
@@ -210,7 +247,8 @@ std::unique_ptr<cudf::table> sirius_physical_exchange_sink::empty_like_input() c
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sink::route(
   cucascade::read_only_data_batch const& batch,
   std::shared_ptr<cucascade::data_batch> const& handle,
-  ::cuda::stream_ref stream)
+  ::cuda::stream_ref stream,
+  route_to where)
 {
   using mode       = exchange_spec::mode;
   auto const ranks = _service->world_size();
@@ -228,9 +266,13 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sin
     slices[_spec.target] = _spec.target == _service->rank() ? handle : whole();
     return slices;
   }
-  if (_spec.routing == mode::broadcast || ranks == 1) {
+  if (_spec.routing == mode::broadcast || where == route_to::every_rank || ranks == 1) {
     // Each rank's transport copies what it sends; this rank keeps the batch itself.
     std::fill(slices.begin(), slices.end(), ranks == 1 ? handle : whole());
+    return slices;
+  }
+  if (where == route_to::this_rank) {
+    slices[_service->rank()] = handle;
     return slices;
   }
   auto* space = batch.get_memory_space();
@@ -238,10 +280,15 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sin
     throw sirius::internal_exception("exchange sink: the input batch is not resident");
   }
   if (_spec.routing == mode::hash) {
+    auto const to = receivers();
+    if (to == 1) {
+      slices[0] = _service->rank() == 0 ? handle : whole();
+      return slices;
+    }
     auto parts = gpu_partition_impl::hash_partition(batch,
                                                     _spec.key_columns,
                                                     _spec.key_cast_types,
-                                                    static_cast<int>(ranks),
+                                                    static_cast<int>(to),
                                                     stream,
                                                     *space,
                                                     batch_telemetry(),
@@ -297,17 +344,85 @@ void sirius_physical_exchange_sink::sink(const operator_data& input_data,
 {
   auto const& routed  = dynamic_cast<const routed_operator_data&>(input_data);
   auto const& batches = routed.get_data_batches();
-  auto const self     = _service->rank();
+  if (!_spec.counts_build) {
+    send(batches, routed.destinations(), false);
+    return;
+  }
+  std::unique_lock lock{_held_mutex};
+  if (auto const whole_build = _spec.build_choice->known()) {
+    lock.unlock();
+    send(batches, routed.destinations(), *whole_build);
+    return;
+  }
+  auto const whole_batch = static_cast<std::size_t>(_service->world_size());
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    if (routed.destinations()[i] == whole_batch) {
+      auto const size = get_batch_rows_and_bytes(*batches[i]);
+      _held_bytes += size.bytes;
+      _held_rows += size.rows.value_or(0);
+    }
+  }
+  _held.push_back({batches, routed.destinations()});
+  if (_held_bytes <= _spec.build_choice->share()) { return; }
+  // More than this rank's share: the build is hashed, whatever the other ranks hold. A task
+  // that holds a batch before over() has settled it is past its share too, and comes here.
+  auto const held = std::exchange(_held, {});
+  lock.unlock();
+  _spec.build_choice->over();
+  for (auto const& h : held) {
+    send(h.batches, h.destinations, false);
+  }
+}
+
+void sirius_physical_exchange_sink::send(
+  std::span<std::shared_ptr<cucascade::data_batch> const> batches,
+  std::span<std::size_t const> destinations,
+  bool whole_build)
+{
+  auto const self        = _service->rank();
+  auto const world       = _service->world_size();
+  auto const whole_batch = static_cast<std::size_t>(world);
+  // Of a whole input batch and its slices, one goes: the batch when the build goes whole.
+  bool const whole =
+    whole_build &&
+    std::find(destinations.begin(), destinations.end(), whole_batch) != destinations.end();
   // A broadcast or NULL-key batch is one data_batch for every rank. This rank's copy lands in a
   // spillable repository, and a spilled batch can no longer be sent, so the peers go first: each
   // peer's send holds a read lock until its frames are staged. Order per destination is kept.
-  for (std::size_t i = 0; i < batches.size(); ++i) {
-    auto const to = static_cast<exchange::rank_t>(routed.destinations()[i]);
-    if (to != self) { _service->send(_stream, to, batches[i]); }
+  for (bool const own : {false, true}) {
+    for (std::size_t i = 0; i < batches.size(); ++i) {
+      if (destinations[i] == whole_batch) {
+        if (!whole) { continue; }
+        for (exchange::rank_t r = 0; r < world; ++r) {
+          if ((r == self) == own) { _service->send(_stream, r, batches[i]); }
+        }
+      } else if (!whole) {
+        auto const to = static_cast<exchange::rank_t>(destinations[i]);
+        if ((to == self) == own) { _service->send(_stream, to, batches[i]); }
+      }
+    }
   }
-  for (std::size_t i = 0; i < batches.size(); ++i) {
-    auto const to = static_cast<exchange::rank_t>(routed.destinations()[i]);
-    if (to == self) { _service->send(_stream, to, batches[i]); }
+}
+
+void sirius_physical_exchange_sink::settle_build()
+{
+  try {
+    std::unique_lock lock{_held_mutex};
+    auto const held = std::exchange(_held, {});
+    exchange::stage_load const load{_held_bytes, _held_rows};
+    lock.unlock();
+    bool const whole_build = _spec.build_choice->decide(load, cudf::get_default_stream());
+    for (auto const& h : held) {
+      send(h.batches, h.destinations, whole_build);
+    }
+  } catch (std::exception const& e) {
+    // As a failed close: the query aborts on every rank, and the stream still ends.
+    SIRIUS_LOG_WARN("exchange sink: stream {} did not send what it held: {}", _stream, e.what());
+    try {
+      _service->abort(exchange::query_of(_stream), e.what());
+    } catch (std::exception const& abort_error) {
+      SIRIUS_LOG_WARN("exchange sink: stream {} not aborted: {}", _stream, abort_error.what());
+    }
   }
 }
 
@@ -323,6 +438,21 @@ std::size_t sirius_physical_exchange_sink::no_history_peak_memory_estimate(
 }
 
 void sirius_physical_exchange_sink::on_finalize_operator()
+{
+  if (_spec.counts_build && !_spec.build_choice->known()) {
+    _settling = std::jthread{[this] {
+      // Not one of the GPU's task threads: it has to pick the GPU itself.
+      rmm::cuda_set_device_raii const device{
+        rmm::cuda_device_id{_spec.build_choice->gpu().get_device_id()}};
+      settle_build();
+      close_streams();
+    }};
+    return;
+  }
+  close_streams();
+}
+
+void sirius_physical_exchange_sink::close_streams()
 {
   // Every rank is told, even after a close to another fails. A failed close aborts the query on
   // every rank, so no receiver waits for an end that will not come; rethrowing instead would leave
