@@ -133,7 +133,7 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> unmatched_build_rows(
 }
 
 std::unique_ptr<rmm::device_uvector<cudf::size_type>> no_match_rows(std::size_t count,
-                                                                     ::cuda::stream_ref stream)
+                                                                    ::cuda::stream_ref stream)
 {
   auto rows = std::make_unique<rmm::device_uvector<cudf::size_type>>(count, stream);
   thrust::fill(rmm::exec_policy_nosync(stream), rows->begin(), rows->end(), cudf::JoinNoMatch);

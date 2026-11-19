@@ -56,6 +56,6 @@ void fill_unmatched_counts(rmm::device_uvector<std::int64_t>& counts,
 
 /// `count` gather indices of `cudf::JoinNoMatch`, which a NULLIFY gather turns into NULL rows.
 std::unique_ptr<rmm::device_uvector<cudf::size_type>> no_match_rows(std::size_t count,
-                                                                     ::cuda::stream_ref stream);
+                                                                    ::cuda::stream_ref stream);
 
 }  // namespace sirius::op

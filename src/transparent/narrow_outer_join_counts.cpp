@@ -43,9 +43,8 @@ class binding_reference_counter : public duckdb::LogicalOperatorVisitor {
 
   void count_in(duckdb::LogicalOperator& op)
   {
-    EnumerateExpressions(op, [this](duckdb::unique_ptr<duckdb::Expression>* expr) {
-      VisitExpression(expr);
-    });
+    EnumerateExpressions(
+      op, [this](duckdb::unique_ptr<duckdb::Expression>* expr) { VisitExpression(expr); });
   }
 
   [[nodiscard]] std::size_t count() const { return _count; }
@@ -70,9 +69,8 @@ std::optional<duckdb::ColumnBinding> counted_column(duckdb::Expression const& ex
     return std::nullopt;
   }
   auto const& aggr = expr.Cast<duckdb::BoundAggregateExpression>();
-  if (aggr.Function().GetName().GetIdentifierName() != "count" ||
-      aggr.GetChildren().size() != 1 || aggr.IsDistinct() || aggr.GetFilter() ||
-      aggr.GetOrderBys()) {
+  if (aggr.Function().GetName().GetIdentifierName() != "count" || aggr.GetChildren().size() != 1 ||
+      aggr.IsDistinct() || aggr.GetFilter() || aggr.GetOrderBys()) {
     return std::nullopt;
   }
   auto const& arg = *aggr.GetChildren()[0];
@@ -89,7 +87,7 @@ std::optional<duckdb::ColumnBinding> counted_column(duckdb::Expression const& ex
 }
 
 duckdb::unique_ptr<duckdb::Expression> present_flag(duckdb::LogicalType const& type,
-                                                 duckdb::ColumnBinding binding)
+                                                    duckdb::ColumnBinding binding)
 {
   auto present = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
     duckdb::ExpressionType::OPERATOR_IS_NOT_NULL, duckdb::LogicalType::BOOLEAN);
@@ -98,7 +96,8 @@ duckdb::unique_ptr<duckdb::Expression> present_flag(duckdb::LogicalType const& t
   return duckdb::make_uniq<duckdb::BoundCaseExpression>(
     std::move(present),
     duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true)),
-    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(duckdb::LogicalType::BOOLEAN)));
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(
+      duckdb::Value(duckdb::LogicalType::BOOLEAN)));
 }
 
 std::size_t narrow_counts_below(duckdb::LogicalAggregate& agg, duckdb::Binder& binder)
@@ -111,7 +110,7 @@ std::size_t narrow_counts_below(duckdb::LogicalAggregate& agg, duckdb::Binder& b
   if (join.join_type != duckdb::JoinType::LEFT && join.join_type != duckdb::JoinType::RIGHT) {
     return 0;
   }
-  auto& nulled = join.children[join.join_type == duckdb::JoinType::LEFT ? 1 : 0];
+  auto& nulled        = join.children[join.join_type == duckdb::JoinType::LEFT ? 1 : 0];
   auto const bindings = nulled->GetColumnBindings();
   nulled->ResolveOperatorTypes();
   auto const types = nulled->types;
@@ -148,7 +147,8 @@ std::size_t narrow_counts_below(duckdb::LogicalAggregate& agg, duckdb::Binder& b
       replacer.replacement_bindings.emplace_back(bindings[i], replacement);
     }
   }
-  auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(table_index, std::move(select_list));
+  auto projection =
+    duckdb::make_uniq<duckdb::LogicalProjection>(table_index, std::move(select_list));
   if (nulled->has_estimated_cardinality) {
     projection->SetEstimatedCardinality(nulled->estimated_cardinality);
   }

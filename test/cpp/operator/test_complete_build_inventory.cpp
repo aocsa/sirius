@@ -297,9 +297,8 @@ TEST_CASE("accumulated Bloom transfer chunks are aligned and cover non-aligned a
   }
 }
 
-TEST_CASE(
-  "a scaled Bloom is sized from the build's rows times the scale, in power-of-two blocks",
-  "[dynamic_filter][multi_partition]")
+TEST_CASE("a scaled Bloom is sized from the build's rows times the scale, in power-of-two blocks",
+          "[dynamic_filter][multi_partition]")
 {
   using sirius::op::scaled_bloom_keys;
   constexpr std::size_t min = std::size_t{1} << 16;
@@ -333,6 +332,5 @@ TEST_CASE(
     }
   }
   // Ranks with nearby row counts agree unless a power of two lies between them.
-  CHECK(scaled_bloom_keys(26'000'000, 4, min, max) ==
-        scaled_bloom_keys(26'010'000, 4, min, max));
+  CHECK(scaled_bloom_keys(26'000'000, 4, min, max) == scaled_bloom_keys(26'010'000, 4, min, max));
 }
