@@ -348,6 +348,10 @@ struct operator_params {
   /// and sorted there, with no sample all-gather and no range exchange. 0 turns it off.
   uint64_t exchange_gather_sort_rows = 0;
 
+  /// Distributed execution: a hashed join whose two inputs are estimated at this many bytes or
+  /// fewer in all runs on rank 0 alone, and so does what is above it. 0 turns it off.
+  uint64_t exchange_stage_bytes = 0;
+
   /// Rewrite plans that read the same rows twice so they read them once
   /// (planner/scan_reuse_rewrites.hpp): TPC-H Q18's IN-subquery aggregate, Q17's and Q2's
   /// correlated aggregate over the outer query's own rows, Q11's repeated join.

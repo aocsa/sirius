@@ -538,12 +538,58 @@ TEST_CASE("distribute_plan gathers a small ORDER BY to rank 0 and sorts it there
   {
     ranks c(2, f.gpu());
     auto plans = plan_on_every_rank(f, sql, 2);
-    REQUIRE(distribute(plans, c, f, {}, 7, {.gather_sort_rows = 1}) ==
-            std::vector<std::string>(2));
+    REQUIRE(distribute(plans, c, f, {}, 7, {.gather_sort_rows = 1}) == std::vector<std::string>(2));
     auto* partition = find(*plans[0], T::SORT_PARTITION);
     REQUIRE(partition);
     REQUIRE(sink_below(*partition));
     CHECK(sink_below(*partition)->spec().routing == exchange_spec::mode::range);
+  }
+}
+
+TEST_CASE("distribute_plan runs a join whose inputs fit the stage budget on rank 0 alone",
+          "[exchange][planner]")
+{
+  fixture f;
+  auto const sql =
+    std::string{"SELECT b.k, count(*) FROM big b JOIN big2 c ON b.k = c.k GROUP BY b.k"};
+
+  SECTION("within the budget")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.stage_bytes = std::uint64_t{1} << 40}) ==
+            std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK(sink_below(*side)->spec().routing == exchange_spec::mode::hash);
+      CHECK(sink_below(*side)->spec().width == 1);
+    }
+    // The group-by and the result stay on rank 0: no exchange above the join.
+    auto* merge = find(*plans[0], T::MERGE_GROUP_BY);
+    REQUIRE(merge);
+    CHECK_FALSE(sink_below(*merge->children.at(0)));
+    CHECK(plans[0]->type != T::EXCHANGE_SOURCE);
+  }
+
+  SECTION("above the budget every rank takes part, as with no budget")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 3);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.stage_bytes = 1}) == std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK(sink_below(*side)->spec().width == 0);
+    }
+    auto* merge = find(*plans[0], T::MERGE_GROUP_BY);
+    REQUIRE(merge);
+    CHECK(sink_below(*merge->children.at(0)));
+    CHECK(plans[0]->type == T::EXCHANGE_SOURCE);
   }
 }
 

@@ -3063,6 +3063,13 @@ static void SetExchangeGatherSortRows(ClientContext& context, SetScope scope, Va
                    params->exchange_gather_sort_rows);
 }
 
+static void SetExchangeStageBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                 = get_operator_params(context, scope);
+  params->exchange_stage_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EXCHANGE_STAGE_BYTES to {}", params->exchange_stage_bytes);
+}
+
 static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                       = get_operator_params(context, scope);
@@ -3579,6 +3586,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.exchange_gather_sort_rows),
                     SetExchangeGatherSortRows);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "exchange_stage_bytes",
+                    "distributed: run a hashed join of at most this many bytes on rank 0; 0 = off",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.exchange_stage_bytes),
+                    SetExchangeStageBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_scan_reuse_rewrites",

@@ -65,6 +65,9 @@ struct exchange_spec {
   std::vector<cudf::null_order> null_precedence;
   /// gather: the receiving rank.
   exchange::rank_t target = 0;
+  /// hash: only ranks 0 to width - 1 receive rows; 0 = every rank. Every rank still gets the
+  /// stream's end, so a rank that receives no row hands on its one empty batch.
+  exchange::rank_t width = 0;
 };
 
 /**
@@ -135,6 +138,9 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   exchange::stream_id _stream;
   exchange_spec _spec;
   std::mutex _boundaries_mutex;
+  /// The ranks that receive rows: the first `width` of a hash exchange that has one, else all.
+  [[nodiscard]] exchange::rank_t receivers() const noexcept;
+
   std::shared_ptr<cudf::table const> _boundaries;
   mutable std::mutex _input_schema_mutex;
   /// Empty, with the columns of the first input batch.

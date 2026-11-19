@@ -78,6 +78,9 @@ struct deferred_scan_policy {
 struct stage_policy {
   /// An ORDER BY of at most this many estimated rows is gathered to rank 0 and sorted there.
   std::uint64_t gather_sort_rows = 0;
+  /// A hashed join whose two inputs are estimated at this many bytes or fewer in all runs on
+  /// rank 0 alone, and so does what is above it, until an operator spreads its rows again.
+  std::uint64_t stage_bytes = 0;
 };
 
 /**

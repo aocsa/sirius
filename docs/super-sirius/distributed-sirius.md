@@ -201,7 +201,7 @@ check of every value. It writes `summary.md` with GB/s per phase next to raw NIX
 
 | Mode | Routes | Notes |
 |---|---|---|
-| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `null_keys_to_every_rank`, a row with a NULL in a key column goes to every rank |
+| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `null_keys_to_every_rank`, a row with a NULL in a key column goes to every rank. With a `width`, only the first `width` ranks receive rows; every rank still gets the stream's end |
 | `range` | by the key columns against world − 1 boundaries | Input batches sorted on the keys; each rank's rows are one sorted run, cut at `lower_bound` as `SORT_PARTITION` cuts |
 | `broadcast` | every row to every rank | |
 | `gather` | every row to one rank | |
@@ -263,6 +263,7 @@ single-process plan already partitions:
 |---|---|
 | `HASH_JOIN`, each side `CONCAT → PARTITION → input` | `hash` on that `PARTITION`'s join keys and casts, below it |
 | the same, with a small build side | `broadcast` of the build side; the probe side stays where it is |
+| the same, with both sides estimated within `exchange_stage_bytes` | `hash` of width 1 on each side: the join runs on rank 0 alone, and a group-by, a sort and the result above it stay there with no exchange |
 | `NESTED_LOOP_JOIN`, each side `CONCAT → PARTITION → input` | `broadcast` of the build side; the probe side stays where it is |
 | `DENSE_COUNT_JOIN`, each side `PARTITION → input` | `hash` on the join key, both sides |
 | `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side |

@@ -88,7 +88,14 @@ enum class placement {
   spread,  ///< Across ranks, each rank holding some.
   ranged,  ///< Across ranks, rank i holding the i-th range of a sort order.
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
+  narrow,  ///< On rank 0; the other ranks run the same operators over no rows.
 };
+
+/// Whether a subtree's rows are on rank 0 alone.
+constexpr bool on_rank0(placement where) noexcept
+{
+  return where == placement::rank0 || where == placement::narrow;
+}
 
 /// A hash join whose estimated build has fewer rows publishes no merged Bloom filters.
 constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
@@ -545,6 +552,7 @@ struct rewriter {
     for (auto const key : spec.key_columns) {
       shape += std::to_string(key) + ",";
     }
+    if (spec.width != 0) { shape += "w" + std::to_string(spec.width); }
     {
       static constexpr std::array<std::string_view, 4> modes{
         "hash", "range", "broadcast", "gather"};
@@ -553,6 +561,7 @@ struct rewriter {
         label += std::to_string(key) + ",";
       }
       label += "] casts=" + std::to_string(spec.key_cast_types.size()) +
+               (spec.width != 0 ? " width=" + std::to_string(spec.width) : std::string{}) +
                " est_rows=" + std::to_string(rows) +
                " below=" + op::SiriusPhysicalOperatorToString(child->type);
       service->describe(id, std::move(label));
@@ -576,17 +585,35 @@ struct rewriter {
 
   /// A hash exchange on @p partition's keys, between it and its input. An input on rank 0 alone
   /// (a gathered aggregate) is spread from there; the other ranks' copies of it hold no rows.
+  /// With @p stay_narrow, an input on rank 0 alone (placement::narrow) is left there.
   placement hash_below(op::sirius_physical_operator& partition_node,
-                       bool null_keys_to_every_rank = false)
+                       bool null_keys_to_every_rank = false,
+                       bool stay_narrow             = false)
   {
     auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
-    visit(partition.children[0]);
+    auto const where = visit(partition.children[0]);
+    if (stay_narrow && where == placement::narrow) { return placement::narrow; }
     exchange_spec spec;
     spec.key_columns             = partition.partition_keys();
     spec.key_cast_types          = partition.specification().key_cast_types;
     spec.null_keys_to_every_rank = null_keys_to_every_rank;
     insert(partition.children[0], std::move(spec), false);
     return placement::spread;
+  }
+
+  /// Brings @p partition_node's input to rank 0 alone, for a stage that runs there: a hash
+  /// exchange of width 1, so that every other rank's source still hands on its one empty batch
+  /// and the operators above run there over no rows. An input already narrow stays.
+  placement to_rank0_below(op::sirius_physical_operator& partition_node)
+  {
+    auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
+    if (visit(partition.children[0]) == placement::narrow) { return placement::narrow; }
+    exchange_spec spec;
+    spec.key_columns    = partition.partition_keys();
+    spec.key_cast_types = partition.specification().key_cast_types;
+    spec.width          = 1;
+    insert(partition.children[0], std::move(spec), false);
+    return placement::narrow;
   }
 
   /// After hash exchanges a rank's build holds only its share of the keys: a filter from it
@@ -663,9 +690,19 @@ struct rewriter {
           visit(build.children[0]);
           insert(
             build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-          return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+          return done(on_rank0(probe_rows) ? probe_rows : placement::spread);
         }
         merge_filters_across_ranks(join);
+        // A join whose two inputs fit one rank's budget runs on rank 0 alone: nothing above it
+        // needs an exchange until an operator spreads its rows again.
+        auto const pbytes = estimated_bytes(*probe.children[0]);
+        if (stages.stage_bytes > 0 && bbytes <= stages.stage_bytes &&
+            pbytes <= stages.stage_bytes - bbytes) {
+          shape += "N";
+          to_rank0_below(probe);
+          to_rank0_below(build);
+          return done(placement::narrow);
+        }
         defer_probe_scan(join, probe.Cast<op::sirius_physical_partition>());
         // Each side's rows meet their matches once both are exchanged on the join keys. A MARK
         // join's NULL build keys match nothing yet turn a missed probe row's mark NULL, so every
@@ -742,7 +779,7 @@ struct rewriter {
         auto const probe_rows = visit(probe.children[0]);
         visit(build.children[0]);
         insert(build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
-        return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+        return done(on_rank0(probe_rows) ? probe_rows : placement::spread);
       }
 
       case T::DENSE_COUNT_JOIN: {
@@ -778,13 +815,13 @@ struct rewriter {
             throw sirius::not_implemented_exception(
               "distributed execution: COUNT(DISTINCT) with grouping sets");
           }
-          visit(grouped.children[0]);
+          if (visit(grouped.children[0]) == placement::narrow) { return done(placement::narrow); }
           exchange_spec spec;
           spec.key_columns = grouped.group_idx;
           insert(grouped.children[0], std::move(spec), false);
           return done(placement::spread);
         }
-        return done(hash_below(partition));
+        return done(hash_below(partition, false, /*stay_narrow=*/true));
       }
 
       case T::MERGE_AGGREGATE: {
@@ -811,7 +848,8 @@ struct rewriter {
         auto& sample =
           expect(*partition.children[0], T::SORT_SAMPLE).Cast<op::sirius_physical_sort_sample>();
         auto& order = expect(*sample.children[0], T::ORDER_BY);
-        if (visit(order.children[0]) == placement::rank0) { return done(placement::rank0); }
+        // Its rows are on rank 0 alone already: the sort runs there as on one GPU.
+        if (auto const where = visit(order.children[0]); on_rank0(where)) { return done(where); }
         if (stages.gather_sort_rows > 0 &&
             order.children[0]->estimated_cardinality <= stages.gather_sort_rows) {
           // Few rows: rank 0 gets them all and sorts them as one GPU does. No sample all-gather,
@@ -915,7 +953,7 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
   r.stages   = stages;
   try {
     auto const where = r.visit(plan);
-    if (where != placement::rank0) {
+    if (!on_rank0(where)) {
       r.insert(plan,
                exchange_spec{.routing = exchange_spec::mode::gather},
                /*ordered=*/where == placement::ranged);

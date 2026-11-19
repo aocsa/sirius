@@ -269,6 +269,33 @@ TEST_CASE("hash exchange sends each row to the rank its hash names", "[exchange]
   }
 }
 
+TEST_CASE("a hash exchange of width 1 sends every row to rank 0 and no row elsewhere",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  int const batches = 2;
+  exchange_spec spec;
+  spec.key_columns = {0};
+  spec.width       = 1;
+  auto sources     = exchange_all(c, 1, spec, batches, /*ordered=*/false, /*sources_late=*/false);
+  std::vector<std::int64_t> want;
+  for (rank_t from = 0; from < c.world(); ++from) {
+    for (int i = 0; i < batches; ++i) {
+      auto k = keys_of(*key_value_batch(from, i));
+      want.insert(want.end(), k.begin(), k.end());
+    }
+  }
+  auto got = flat(drain(*sources[0]));
+  std::sort(got.begin(), got.end());
+  std::sort(want.begin(), want.end());
+  CHECK(!got.empty());
+  CHECK(got == want);
+  // The other ranks get the stream's end from every sender, and so their one empty batch.
+  for (rank_t r = 1; r < c.world(); ++r) {
+    CHECK(flat(drain(*sources[r])).empty());
+  }
+}
+
 TEST_CASE("range exchange sends each row to the rank whose range holds it", "[exchange][operators]")
 {
   ranks c(3);
@@ -1056,6 +1083,8 @@ TEST_CASE("an exchange sink rejects a spec that does not fit", "[exchange][opera
   reject({.routing = mode::gather, .key_columns = {0}});
   reject({.routing = mode::hash, .key_columns = {2}});
   reject({.routing = mode::hash, .key_columns = {-1}});
+  reject({.routing = mode::broadcast, .width = 1});
+  reject({.routing = mode::hash, .key_columns = {0}, .width = 3});
   reject({.routing        = mode::hash,
           .key_columns    = {0},
           .key_cast_types = {cudf::data_type{cudf::type_id::INT64},

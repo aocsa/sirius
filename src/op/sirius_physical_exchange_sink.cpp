@@ -121,6 +121,17 @@ sirius_physical_exchange_sink::sirius_physical_exchange_sink(
     throw sirius::invalid_input_exception(
       "exchange sink: gather to rank {} of {}", _spec.target, _service->world_size());
   }
+  if (_spec.width != 0 && (_spec.routing != mode::hash || _spec.width > _service->world_size())) {
+    throw sirius::invalid_input_exception(
+      "exchange sink: a width of {} needs hash routing and that many ranks; there are {}",
+      _spec.width,
+      _service->world_size());
+  }
+}
+
+exchange::rank_t sirius_physical_exchange_sink::receivers() const noexcept
+{
+  return _spec.width == 0 ? _service->world_size() : _spec.width;
 }
 
 void sirius_physical_exchange_sink::set_range_boundaries(
@@ -147,6 +158,8 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> slices;
   std::vector<std::size_t> ranks;
   bool row_to_every_rank = false;
+  // With one receiver every row is on it already: nothing is copied to other ranks.
+  bool const null_keys_to_receivers = _spec.null_keys_to_every_rank && receivers() > 1;
   if (!batches.empty()) {
     std::lock_guard lock{_input_schema_mutex};
     if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batches.front())); }
@@ -154,7 +167,7 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   for (std::size_t b = 0; b < handles.size(); ++b) {
     // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
     if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
-    if (_spec.null_keys_to_every_rank && !row_to_every_rank &&
+    if (null_keys_to_receivers && !row_to_every_rank &&
         !_every_rank_has_a_row.load(std::memory_order_acquire)) {
       auto* space = batches[b].get_memory_space();
       if (space == nullptr) {
@@ -166,20 +179,20 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
         *space,
         stream,
         batch_telemetry());
-      for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+      for (exchange::rank_t r = 0; r < receivers(); ++r) {
         slices.push_back(row);
         ranks.push_back(r);
       }
       row_to_every_rank = true;
     }
     std::vector<std::shared_ptr<cucascade::data_batch>> routed;
-    auto split = _spec.null_keys_to_every_rank
+    auto split = null_keys_to_receivers
                    ? split_null_keys(batches[b], _spec.key_columns, stream, batch_telemetry())
                    : std::nullopt;
     if (!split) {
       routed = route(batches[b], handles[b], stream);
     } else {
-      for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+      for (exchange::rank_t r = 0; r < receivers(); ++r) {
         slices.push_back(split->null_keys);
         ranks.push_back(r);
       }
@@ -238,10 +251,15 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sin
     throw sirius::internal_exception("exchange sink: the input batch is not resident");
   }
   if (_spec.routing == mode::hash) {
+    auto const to = receivers();
+    if (to == 1) {
+      slices[0] = _service->rank() == 0 ? handle : whole();
+      return slices;
+    }
     auto parts = gpu_partition_impl::hash_partition(batch,
                                                     _spec.key_columns,
                                                     _spec.key_cast_types,
-                                                    static_cast<int>(ranks),
+                                                    static_cast<int>(to),
                                                     stream,
                                                     *space,
                                                     batch_telemetry(),
