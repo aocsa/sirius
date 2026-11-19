@@ -2407,7 +2407,8 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
                                           return scans.parquet_footer(path);
                                         },
                                         sirius_ctx->get_config().smallest_gpu_downgrade_threshold()}
-        : planner::deferred_scan_policy{});
+        : planner::deferred_scan_policy{},
+      planner::stage_policy{.gather_sort_rows = op_params.exchange_gather_sort_rows});
   }
 }
 

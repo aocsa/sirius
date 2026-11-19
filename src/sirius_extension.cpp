@@ -3055,6 +3055,14 @@ static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope,
                    params->enable_complete_group_having);
 }
 
+static void SetExchangeGatherSortRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                      = get_operator_params(context, scope);
+  params->exchange_gather_sort_rows = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EXCHANGE_GATHER_SORT_ROWS to {}",
+                   params->exchange_gather_sort_rows);
+}
+
 static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                       = get_operator_params(context, scope);
@@ -3564,6 +3572,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_complete_group_having),
                     SetEnableCompleteGroupHaving);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "exchange_gather_sort_rows",
+                    "distributed: sort an ORDER BY of at most this many rows on rank 0; 0 = off",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.exchange_gather_sort_rows),
+                    SetExchangeGatherSortRows);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_scan_reuse_rewrites",

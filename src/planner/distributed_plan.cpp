@@ -220,6 +220,7 @@ struct rewriter {
   std::map<op::sirius_physical_operator const*, placement> cte_scans;
   parquet_footer_reader footers;
   deferred_scan_policy deferred;
+  stage_policy stages;
 
   exchange::stream_id stream() { return exchange::make_stream_id(query, next_stream++); }
 
@@ -811,6 +812,14 @@ struct rewriter {
           expect(*partition.children[0], T::SORT_SAMPLE).Cast<op::sirius_physical_sort_sample>();
         auto& order = expect(*sample.children[0], T::ORDER_BY);
         if (visit(order.children[0]) == placement::rank0) { return done(placement::rank0); }
+        if (stages.gather_sort_rows > 0 &&
+            order.children[0]->estimated_cardinality <= stages.gather_sort_rows) {
+          // Few rows: rank 0 gets them all and sorts them as one GPU does. No sample all-gather,
+          // no range exchange.
+          shape += "g";
+          insert(order.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
+          return done(placement::rank0);
+        }
         exchange_spec spec;
         spec.routing = exchange_spec::mode::range;
         for (auto const& o : sample.orders) {
@@ -897,11 +906,13 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle,
                      parquet_footer_reader footers,
-                     deferred_scan_policy deferred)
+                     deferred_scan_policy deferred,
+                     stage_policy stages)
 {
   rewriter r{service, &gpu, query, &lifecycle};
   r.footers  = std::move(footers);
   r.deferred = std::move(deferred);
+  r.stages   = stages;
   try {
     auto const where = r.visit(plan);
     if (where != placement::rank0) {

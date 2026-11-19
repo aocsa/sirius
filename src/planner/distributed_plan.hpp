@@ -74,6 +74,12 @@ struct deferred_scan_policy {
   std::uint64_t min_bytes = 0;    ///< The smallest scan, over all ranks, that is deferred.
 };
 
+/// Which stages distribute_plan keeps on rank 0 instead of on every rank. Zero turns a rule off.
+struct stage_policy {
+  /// An ORDER BY of at most this many estimated rows is gathered to rank 0 and sorted there.
+  std::uint64_t gather_sort_rows = 0;
+};
+
 /**
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of
  * @p service, each over its own share of the scanned files.
@@ -95,6 +101,7 @@ struct deferred_scan_policy {
  * @param query This query's number, the same on every rank: its exchanges' stream ids.
  * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
  * @param footers Reads a Parquet file's footer; may be empty.
+ * @param stages Which stages run on rank 0 alone; by default none does.
  * @throws sirius::not_implemented_exception on an operator distributed execution does not
  *         support, rather than a wrong answer; this rank throws before the all-gather.
  * @throws sirius::invalid_input_exception when another rank planned a different shape, on every
@@ -106,7 +113,8 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle,
                      parquet_footer_reader footers = {},
-                     deferred_scan_policy deferred = {});
+                     deferred_scan_policy deferred = {},
+                     stage_policy stages           = {});
 
 /// Bytes `[start, start + length)` of file `file` (an index into the table's files).
 struct file_byte_range {

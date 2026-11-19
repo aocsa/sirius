@@ -231,7 +231,8 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
                                     ranks& c,
                                     fixture& f,
                                     sirius::planner::parquet_footer_reader const& footers = {},
-                                    std::uint64_t query                                   = 7)
+                                    std::uint64_t query                                   = 7,
+                                    sirius::planner::stage_policy stages                  = {})
 {
   auto const world = static_cast<rank_t>(plans.size());
   std::vector<std::string> errors(world);
@@ -240,7 +241,7 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
     threads.emplace_back([&, r] {
       try {
         sirius::planner::distribute_plan(
-          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers);
+          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers, {}, stages);
       } catch (std::exception const& e) {
         errors[r] = e.what();
       }
@@ -503,6 +504,47 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   CHECK(distributed->types == planned.types);
   CHECK(distributed->estimated_cardinality == planned.estimated_cardinality);
   CHECK(distributed->children.size() == 1);
+}
+
+TEST_CASE("distribute_plan gathers a small ORDER BY to rank 0 and sorts it there",
+          "[exchange][planner]")
+{
+  fixture f;
+  auto const sql = std::string{"SELECT k, v FROM big ORDER BY v DESC NULLS FIRST, k"};
+
+  SECTION("at or below the row limit")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 2);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.gather_sort_rows = 1'000'000'000}) ==
+            std::vector<std::string>(2));
+    // The sorted rows are on rank 0 already: no gather on top, no range exchange, and the
+    // sample takes no boundaries from other ranks.
+    CHECK(plans[0]->type != T::EXCHANGE_SOURCE);
+    auto* partition = find(*plans[0], T::SORT_PARTITION);
+    REQUIRE(partition);
+    CHECK_FALSE(sink_below(*partition));
+    auto* sample = find(*plans[0], T::SORT_SAMPLE);
+    REQUIRE(sample);
+    CHECK(sample->Cast<sirius::op::sirius_physical_sort_sample>().cross_rank_boundaries() ==
+          nullptr);
+    auto* order = find(*plans[0], T::ORDER_BY);
+    REQUIRE(order);
+    REQUIRE(sink_below(*order));
+    CHECK(sink_below(*order)->spec().routing == exchange_spec::mode::gather);
+  }
+
+  SECTION("above the row limit the range exchange stays")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, sql, 2);
+    REQUIRE(distribute(plans, c, f, {}, 7, {.gather_sort_rows = 1}) ==
+            std::vector<std::string>(2));
+    auto* partition = find(*plans[0], T::SORT_PARTITION);
+    REQUIRE(partition);
+    REQUIRE(sink_below(*partition));
+    CHECK(sink_below(*partition)->spec().routing == exchange_spec::mode::range);
+  }
 }
 
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")

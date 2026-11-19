@@ -271,6 +271,7 @@ single-process plan already partitions:
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
 | `MERGE_TOP_N → TOP_N` | `gather` to rank 0, between them; a row outside its rank's top N is outside the overall top N |
 | `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
+| the same, with at most `exchange_gather_sort_rows` estimated rows | `gather` to rank 0, below `ORDER_BY`; the whole sort runs there |
 | the result | `gather` to rank 0, ordered after a distributed sort |
 
 `GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. A `CTE`
