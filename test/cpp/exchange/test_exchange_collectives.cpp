@@ -23,6 +23,7 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
+#include "exchange/stage_choice.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
@@ -798,6 +799,77 @@ TEST_CASE("a rank that leaves an all-gather does not wait, and the others go on 
     CHECK(got[r][2] == nullptr);
     CHECK(keys_of(*got[r][1]).front() == 1000);
   }
+}
+
+TEST_CASE("every rank gets the sum of the bytes the ranks hold for a stage",
+          "[exchange][collectives]")
+{
+  ranks c(3);
+  std::vector<std::optional<std::uint64_t>> got(3);
+  on_every_rank(3, [&](rank_t r) {
+    sirius::exchange::stage_count count{c.all[r].service, 21, *env().gpu};
+    got[r] = count.total((r + 1) * 1000, utils::default_stream());
+    CHECK(count.resolved());
+  });
+  for (rank_t r = 0; r < 3; ++r) {
+    CHECK(got[r] == std::optional<std::uint64_t>{6000});
+  }
+}
+
+TEST_CASE("a rank over its share of a stage waits for no one, and no rank gets a sum",
+          "[exchange][collectives]")
+{
+  ranks c(3);
+  sirius::exchange::stage_count gone{c.all[2].service, 22, *env().gpu};
+  // Before the others start: it must not need them.
+  gone.over();
+  CHECK(gone.resolved());
+  CHECK(gone.wait() == std::nullopt);
+  // Its input ends later: it has its answer, and no all-gather runs for it.
+  CHECK(gone.total(5, utils::default_stream()) == std::nullopt);
+  std::vector<std::optional<std::uint64_t>> got(2, std::optional<std::uint64_t>{1});
+  on_every_rank(2, [&](rank_t r) {
+    sirius::exchange::stage_count count{
+      c.all[r].service, 22, *env().gpu, std::chrono::seconds{30}};
+    got[r] = count.total(10, utils::default_stream());
+  });
+  CHECK(got[0] == std::nullopt);
+  CHECK(got[1] == std::nullopt);
+}
+
+TEST_CASE("a stage count asked again answers as before, without a second all-gather",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  std::vector<std::optional<std::uint64_t>> again(2);
+  on_every_rank(2, [&](rank_t r) {
+    sirius::exchange::stage_count count{
+      c.all[r].service, 23, *env().gpu, std::chrono::seconds{30}};
+    REQUIRE(count.total(7 + r, utils::default_stream()) == std::optional<std::uint64_t>{15});
+    // The peer is past its all-gather: another would wait out the timeout.
+    again[r] = count.total(100, utils::default_stream());
+    count.over();
+    CHECK(count.wait() == std::optional<std::uint64_t>{15});
+  });
+  CHECK(again[0] == std::optional<std::uint64_t>{15});
+  CHECK(again[1] == std::optional<std::uint64_t>{15});
+}
+
+TEST_CASE("a thread that waits for a stage count gets what the rank's other thread gathers",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  std::vector<std::optional<std::uint64_t>> waited(2);
+  on_every_rank(2, [&](rank_t r) {
+    sirius::exchange::stage_count count{
+      c.all[r].service, 24, *env().gpu, std::chrono::seconds{30}};
+    std::thread reader{[&] { waited[r] = count.wait(); }};
+    auto const sum = count.total(40, utils::default_stream());
+    reader.join();
+    CHECK(sum == std::optional<std::uint64_t>{80});
+  });
+  CHECK(waited[0] == std::optional<std::uint64_t>{80});
+  CHECK(waited[1] == std::optional<std::uint64_t>{80});
 }
 
 TEST_CASE("all-gather gives every rank every rank's table, in rank order",
