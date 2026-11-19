@@ -38,8 +38,6 @@ set(SIRIUS_CLANG_CXX_WARNING_OPTIONS -Wunreachable-code -Wimplicit-fallthrough
 
 set(SIRIUS_LINK_LIBRARIES
     cudf::cudf
-    cuvs::cuvs
-    raft::raft
     cuco::cuco
     rmm::rmm
     spdlog::spdlog
@@ -59,6 +57,9 @@ set(SIRIUS_LINK_LIBRARIES
     kvikio::kvikio
     # NVML: the NIXL fabric checks peer access between GPUs other processes own.
     CUDA::nvml)
+if(SIRIUS_WITH_VSS)
+  list(APPEND SIRIUS_LINK_LIBRARIES cuvs::cuvs raft::raft)
+endif()
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -79,11 +80,17 @@ foreach(_target sirius_objects sirius_core sirius_shared)
     ${_target}
     PRIVATE
       $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+      # Kernels index std::array; RAFT's target passes this flag too, but only
+      # with SIRIUS_WITH_VSS.
+      $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-relaxed-constexpr>
       "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
   )
   target_compile_definitions(
     ${_target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN
                        CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+  if(SIRIUS_WITH_VSS)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_WITH_VSS)
+  endif()
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
