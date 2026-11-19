@@ -23,7 +23,9 @@ target_sources(
           scan/strings/dict_fsst.cu
           scan/strings/dictionary.cu
           scan/strings/fsst.cu
-          scan/strings/uncompressed.cu
-          vss/cudf_raft_interop.cu
-          vss/brute_force_search.cu
-          vss/ivf_flat_index.cu)
+          scan/strings/uncompressed.cu)
+if(SIRIUS_WITH_VSS)
+  target_sources(
+    sirius_objects PRIVATE vss/cudf_raft_interop.cu vss/brute_force_search.cu
+                           vss/ivf_flat_index.cu)
+endif()

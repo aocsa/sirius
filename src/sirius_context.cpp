@@ -51,7 +51,14 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
 #include "util/scoped_process_affinity.hpp"
+#ifdef SIRIUS_WITH_VSS
 #include "vss/cuvs_index_cache.hpp"
+#else
+// Built without vector search: the cache member stays null and its getters throw.
+namespace sirius::vss {
+class cuvs_index_cache {};
+}  // namespace sirius::vss
+#endif
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -991,7 +998,9 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
   // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
   // manager so an index build can reserve its GPU footprint through Sirius.
+#ifdef SIRIUS_WITH_VSS
   cuvs_index_cache_ = std::make_unique<sirius::vss::cuvs_index_cache>(*memory_manager_);
+#endif
 
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine.
@@ -1534,12 +1543,14 @@ void SiriusContext::reset_caches()
 sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache()
 {
   throw_if_not_initialized();
+  if (!cuvs_index_cache_) { throw std::runtime_error("Sirius was built without vector search"); }
   return *cuvs_index_cache_;
 }
 
 const sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache() const
 {
   throw_if_not_initialized();
+  if (!cuvs_index_cache_) { throw std::runtime_error("Sirius was built without vector search"); }
   return *cuvs_index_cache_;
 }
 

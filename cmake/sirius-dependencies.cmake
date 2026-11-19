@@ -7,8 +7,10 @@ if(NOT VCPKG_BUILD)
     cudf::cudf
     INTERFACE "$<$<COMPILE_LANGUAGE:CXX,CUDA>:SHELL:-include variant>")
 endif()
-find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
-find_package(cuvs REQUIRED CONFIG)
+if(SIRIUS_WITH_VSS)
+  find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
+  find_package(cuvs REQUIRED CONFIG)
+endif()
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 # CRoaring decodes Iceberg Puffin deletion vectors (portable Roaring). Host-side
@@ -29,7 +31,7 @@ endif()
 # The static vcpkg build only exports cuvs::cuvs_static; shared cuvs packages
 # already provide cuvs::cuvs. Provide the canonical name when it is missing so
 # both build paths link cuvs::cuvs the same way below.
-if(NOT TARGET cuvs::cuvs)
+if(SIRIUS_WITH_VSS AND NOT TARGET cuvs::cuvs)
   add_library(cuvs::cuvs INTERFACE IMPORTED)
   set_target_properties(cuvs::cuvs PROPERTIES INTERFACE_LINK_LIBRARIES
                                               cuvs::cuvs_static)

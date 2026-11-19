@@ -38,6 +38,7 @@ option(
   OFF)
 
 # Optional features
+option(SIRIUS_WITH_VSS "Build vector search (links cuVS and RAFT)" ON)
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 
