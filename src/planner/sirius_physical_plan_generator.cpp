@@ -2388,6 +2388,10 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
         "distributed execution: sirius_exchange_peers set on a connection without Sirius state");
     }
     auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+    // Read before the query takes its number: a rank that fails once it has one must abort it.
+    auto directives = op_params.exchange_directives.empty()
+                        ? planner::exchange_directives{}
+                        : planner::read_exchange_directives(op_params.exchange_directives);
     sirius::planner::distribute_plan(
       plan,
       sirius_ctx->get_exchange_service(op_params),
@@ -2410,7 +2414,8 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
         : planner::deferred_scan_policy{},
       planner::stage_policy{.gather_sort_rows = op_params.exchange_gather_sort_rows,
                             .stage_bytes      = op_params.exchange_stage_bytes,
-                            .broadcast_bytes  = op_params.exchange_broadcast_bytes});
+                            .broadcast_bytes  = op_params.exchange_broadcast_bytes},
+      std::move(directives));
   }
 }
 

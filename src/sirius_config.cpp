@@ -506,6 +506,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("exchange_gather_sort_rows", opt.exchange_gather_sort_rows);
   r.optional("exchange_stage_bytes", yaml::bytes(opt.exchange_stage_bytes));
   r.optional("exchange_broadcast_bytes", yaml::bytes(opt.exchange_broadcast_bytes));
+  r.optional("exchange_directives", opt.exchange_directives);
   r.optional("enable_scan_reuse_rewrites", opt.enable_scan_reuse_rewrites);
   r.optional("pin_table_prove_unique_keys", opt.prove_unique_keys);
   // 0 is meaningful here: it selects the share of GPU memory space capacity.

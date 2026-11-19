@@ -66,11 +66,13 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -83,7 +85,10 @@ namespace {
 
 using op::exchange_spec;
 using op::SiriusPhysicalOperatorType;
-using T = SiriusPhysicalOperatorType;
+using T    = SiriusPhysicalOperatorType;
+using mode = exchange_spec::mode;
+
+constexpr std::array<std::string_view, 4> mode_names{"hash", "range", "broadcast", "gather"};
 
 /// Where a subtree's rows are.
 enum class placement {
@@ -217,6 +222,207 @@ bool emits_build_rows_only_with_probe(duckdb::JoinType type)
          type != duckdb::JoinType::RIGHT_SEMI && type != duckdb::JoinType::RIGHT_ANTI;
 }
 
+/// The input column that output column @p column of @p node is, for an operator with one input
+/// that only drops rows or columns; nothing for any other, or for a computed column.
+std::optional<std::size_t> passed_on(op::sirius_physical_operator const& node, std::size_t column)
+{
+  switch (node.type) {
+    case T::PROJECTION: {
+      auto const& list = node.Cast<op::sirius_physical_projection>().select_list;
+      if (column >= list.size() || !list[column]->is_reference()) { return std::nullopt; }
+      return list[column]->as_reference().column_index;
+    }
+    case T::FILTER: {
+      auto const* kept = std::get_if<std::vector<cudf::size_type>>(
+        &node.Cast<op::sirius_physical_filter>().output_columns);
+      if (kept == nullptr) { return column; }
+      if (column >= kept->size()) { return std::nullopt; }
+      return static_cast<std::size_t>((*kept)[column]);
+    }
+    case T::DYNAMIC_FILTER:
+    case T::CONCAT:
+    case T::PARTITION:
+    case T::EXCHANGE_SOURCE:
+    case T::EXCHANGE_SINK:
+      return node.types.size() == node.children[0]->types.size() ? std::optional{column}
+                                                                 : std::nullopt;
+    default: return std::nullopt;
+  }
+}
+
+/// The side of @p join (0 probe, 1 build) and the column of it that output column @p column is;
+/// nothing for a MARK join's mark.
+std::optional<std::pair<std::size_t, std::size_t>> join_input(
+  op::sirius_physical_hash_join const& join, std::size_t column)
+{
+  using J = duckdb::JoinType;
+  // The output is the probe side's columns, then the build side's.
+  auto const& probe = join.lhs_output_columns.col_idxs;
+  auto const& build = join.rhs_output_columns.col_idxs;
+  if (join.join_type != J::RIGHT_SEMI && join.join_type != J::RIGHT_ANTI) {
+    if (column < probe.size()) {
+      return std::pair{std::size_t{0}, static_cast<std::size_t>(probe[column])};
+    }
+    column -= probe.size();
+  }
+  if (join.join_type != J::SEMI && join.join_type != J::ANTI && join.join_type != J::MARK &&
+      column < build.size()) {
+    return std::pair{std::size_t{1}, static_cast<std::size_t>(build[column])};
+  }
+  return std::nullopt;
+}
+
+/// The name of the scanned column that column @p column of @p node is, read down through the
+/// operators that pass a column on; empty when it is none, or not a stored Parquet column.
+std::string column_name(op::sirius_physical_operator const& node, std::size_t column)
+{
+  if (node.type == T::GPU_SCAN) {
+    auto const* info = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+      &node.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info());
+    if (info == nullptr) { return {}; }
+    auto const index = info->projection_ids.empty()
+                         ? column
+                         : (column < info->projection_ids.size()
+                              ? static_cast<std::size_t>(info->projection_ids[column])
+                              : info->column_ids.size());
+    if (index >= info->column_ids.size()) { return {}; }
+    auto const& id = info->column_ids[index];
+    if (id.IsRowIdColumn() || id.IsVirtualColumn() || id.HasChildren() ||
+        id.GetPrimaryIndex() >= info->names.size()) {
+      return {};
+    }
+    return info->names[id.GetPrimaryIndex()];
+  }
+  if (node.type == T::HASH_JOIN) {
+    auto const from = join_input(node.Cast<op::sirius_physical_hash_join>(), column);
+    return from ? column_name(*node.children[from->first], from->second) : std::string{};
+  }
+  auto const from = passed_on(node, column);
+  return from ? column_name(*node.children[0], *from) : std::string{};
+}
+
+/// The names of the scanned columns that column @p column of @p node equals in every row: its
+/// own (see column_name) and, below each inner join that has it as a key, the other side's key of
+/// that equality. A planner keeps one column of an equality and may keep either.
+std::set<std::string> equal_names(op::sirius_physical_operator const& node, std::size_t column)
+{
+  if (node.type == T::GPU_SCAN) {
+    auto name = column_name(node, column);
+    return name.empty() ? std::set<std::string>{} : std::set<std::string>{std::move(name)};
+  }
+  if (node.type != T::HASH_JOIN) {
+    auto const from = passed_on(node, column);
+    return from ? equal_names(*node.children[0], *from) : std::set<std::string>{};
+  }
+  auto const& join = node.Cast<op::sirius_physical_hash_join>();
+  auto const from  = join_input(join, column);
+  if (!from) { return {}; }
+  auto names = equal_names(*node.children[from->first], from->second);
+  // Each side is CONCAT → PARTITION, and the partitions' keys are the equalities in one order.
+  auto const keys = [&](std::size_t side) -> std::vector<int> const* {
+    auto const& concat = *node.children[side];
+    if (concat.type != T::CONCAT || concat.children[0]->type != T::PARTITION) { return nullptr; }
+    return &concat.children[0]->Cast<op::sirius_physical_partition>().partition_keys();
+  };
+  auto const* own   = keys(from->first);
+  auto const* other = keys(1 - from->first);
+  if (join.join_type != duckdb::JoinType::INNER || own == nullptr || other == nullptr ||
+      own->size() != other->size()) {
+    return names;
+  }
+  for (std::size_t k = 0; k < own->size(); ++k) {
+    if (static_cast<std::size_t>((*own)[k]) == from->second) {
+      names.merge(
+        equal_names(*node.children[1 - from->first], static_cast<std::size_t>((*other)[k])));
+    }
+  }
+  return names;
+}
+
+/// Whether the rows of @p node's output that agree on @p columns are all on one rank: a hash
+/// exchange below put them there, on columns among these, and no operator since has moved a row
+/// to another rank or made one on a rank its columns did not come from.
+bool kept_together(op::sirius_physical_operator const& node, std::set<std::size_t> const& columns)
+{
+  if (columns.empty()) { return false; }
+  if (node.type == T::EXCHANGE_SOURCE) {
+    auto const& spec = node.children[0]->Cast<op::sirius_physical_exchange_sink>().spec();
+    // A build that may go whole as the query runs leaves its probe rows where they were.
+    return spec.routing == mode::hash && spec.width == 0 && !spec.null_keys_to_every_rank &&
+           spec.build_choice == nullptr && !spec.key_columns.empty() &&
+           std::ranges::all_of(spec.key_columns, [&](int key) {
+             return columns.contains(static_cast<std::size_t>(key));
+           });
+  }
+  if (node.type == T::HASH_JOIN) {
+    auto const& join = node.Cast<op::sirius_physical_hash_join>();
+    std::array<std::set<std::size_t>, 2> sides;
+    for (auto const column : columns) {
+      if (auto const from = join_input(join, column)) { sides[from->first].insert(from->second); }
+    }
+    // An output row is on the rank of the probe row it was made from, unless it is a build row
+    // that matched nothing.
+    if (emits_build_rows_only_with_probe(join.join_type) &&
+        kept_together(*node.children[0], sides[0])) {
+      return true;
+    }
+    // An inner join's output row holds its build row's key: it is on that row's rank when the
+    // build side was hashed, and a broadcast build side has no hash exchange to find.
+    return join.join_type == duckdb::JoinType::INNER && kept_together(*node.children[1], sides[1]);
+  }
+  std::set<std::size_t> below;
+  for (auto const column : columns) {
+    if (auto const from = passed_on(node, column)) { below.insert(*from); }
+  }
+  return !below.empty() && kept_together(*node.children[0], below);
+}
+
+/// A join's or a join directive's equalities in one order, whichever side each is written on.
+std::string site_key(std::vector<std::pair<std::string, std::string>> const& names)
+{
+  std::vector<std::string> keys;
+  for (auto const& [first, second] : names) {
+    keys.push_back(std::min(first, second) + "=" + std::max(first, second));
+  }
+  std::ranges::sort(keys);
+  std::string key;
+  for (auto const& k : keys) {
+    key += k + ",";
+  }
+  return key;
+}
+
+/// Whether each of @p columns from @p column on, a grouped merge's keys as the names each is known
+/// by, takes one of @p keys, a directive's names, that no other column takes.
+bool names_each(std::vector<std::pair<std::string, std::string>> const& keys,
+                std::vector<std::set<std::string>> const& columns,
+                std::vector<bool>& taken,
+                std::size_t column = 0)
+{
+  if (column == columns.size()) { return true; }
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    if (taken[k] || !columns[column].contains(keys[k].first)) { continue; }
+    taken[k] = true;
+    if (names_each(keys, columns, taken, column + 1)) { return true; }
+    taken[k] = false;
+  }
+  return false;
+}
+
+/// @p told as the line of a directive file.
+std::string to_text(exchange_directive const& told)
+{
+  auto text = op::SiriusPhysicalOperatorToString(told.site) + " ";
+  for (auto const& [first, second] : told.keys) {
+    text += first + (second.empty() ? "" : "=" + second) + ",";
+  }
+  text.back() = ' ';
+  return text +
+         (told.routing ? std::string{mode_names[static_cast<std::size_t>(*told.routing)]}
+                       : std::string{"none"}) +
+         (told.width != 0 ? " width=" + std::to_string(told.width) : std::string{});
+}
+
 struct rewriter {
   std::shared_ptr<exchange::exchange_service> service;
   cucascade::memory::memory_space* gpu;
@@ -230,8 +436,48 @@ struct rewriter {
   parquet_footer_reader footers;
   deferred_scan_policy deferred;
   stage_policy stages;
+  exchange_directives directives;
+  /// Whether a site took directives[i].
+  std::vector<bool> named;
 
   exchange::stream_id stream() { return exchange::make_stream_id(query, next_stream++); }
+
+  /// The one directive of a @p site that @p names_it; null when none or several do, or when an
+  /// earlier site took the directive.
+  template <typename Names>
+  exchange_directive const* directive(T site, Names const& names_it)
+  {
+    std::vector<std::size_t> found;
+    for (std::size_t i = 0; i < directives.size(); ++i) {
+      if (directives[i].site == site && names_it(directives[i])) { found.push_back(i); }
+    }
+    if (found.empty()) { return nullptr; }
+    if (found.size() > 1) { return decline(directives[found[0]], "several directives name it"); }
+    if (named[found[0]]) { return decline(directives[found[0]], "an earlier site took it"); }
+    named[found[0]] = true;
+    SIRIUS_LOG_INFO("[exchange directive] {}: names a site", to_text(directives[found[0]]));
+    return &directives[found[0]];
+  }
+
+  /// Leaves the site that @p told names to this rewrite's own rule.
+  static exchange_directive const* decline(exchange_directive const& told, std::string_view why)
+  {
+    SIRIUS_LOG_INFO("[exchange directive] {}: not followed, {}", to_text(told), why);
+    return nullptr;
+  }
+
+  /// Whether each group of @p grouped has its rows on one rank, its input being @p where: all of
+  /// them on rank 0, or put together by a hash exchange below. Declines @p told when not.
+  static bool whole_groups(exchange_directive const& told,
+                           op::sirius_physical_grouped_aggregate const& grouped,
+                           placement where)
+  {
+    if (on_rank0(where)) { return true; }
+    std::set<std::size_t> columns(grouped.group_idx.begin(), grouped.group_idx.end());
+    if (where == placement::spread && kept_together(*grouped.children[0], columns)) { return true; }
+    decline(told, "no hash exchange below, on columns among the group's, keeps each group whole");
+    return false;
+  }
 
   /// The rows of @p files, from their footers; nothing when one cannot be read.
   std::optional<std::uint64_t> footer_rows(std::vector<std::string> const& files) const
@@ -557,9 +803,7 @@ struct rewriter {
     if (spec.width != 0) { shape += "w" + std::to_string(spec.width); }
     if (spec.build_choice) { shape += spec.counts_build ? "cb" : "cp"; }
     {
-      static constexpr std::array<std::string_view, 4> modes{
-        "hash", "range", "broadcast", "gather"};
-      auto label = std::string{modes[static_cast<std::size_t>(spec.routing)]} + " keys=[";
+      auto label = std::string{mode_names[static_cast<std::size_t>(spec.routing)]} + " keys=[";
       for (auto const key : spec.key_columns) {
         label += std::to_string(key) + ",";
       }
@@ -700,15 +944,53 @@ struct rewriter {
         auto& build       = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
         auto const world  = static_cast<std::uint64_t>(service->world_size());
         auto const bbytes = estimated_bytes(*build.children[0]);
+        bool const whole_build_is_safe = emits_build_rows_only_with_probe(join.join_type);
         // A BUILD_FILTER (right semi and anti joins only, which publish nothing distributed)
         // would publish this rank's keys alone, before the exchange: it goes.
         if (build.children[0]->type == T::BUILD_FILTER) {
           auto input        = std::move(build.children[0]->children[0]);
           build.children[0] = std::move(input);
         }
-        if (emits_build_rows_only_with_probe(join.join_type) &&
-            bbytes <= max_broadcast_build_bytes &&
-            bbytes <= estimated_bytes(*probe.children[0]) / std::max<std::uint64_t>(world - 1, 1)) {
+        // Each equality's columns, the build side's first.
+        std::vector<std::pair<std::string, std::string>> names;
+        auto const& build_keys = build.Cast<op::sirius_physical_partition>().partition_keys();
+        auto const& probe_keys = probe.Cast<op::sirius_physical_partition>().partition_keys();
+        for (std::size_t k = 0; k < build_keys.size() && build_keys.size() == probe_keys.size();
+             ++k) {
+          names.emplace_back(
+            column_name(*build.children[0], static_cast<std::size_t>(build_keys[k])),
+            column_name(*probe.children[0], static_cast<std::size_t>(probe_keys[k])));
+        }
+        bool const known = !names.empty() && std::ranges::none_of(names, [](auto const& name) {
+          return name.first.empty() || name.second.empty();
+        });
+        auto const* told = known ? directive(T::HASH_JOIN,
+                                             [key = site_key(names)](exchange_directive const& d) {
+                                               return site_key(d.keys) == key;
+                                             })
+                                 : nullptr;
+        if (told != nullptr && told->routing == mode::broadcast) {
+          // The directive's first columns are the side to broadcast, which must be this plan's
+          // build side: a probe side is never broadcast.
+          auto const side = [](auto const& keys, bool first) {
+            std::vector<std::string> columns;
+            for (auto const& key : keys) {
+              columns.push_back(first ? key.first : key.second);
+            }
+            std::ranges::sort(columns);
+            return columns;
+          };
+          if (!whole_build_is_safe) {
+            told = decline(*told, "every rank would emit the build rows that match nothing");
+          } else if (side(told->keys, true) != side(names, true) ||
+                     side(names, true) == side(names, false)) {
+            told = decline(*told, "it names the side this plan probes with");
+          }
+        }
+        if (told != nullptr ? told->routing == mode::broadcast
+                            : whole_build_is_safe && bbytes <= max_broadcast_build_bytes &&
+                                bbytes <= estimated_bytes(*probe.children[0]) /
+                                            std::max<std::uint64_t>(world - 1, 1)) {
           // Every rank gets the whole build and keeps its probe rows. Its build being whole, its
           // Bloom filters hold every key, as on one GPU: nothing to merge.
           shape += "B";
@@ -721,13 +1003,16 @@ struct rewriter {
         // A join whose two inputs fit one rank's budget runs on rank 0 alone: nothing above it
         // needs an exchange until an operator spreads its rows again.
         auto const pbytes = estimated_bytes(*probe.children[0]);
-        bool const narrow = stages.stage_bytes > 0 && bbytes <= stages.stage_bytes &&
-                            pbytes <= stages.stage_bytes - bbytes;
+        bool const narrow = told != nullptr
+                              ? told->width == 1
+                              : stages.stage_bytes > 0 && bbytes <= stages.stage_bytes &&
+                                  pbytes <= stages.stage_bytes - bbytes;
         // A build that really holds few bytes goes whole to every rank, as the small estimated
         // one above does, and the probe rows stay: the build side's sinks count it as it runs.
+        // A join that a directive names is hashed as told.
         std::shared_ptr<exchange::broadcast_choice> choice;
         exchange::stream_id count_stream{};
-        if (!narrow && stages.broadcast_bytes > 0 &&
+        if (told == nullptr && !narrow && stages.broadcast_bytes > 0 &&
             emits_build_rows_only_with_probe(join.join_type) &&
             join.join_type != duckdb::JoinType::MARK) {
           count_stream = stream();
@@ -856,6 +1141,18 @@ struct rewriter {
         auto& partition = *node.children[0];
         auto& grouped   = expect(*partition.children[0], T::HASH_GROUP_BY)
                           .Cast<op::sirius_physical_grouped_aggregate>();
+        std::vector<std::set<std::string>> columns;
+        for (auto const key : grouped.group_idx) {
+          columns.push_back(equal_names(*grouped.children[0], static_cast<std::size_t>(key)));
+        }
+        auto const* told = directive(T::MERGE_GROUP_BY, [&](exchange_directive const& d) {
+          std::vector<bool> taken(d.keys.size());
+          return d.keys.size() == columns.size() && names_each(d.keys, columns, taken);
+        });
+        // Told to leave the input where it is: done when the rows of each group are on one rank
+        // already, so that each rank merges whole groups. The input is visited first: the proof
+        // reads the exchanges put below it.
+        bool const leave = told != nullptr && !told->routing;
         if (grouped.has_count_distinct) {
           // Partial distinct sets are LIST columns, which the exchange does not carry: the input
           // rows meet by group key instead, and each rank's partials hold whole groups.
@@ -863,10 +1160,24 @@ struct rewriter {
             throw sirius::not_implemented_exception(
               "distributed execution: COUNT(DISTINCT) with grouping sets");
           }
-          if (visit(grouped.children[0]) == placement::narrow) { return done(placement::narrow); }
+          auto const where = visit(grouped.children[0]);
+          if (where == placement::narrow) { return done(placement::narrow); }
+          if (leave && whole_groups(*told, grouped, where)) { return done(where); }
           exchange_spec spec;
           spec.key_columns = grouped.group_idx;
           insert(grouped.children[0], std::move(spec), false);
+          return done(placement::spread);
+        }
+        if (leave) {
+          auto const where = visit(partition.children[0]);
+          if (where == placement::narrow || whole_groups(*told, grouped, where)) {
+            return done(where);
+          }
+          auto const& keyed = partition.Cast<op::sirius_physical_partition>();
+          exchange_spec spec;
+          spec.key_columns    = keyed.partition_keys();
+          spec.key_cast_types = keyed.specification().key_cast_types;
+          insert(partition.children[0], std::move(spec), false);
           return done(placement::spread);
         }
         return done(hash_below(partition, false, /*stay_narrow=*/true));
@@ -993,14 +1304,23 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      exec::query_lifecycle_registry& lifecycle,
                      parquet_footer_reader footers,
                      deferred_scan_policy deferred,
-                     stage_policy stages)
+                     stage_policy stages,
+                     exchange_directives directives)
 {
   rewriter r{service, &gpu, query, &lifecycle};
-  r.footers  = std::move(footers);
-  r.deferred = std::move(deferred);
-  r.stages   = stages;
+  r.footers    = std::move(footers);
+  r.deferred   = std::move(deferred);
+  r.stages     = stages;
+  r.directives = std::move(directives);
+  r.named.assign(r.directives.size(), false);
   try {
     auto const where = r.visit(plan);
+    for (std::size_t i = 0; i < r.directives.size(); ++i) {
+      if (!r.named[i]) {
+        SIRIUS_LOG_INFO("[exchange directive] {}: names no site of this plan",
+                        to_text(r.directives[i]));
+      }
+    }
     if (!on_rank0(where)) {
       r.insert(plan,
                exchange_spec{.routing = exchange_spec::mode::gather},
@@ -1025,6 +1345,69 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
     }
     throw;
   }
+}
+
+exchange_directives parse_exchange_directives(std::istream& in)
+{
+  exchange_directives out;
+  std::string line;
+  for (std::size_t number = 1; std::getline(in, line); ++number) {
+    std::istringstream words(line.substr(0, line.find('#')));
+    std::string site;
+    std::string keys;
+    std::string routing;
+    std::string width;
+    std::string more;
+    if (!(words >> site)) { continue; }
+    words >> keys >> routing >> width;
+    exchange_directive told{};
+    bool const join = site == op::SiriusPhysicalOperatorToString(T::HASH_JOIN);
+    told.site       = join ? T::HASH_JOIN : T::MERGE_GROUP_BY;
+    bool ok =
+      (join || site == op::SiriusPhysicalOperatorToString(T::MERGE_GROUP_BY)) && !(words >> more);
+    // `a=b,c=d` for a join, `a,b` for a grouped merge.
+    for (std::size_t at = 0; ok && at <= keys.size();) {
+      auto const end    = std::min(keys.find(',', at), keys.size());
+      auto const key    = std::string_view{keys}.substr(at, end - at);
+      auto const equals = key.find('=');
+      auto const first  = key.substr(0, equals);
+      auto const second = equals == key.npos ? std::string_view{} : key.substr(equals + 1);
+      ok = !first.empty() && (equals != key.npos) == join && second.empty() != join &&
+           second.find('=') == second.npos;
+      told.keys.emplace_back(first, second);
+      at = end + 1;
+    }
+    if (routing == "hash") {
+      told.routing = mode::hash;
+    } else if (routing == "broadcast") {
+      told.routing = mode::broadcast;
+      ok           = ok && join && width.empty();
+    } else {
+      ok = ok && !join && routing == "none";
+    }
+    if (width == "width=1") {
+      told.width = 1;
+      ok         = ok && join;
+    } else {
+      ok = ok && width.empty();
+    }
+    if (!ok) {
+      throw sirius::invalid_input_exception(
+        "exchange directives, line {}: expected `HASH_JOIN a=b[,c=d] hash [width=1]`, "
+        "`HASH_JOIN a=b[,c=d] broadcast` or `MERGE_GROUP_BY a[,b] hash|none`, found `{}`",
+        number,
+        line);
+    }
+    out.push_back(std::move(told));
+  }
+  return out;
+}
+
+exchange_directives read_exchange_directives(std::string const& path)
+{
+  std::ifstream file(path);
+  if (!file) { throw sirius::invalid_input_exception("exchange directives: cannot read {}", path); }
+  return parse_exchange_directives(file);
 }
 
 std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const> file_bytes,

@@ -356,6 +356,11 @@ struct operator_params {
   /// most this many bytes over all ranks goes whole to every rank. 0 turns it off.
   uint64_t exchange_broadcast_bytes = 0;
 
+  /// Distributed execution: a file of exchange directives (planner::read_exchange_directives)
+  /// that a query's distributed plan follows at the joins and grouped merges they name, instead
+  /// of deciding those itself. The same file on every rank. Empty turns it off.
+  std::string exchange_directives;
+
   /// Rewrite plans that read the same rows twice so they read them once
   /// (planner/scan_reuse_rewrites.hpp): TPC-H Q18's IN-subquery aggregate, Q17's and Q2's
   /// correlated aggregate over the outer query's own rows, Q11's repeated join.
