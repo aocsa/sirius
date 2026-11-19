@@ -373,6 +373,10 @@ ranks, uncapped) and
 `publish_when_empty_or_drained` (an empty build or drained targets still take part). With one
 rank, all three keep their defaults and the publisher behaves as on one GPU.
 
+A join that runs on rank 0 alone (`exchange_stage_bytes`) has its whole build there. Rank 0 sizes
+its Bloom for its own rows and sends it to every rank, one copy each; the other ranks, whose
+builds are empty, publish a copy of it to their scans. No rank sends a filter to rank 0.
+
 A join whose build is broadcast publishes from its whole build, as on one GPU, with nothing to
 merge. A join that hashes both sides and whose estimated build is under 2^14 rows publishes no
 filters.

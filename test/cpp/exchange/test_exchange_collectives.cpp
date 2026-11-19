@@ -245,10 +245,11 @@ dynamic_filter_publish_plan filter_plan(
 std::shared_ptr<sirius::op::bloom_all_gather_merge> merge_over(
   std::shared_ptr<exchange_service> service,
   dynamic_filter_publish_plan const& plan,
-  std::chrono::milliseconds timeout = std::chrono::seconds{30})
+  std::chrono::milliseconds timeout = std::chrono::seconds{30},
+  std::optional<rank_t> only_from   = std::nullopt)
 {
   return std::make_shared<sirius::op::bloom_all_gather_merge>(
-    std::move(service), 41, plan.admitted_keys().size(), *env().gpu, timeout);
+    std::move(service), 41, plan.admitted_keys().size(), *env().gpu, timeout, only_from);
 }
 
 /// Merges @p plan's filters across ranks. Each rank sizes its Bloom from its rows times the
@@ -257,10 +258,12 @@ void merge_across_ranks(dynamic_filter_publish_plan& plan,
                         std::shared_ptr<exchange_service> service,
                         std::size_t min_keys,
                         std::size_t max_keys              = std::size_t{1} << 30,
-                        std::chrono::milliseconds timeout = std::chrono::seconds{30})
+                        std::chrono::milliseconds timeout = std::chrono::seconds{30},
+                        std::optional<rank_t> only_from   = std::nullopt)
 {
-  auto const ranks = service->world_size();
-  auto merge       = merge_over(std::move(service), plan, timeout);
+  // A build that is whole on one rank holds all of its keys there.
+  auto const ranks = only_from ? rank_t{1} : service->world_size();
+  auto merge       = merge_over(std::move(service), plan, timeout, only_from);
   plan.set_cross_rank_merge(
     std::move(merge), sirius::op::merged_bloom_policy(plan.policy(), ranks, min_keys, max_keys));
 }
@@ -331,11 +334,13 @@ struct whole_build_join {
   dynamic_filter_publish_plan plan;
 
   explicit whole_build_join(std::shared_ptr<exchange_service> service,
-                            std::size_t min_keys = 4096,
-                            std::uint64_t cap    = 64 * KiB)
+                            std::size_t min_keys            = 4096,
+                            std::uint64_t cap               = 64 * KiB,
+                            std::optional<rank_t> only_from = std::nullopt)
     : plan(filter_plan(channel, cap))
   {
-    merge_across_ranks(plan, std::move(service), min_keys);
+    merge_across_ranks(
+      plan, std::move(service), min_keys, std::size_t{1} << 30, std::chrono::seconds{30}, only_from);
   }
 
   sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
@@ -560,6 +565,34 @@ TEST_CASE("whole-build ranks merge even when one build is empty and another's ta
   CHECK(outcomes[0].publications_skipped_targets_drained == 0);
   CHECK(outcomes[1].publications_skipped_targets_drained == 1);
   CHECK(published_bloom(*joins[1]->channel) == nullptr);
+}
+
+TEST_CASE("a merge from one rank gives every rank that rank's Bloom, at its size",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // The join runs on rank 0 alone: 20000 build keys there, empty builds on ranks 1 and 2.
+  ranks c(3);
+  std::vector<std::unique_ptr<whole_build_join>> joins;
+  for (rank_t r = 0; r < 3; ++r) {
+    joins.push_back(
+      std::make_unique<whole_build_join>(c.all[r].service, 4096, 64 * KiB, rank_t{0}));
+  }
+  auto const keys = sequence(0, 1, 20000);
+  on_every_rank(3, [&](rank_t r) {
+    auto const build = r == 0 ? keys_table(0, 1, 20000) : keys_table(0, 1, 0);
+    static_cast<void>(joins[r]->publish(build->view()));
+  });
+  auto const* whole = published_bloom(*joins[0]->channel);
+  REQUIRE(whole != nullptr);
+  // 20000 keys: 1250 blocks, rounded up to 2048 (64 KiB), not the 8 KiB of an empty build.
+  CHECK(whole->storage_bytes() == 64 * KiB);
+  for (rank_t r = 0; r < 3; ++r) {
+    auto const* bloom = published_bloom(*joins[r]->channel);
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == whole->storage_bytes());
+    CHECK(members(*bloom, keys) == keys.size());
+    CHECK(members(*bloom, sequence(1'000'000, 1, 6000)) < 100);
+  }
 }
 
 TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter merge",

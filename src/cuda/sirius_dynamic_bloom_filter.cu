@@ -529,11 +529,22 @@ std::shared_ptr<sirius_dynamic_bloom_filter> sirius_dynamic_bloom_filter::folded
   std::size_t bytes, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
   auto const own = storage_bytes();
-  if (bytes == 0 || bytes % bloom_bytes_per_block != 0 ||
-      !std::has_single_bit(bytes / bloom_bytes_per_block) || own % bytes != 0 ||
-      !std::has_single_bit(own / bytes)) {
+  if (bytes == 0 || own % bytes != 0 || !std::has_single_bit(own / bytes)) {
     throw std::invalid_argument(
       "[sirius_dynamic_bloom_filter] folding to a size that does not fold");
+  }
+  auto folded = empty_of(bytes, stream, mr);
+  folded->merge_from(storage(), own, stream);
+  return folded;
+}
+
+std::shared_ptr<sirius_dynamic_bloom_filter> sirius_dynamic_bloom_filter::empty_of(
+  std::size_t bytes, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+{
+  if (bytes == 0 || bytes % bloom_bytes_per_block != 0 ||
+      !std::has_single_bit(bytes / bloom_bytes_per_block)) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_bloom_filter] a size that is not a power-of-two number of blocks");
   }
   rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_impl->source_device}};
   auto empty           = std::make_unique<impl>();
@@ -543,10 +554,8 @@ std::shared_ptr<sirius_dynamic_bloom_filter> sirius_dynamic_bloom_filter::folded
       empty->source_device,
       make_bloom<sirius_bloom<Key>>(bytes / bloom_bytes_per_block, mr, stream)));
   });
-  std::shared_ptr<sirius_dynamic_bloom_filter> folded{
+  return std::shared_ptr<sirius_dynamic_bloom_filter>{
     new sirius_dynamic_bloom_filter{_domain, std::move(empty)}};
-  folded->merge_from(storage(), own, stream);
-  return folded;
 }
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(

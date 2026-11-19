@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 
 namespace cucascade::memory {
 class memory_space;
@@ -42,6 +43,10 @@ namespace sirius::op {
  * rep, family, scale, size), folds its own onto the smallest size any rank sent, and ORs the
  * others into it. A key whose filters cannot all be merged publishes nothing: a rank sent none, a
  * header's kind differs, a size does not fold onto the smallest, or a rank missed the timeout.
+ *
+ * A join that runs on one rank alone has its whole build there. Constructed with that rank, only
+ * it sends its Bloom, one copy to each rank, and every other rank publishes that filter at that
+ * size in place of its own, which is empty. A rank that did not get it publishes nothing.
  */
 class bloom_all_gather_merge final : public cross_rank_filter_merge {
  public:
@@ -53,12 +58,14 @@ class bloom_all_gather_merge final : public cross_rank_filter_merge {
    * @param key_count The join's admitted keys.
    * @param gpu Where this rank's contribution and the gathered filters are allocated.
    * @param timeout A rank that has not sent its filter by then is given up on.
+   * @param only_from The one rank whose build holds every key, when the join runs there alone.
    */
   bloom_all_gather_merge(std::shared_ptr<exchange::exchange_service> service,
                          exchange::stream_id first_stream,
                          std::size_t key_count,
                          cucascade::memory::memory_space& gpu,
-                         std::chrono::milliseconds timeout = default_timeout);
+                         std::chrono::milliseconds timeout          = default_timeout,
+                         std::optional<exchange::rank_t> only_from = std::nullopt);
 
   void merge(std::span<std::shared_ptr<sirius_dynamic_filter>> membership,
              ::cuda::stream_ref stream) override;
@@ -73,6 +80,7 @@ class bloom_all_gather_merge final : public cross_rank_filter_merge {
   std::size_t _key_count;
   cucascade::memory::memory_space* _gpu;
   std::chrono::milliseconds _timeout;
+  std::optional<exchange::rank_t> _only_from;
 };
 
 /// The bounds of a merged Bloom's size in keys, until the streaming OR (#2375).

@@ -617,8 +617,10 @@ struct rewriter {
   }
 
   /// After hash exchanges a rank's build holds only its share of the keys: a filter from it
-  /// alone would drop rows other ranks' builds match, so every rank's Bloom is merged.
-  void merge_filters_across_ranks(op::sirius_physical_hash_join& join)
+  /// alone would drop rows other ranks' builds match, so every rank's Bloom is merged. With
+  /// @p narrow the join runs on rank 0 alone: its build is whole there, and its Bloom goes from
+  /// there to every rank, whose scans it filters.
+  void merge_filters_across_ranks(op::sirius_physical_hash_join& join, bool narrow = false)
   {
     if (!join.publishes_dynamic_filters()) { return; }
     auto const build_rows = join.children[1]->estimated_cardinality;
@@ -635,13 +637,21 @@ struct rewriter {
     auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
     for (std::size_t k = 0; k < join.dynamic_filter_plan().admitted_keys().size(); ++k) {
-      service->describe(first + k, "bloom merge key=" + std::to_string(k));
+      service->describe(
+        first + k, (narrow ? "bloom from rank 0 key=" : "bloom merge key=") + std::to_string(k));
     }
-    install_filter_merge(join,
-                         std::make_shared<op::bloom_all_gather_merge>(
-                           service, first, join.dynamic_filter_plan().admitted_keys().size(), *gpu),
-                         service->world_size());
-    shape += "F";
+    install_filter_merge(
+      join,
+      std::make_shared<op::bloom_all_gather_merge>(
+        service,
+        first,
+        join.dynamic_filter_plan().admitted_keys().size(),
+        *gpu,
+        op::bloom_all_gather_merge::default_timeout,
+        narrow ? std::optional<exchange::rank_t>{0} : std::nullopt),
+      // Rank 0 alone holds a narrow join's build: all of its keys, not one part in the ranks.
+      narrow ? 1 : service->world_size());
+    shape += narrow ? "F0" : "F";
   }
 
   placement visit(duckdb::unique_ptr<op::sirius_physical_operator>& slot)
@@ -692,12 +702,13 @@ struct rewriter {
             build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
           return done(on_rank0(probe_rows) ? probe_rows : placement::spread);
         }
-        merge_filters_across_ranks(join);
         // A join whose two inputs fit one rank's budget runs on rank 0 alone: nothing above it
         // needs an exchange until an operator spreads its rows again.
         auto const pbytes = estimated_bytes(*probe.children[0]);
-        if (stages.stage_bytes > 0 && bbytes <= stages.stage_bytes &&
-            pbytes <= stages.stage_bytes - bbytes) {
+        bool const narrow = stages.stage_bytes > 0 && bbytes <= stages.stage_bytes &&
+                            pbytes <= stages.stage_bytes - bbytes;
+        merge_filters_across_ranks(join, narrow);
+        if (narrow) {
           shape += "N";
           to_rank0_below(probe);
           to_rank0_below(build);
