@@ -1083,13 +1083,6 @@ bool sirius_physical_hash_join::unmatched_rows_pending() const
     });
 }
 
-bool sirius_physical_hash_join::all_ports_empty()
-{
-  if (!sirius_physical_operator::all_ports_empty()) { return false; }
-  std::lock_guard<std::mutex> lg(op_state_mutex);
-  return !(streams_right_join() && unmatched_rows_pending());
-}
-
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
@@ -1363,6 +1356,7 @@ bool sirius_physical_hash_join::all_ports_empty()
 {
   if (!sirius_physical_operator::all_ports_empty()) { return false; }
   std::lock_guard<std::mutex> lg(op_state_mutex);
+  if (streams_right_join()) { return !unmatched_rows_pending(); }
   if (!kept_build_streaming() || _join_mode != HASH_JOIN_MODE::BUILD_PROBE) { return true; }
   // An issued emit task is counted by the pipeline, which cannot finish until it completes.
   return std::all_of(
