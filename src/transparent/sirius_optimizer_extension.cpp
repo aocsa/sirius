@@ -452,7 +452,8 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     // first, so its failure starts over before the EXISTS rewrite has replaced anything.
     auto const rewrite_subqueries =
       [&](duckdb::unique_ptr<duckdb::LogicalOperator>& copy) -> std::size_t {
-      if (operator_option_enabled(context, &sirius::operator_params::enable_delim_aggregate_reuse)) {
+      if (operator_option_enabled(context,
+                                  &sirius::operator_params::enable_delim_aggregate_reuse)) {
         try {
           sirius::planner::reuse_delim_rows_for_subquery_aggregates(
             context, input.optimizer.binder, copy);
@@ -463,7 +464,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
           copy = copy_logical_plan(*captured, context);
         }
       }
-      if (!operator_option_enabled(context, &sirius::operator_params::enable_exists_minmax_rewrite)) { return 0; }
+      if (!operator_option_enabled(context,
+                                   &sirius::operator_params::enable_exists_minmax_rewrite)) {
+        return 0;
+      }
       try {
         return sirius::planner::rewrite_correlated_inequality_exists(
           context, input.optimizer.binder, copy, gpu_memory_budget(context));

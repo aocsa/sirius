@@ -178,7 +178,6 @@ struct build_probe_decision {
   double estimated_probe_to_build_ratio,
   std::optional<uint64_t> resident_bytes = std::nullopt,
   bool kept_build_streaming              = false,
-
   bool right_may_stream                  = false);
 
 /**
@@ -707,7 +706,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Kept-build: issue the emit task for the first slot whose probe stream is complete. Must be
   /// called with op_state_mutex held.
   std::unique_ptr<operator_data> next_kept_build_emit_task();
-  bool _right_may_stream    = false;
+  bool _right_may_stream = false;
   std::optional<build_count_spec> _build_counts;
 };
 

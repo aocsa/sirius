@@ -1767,9 +1767,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     if (hash_join.build_counts() && !right_stream) {
       throw std::logic_error("a hash join counting its build matches must stream its probe");
     }
-    probe_drives =
-      hash_join.is_right_family() && !hash_join.is_delim_join_inner() &&
-      !hash_join.kept_build_streaming() && !right_stream;
+    probe_drives = hash_join.is_right_family() && !hash_join.is_delim_join_inner() &&
+                   !hash_join.kept_build_streaming() && !right_stream;
   }
   bind_wrapped_join(join_op, probe_drives);
 }

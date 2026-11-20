@@ -747,7 +747,6 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         double estimated_probe_to_build_ratio,
                                                         std::optional<uint64_t> resident_bytes,
                                                         bool kept_build_streaming,
-
                                                         bool right_may_stream)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
@@ -913,7 +912,6 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              estimated_probe_to_build_ratio,
                                                              in.resident_bytes,
                                                              kept_build_streaming(),
-
                                                              _right_may_stream);
 
   // A hash-partitioned MARK build: marks use the join-wide build observation.
