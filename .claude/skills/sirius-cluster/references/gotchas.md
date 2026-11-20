@@ -84,3 +84,15 @@ Seen on 2026-11-18 with `aws-ec2` instances (Deep Learning Base AMI, Ubuntu
 - Capacity decides the instance type. A second `g7e.8xlarge` was not to be had
   in any of five regions that evening. Launch every instance of a run at the same
   moment, and give back a lone one, before building anything.
+- The biggest type was harder still: on 2026-11-19 a `g7e.48xlarge` (8 GPUs) was
+  refused in four regions for almost three hours before one zone gave one.
+- An instance ends at the time its shutdown timer was given, whatever was agreed
+  later. One was lost in the middle of a run because the old timer was still
+  armed after the run was extended. When a run is extended, move every timer,
+  the one on the instance and any on this machine, and read the new time back.
+- The AWS login on this machine can expire during a long run. Then nothing can
+  be extended, terminated early or proven terminated from here until the user
+  logs in again. The on-box timer still ends the instance: copy the results off
+  well before it, and take the proof of termination after the next login.
+- Several ranks on one instance that read from S3: see section 1d of the
+  `distributed-sirius-bench` skill before choosing the rank count.
