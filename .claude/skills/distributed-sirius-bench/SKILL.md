@@ -173,6 +173,33 @@ and writes a rank config, `setup` builds the branch on each machine, `data` gene
   folder off before the instances are terminated: the instance store goes with
   them.
 
+## 1d. A dataset read from S3
+
+The script has not read a dataset from S3 itself. What follows was seen on 2026-11-19 in runs
+started by hand on one `g7e.48xlarge` (8 GPUs, one rank per GPU, SF10000 and SF30000); pass it
+through `--views-sql` and the config, and treat the first smoke test as the test.
+
+- The views file creates the `SIRIUS_S3` secret and one `read_parquet('s3://...')` view per table.
+  Take the keys from the instance's role at run time and keep the file in memory (`/dev/shm`): it
+  holds keys, so never print it or copy it into the run folder.
+- Those runs kept `supplier`, `nation` and `region` on local disk: each has one file, fewer than
+  the ranks.
+- Keep the bucket in the instance's region. Copying SF10000 (2.9 TB) between regions took
+  26 minutes and about $58, and the copy then costs about $67 a month.
+- **More ranks did not mean more speed.** The 22 queries took 942.9 s on 1 rank, 542.2 s on 2,
+  499.6 s on 4 and 941.7 to 972.3 s on 8. The engine's S3 reader was the limit (10 to 24 GB/s
+  while plain downloads reached 48.6 GB/s on the same box), so run the rank counts as a ladder
+  (1, 2, 4, 8) on a few queries before a whole suite on all GPUs.
+- S3 connections add up to ranks x reactors x `executor.scan_manager.rest.max_connections`
+  (8 reactors per rank there). With 512 on 8 ranks, connects timed out by the tens of
+  thousands and half the ranks starved; 128 and 256 completed. No value tested made 8 ranks
+  faster than 4.
+- A rank's reader sometimes falls behind for a whole query, at any rank count, and the query
+  waits for it (Q1 at 223.8 s against 36.3 s on 1 rank). One slow run is not a result: rerun
+  before comparing, and say in the report which runs had a slow rank.
+- `SET delim_join_as_cte = false;` went before the queries: without it Q4 took 713 s at
+  SF10000. The same runs set `SET threads = 40;`.
+
 ## 2. Plan and confirm
 
 ```bash
@@ -307,6 +334,9 @@ job and ask first. If no reference exists, say in the report that the answers we
 | `sbatch failed`, or a job that never starts | The site needs other options: ask the user and pass them with `--sbatch-args` |
 | `check` prints `NO REFERENCE` for a query | The expected folder has no `q<nn>.parquet` or `q<nn>.csv` for it: give `--pattern` |
 | Times far slower than expected | CPUs per rank (`scontrol show job <id>`), storage stalls, the exchange path |
+| One run far slower than another with the same setup, GPUs idle (data on S3) | A rank whose S3 reader fell behind: compare when each rank's scan ends in `rank-logs/`. Rerun before changing anything |
+| `connect timed out` by the thousands in the rank logs (data on S3) | Too many S3 connections for the box: lower `max_connections`, see 1d |
+| GPU out of memory in one join on more ranks but not on fewer | Seen for Q10 at SF10000 on 4 ranks in every run, while 2 and 8 ranks passed. Report it; no setting tested fixed it |
 
 ## Rules that come from the cluster, not from this skill
 
@@ -366,6 +396,12 @@ job and ask first. If no reference exists, say in the report that the answers we
   - In both, `check --ref-client` against the same `run.sql` (without its last line) run through
     the build's plain DuckDB: Q1, Q6 and Q12 matched. This is the first answer check without
     Slurm.
+- **Seen in runs this script did not start** (2026-11-19, one `g7e.48xlarge` with 8 RTX PRO 6000
+  Blackwell, a prebuilt package of the branch `rebase/distributed-sirius-on-e6a43ebc`, one rank
+  per GPU, data read from S3): section 1d holds what they showed. SF10000, 22 queries: 2 ranks
+  22 of 22 in 542.2 s; 1 rank and 4 ranks 21 of 22 (Q13 hit a cuDF row-count limit, Q10 ran out
+  of GPU memory). Answers matched DuckDB except rows that tie at a LIMIT in Q3 and Q18. SF30000,
+  seven queries: 532.8 s on 4 ranks, 1,503.9 s on 8, answers not checked.
 - **Checked with `--dry-run` only:** the 20 reference runs as a whole. For each, the script wrote
   the config, the SQL statements and their order, the statement timeout, the commit, the rank
   count and the environment, and they equal the files of the recorded run.
@@ -375,7 +411,7 @@ job and ask first. If no reference exists, say in the report that the answers we
   script on three machines, one of them with its own `$HOME` and file system: the copies of
   `config.yaml` and `gateway.conf`, and the rank logs copied back.
 - **Not run at all:** four nodes, more than one instance of a `g7e` type or an instance with
-  several GPUs on AWS, a dataset read from S3, `full` without Slurm, a query through the `local` launcher on machines that share
+  several GPUs on AWS, a dataset read from S3 (both seen only outside this script, see 1d), `full` without Slurm, a query through the `local` launcher on machines that share
   `$HOME`, any GDS run through this script, a run at SF30000 or SF100000, `--order pass`, a new clone at
   `--commit`,
   `check` on all 22 queries or with `--ref-client` on nodes, and `--results parquet` where
