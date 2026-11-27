@@ -50,7 +50,9 @@ _load() { # the cluster's config; every command but hosts and init needs it
 }
 # The gateway's port, and rank i's two ports (9500 + i, 27000 + i).
 PORTS=':(9494|950[0-9]|2700[0-9]) '
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+# SSH_CONFIG=<file>: take the aliases from that file, not ~/.ssh/config (cloud instances,
+# whose addresses change with every launch). Its path must hold no space.
+SSH_OPTS="${SSH_CONFIG:+-F $SSH_CONFIG }-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 TMUX="tmux -L zeno"   # a tmux server of its own: stopping it never touches the user's sessions
 
 log() { echo "[cluster $(date -u +%H:%M:%S)] $*" >&2; }
@@ -271,7 +273,8 @@ fi
 busy=$(ps -eo user:16,pcpu,etime,comm --sort=-pcpu | awk 'NR > 1 && $1 != "root" && $2 > 50 && $4 != "ps"' | head -5)
 echo "non-root processes over 50% CPU: ${busy:-none}"
 echo "load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cores, RAM available $(awk '/MemAvailable/ { print int($2 / 1048576) }' /proc/meminfo) GiB, locked memory limit $(ulimit -l) kB, logged in: $(who | awk '{ print $1 }' | sort -u | paste -sd, -)"
-echo "disk free under \$HOME: $(df -h --output=avail "$HOME" | tail -1 | tr -d ' ')"
+d="$W"; [ -d "$d" ] || d="$HOME"    # the work folder can be on another disk than $HOME
+echo "disk free under $d: $(df -h --output=avail "$d" | tail -1 | tr -d ' ')"
 p=$(ss -ltn | grep -E "$PORTS")
 echo "sirius ports: ${p:-free}"
 if [ -d "$W/sirius" ]; then

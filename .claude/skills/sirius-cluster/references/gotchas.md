@@ -60,3 +60,27 @@ you see them there.
   in a syntax error.
 - The reference answers of `bench` are kept in `<work>/ref/`; reusing a kept
   file was never exercised.
+
+
+## AWS instances
+
+Seen on 2026-11-18 with `aws-ec2` instances (Deep Learning Base AMI, Ubuntu
+22.04, driver 595): one `g7e.8xlarge`, then two `g6.4xlarge`.
+
+- The AMI has `tmux` and `git` but no Pixi. The instance store is mounted at
+  `/opt/dlami/nvme` and any user can write there; the root volume had 144 GB
+  free of 200.
+- The locked memory limit is `unlimited`, so `tcp_lanes` stays at its default.
+  A two-instance run passed with it.
+- The instances reach each other by their private addresses once the security
+  group allows traffic from itself. `ZENO_NET` stayed empty: the ranks chose the
+  private address, not the AMI's `docker0`.
+- `init` prints `ssh to <addr>: NO (Host key verification failed.)` for a new
+  pair. On instances that is yours to fix, with the user's yes: see SKILL.md.
+- The build took 12 minutes on 32 vCPUs and 34 minutes on 16. SF100 took about
+  2 minutes to generate (26 GB).
+- `status` right after a build lists the build's `sccache` server as `LEFT`. It
+  ended by itself: `status` was clean 12 minutes after the build.
+- Capacity decides the instance type. A second `g7e.8xlarge` was not to be had
+  in any of five regions that evening. Launch every instance of a run at the same
+  moment, and give back a lone one, before building anything.

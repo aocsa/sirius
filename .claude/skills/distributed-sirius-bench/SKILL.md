@@ -163,6 +163,15 @@ and writes a rank config, `setup` builds the branch on each machine, `data` gene
   Pixi before every `bench.py` command.
 - A checkout that is not on the branch (a detached commit) needs `--commit` with its commit.
 - `cluster.sh nodes` before the first gate, `cluster.sh status` after the last.
+- **AWS instances** (launched with the `aws-ec2` skill) are such machines too:
+  `cluster.sh` drives them through an alias file (`SSH_CONFIG`, see the
+  `sirius-cluster` skill). `--nodes` takes the private addresses, which is what
+  `init` records. `--checkout`, `--data`, `--out` and `--spill-dir` go on the
+  instance store. The security group must allow traffic from itself (the gateway
+  listens on 9494, rank i on 9500 + i and 27000 + i). No
+  `SIRIUS_GATEWAY_PRIORITY_NETWORKS` and no `tcp_lanes` was needed. Copy the run
+  folder off before the instances are terminated: the instance store goes with
+  them.
 
 ## 2. Plan and confirm
 
@@ -345,6 +354,18 @@ job and ask first. If no reference exists, say in the report that the answers we
   lanes; the answers were not checked. The second machine got the run folder, `config.yaml` and
   `gateway.conf`, and its rank log came back. `cluster.sh status` was clean on both machines
   after the failed run and after the passed one.
+- **Run for real on AWS** (2026-11-18, instances of the `aws-ec2` skill driven from a macOS
+  control machine through `cluster.sh` with an alias file; Deep Learning Base AMI, driver 595, a
+  new build of this branch at `28d30249`, SF100 generated on the instance store, the config of
+  `cluster.sh init`, every gate from `plan` to `smoke`):
+  - One `g7e.8xlarge` (one RTX PRO 6000 Blackwell 96 GB, 32 vCPUs), single mode, 1 rank. Q1, Q6
+    and Q12 took 0.86 s, 0.57 s and 0.72 s.
+  - Two `g6.4xlarge` (one L4 24 GB and 16 vCPUs each, each with its own `$HOME`), multi mode,
+    2 ranks, `--nodes` as private addresses, the default TCP lanes. Q1, Q6 and Q12 took 1.31 s,
+    1.27 s and 1.65 s, exchange host-staged over TCP lanes.
+  - In both, `check --ref-client` against the same `run.sql` (without its last line) run through
+    the build's plain DuckDB: Q1, Q6 and Q12 matched. This is the first answer check without
+    Slurm.
 - **Checked with `--dry-run` only:** the 20 reference runs as a whole. For each, the script wrote
   the config, the SQL statements and their order, the statement timeout, the commit, the rank
   count and the environment, and they equal the files of the recorded run.
@@ -353,7 +374,8 @@ job and ask first. If no reference exists, say in the report that the answers we
   automatically, a views file, queries chosen by name and by number). Also the `local` launcher's
   script on three machines, one of them with its own `$HOME` and file system: the copies of
   `config.yaml` and `gateway.conf`, and the rank logs copied back.
-- **Not run at all:** four nodes, a query through the `local` launcher on machines that share
+- **Not run at all:** four nodes, more than one instance of a `g7e` type or an instance with
+  several GPUs on AWS, a dataset read from S3, `full` without Slurm, a query through the `local` launcher on machines that share
   `$HOME`, any GDS run through this script, a run at SF30000 or SF100000, `--order pass`, a new clone at
   `--commit`,
   `check` on all 22 queries or with `--ref-client` on nodes, and `--results parquet` where
