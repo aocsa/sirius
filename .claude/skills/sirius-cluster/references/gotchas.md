@@ -29,8 +29,11 @@ you see them there.
   the cluster's yaml made the same run pass (2 of 2 ranks, Q1/Q6/Q12 at SF3000
   about twice as fast as one node, answers equal to the one-node run). That
   branch's doc reports wrong answers with 2 lanes on four machines for Q5 and
-  Q13: check answers. The branch `experimental/distributed-sirius` ran two
-  nodes under the same limit without this setting; the key was not tried there.
+  Q13: check answers. The branch `experimental/distributed-sirius` has the TCP
+  lanes too at `18f91952`: on 2026-11-18 a two-node smoke test under the same
+  limit failed with `rank 0 reached 0 of 1 peers in 120000 ms` and passed with
+  `tcp_lanes: 2`. `init` does not write the key: add it when `init` prints a
+  locked memory limit that is not `unlimited`.
 
 ## Builds
 
