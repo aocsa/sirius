@@ -3210,6 +3210,8 @@ static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope,
   params->enable_complete_group_having = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_COMPLETE_GROUP_HAVING to {}",
                    params->enable_complete_group_having);
+}
+
 static void SetEnableNarrowingExpressionPushdown(ClientContext& context,
                                                  SetScope scope,
                                                  Value& parameter)
@@ -3218,6 +3220,8 @@ static void SetEnableNarrowingExpressionPushdown(ClientContext& context,
   params->enable_narrowing_expression_pushdown = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_NARROWING_EXPRESSION_PUSHDOWN to {}",
                    params->enable_narrowing_expression_pushdown);
+}
+
 static void SetEnableLateDimensionJoin(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                       = get_operator_params(context, scope);
@@ -3864,11 +3868,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_complete_group_having),
                     SetEnableCompleteGroupHaving);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "enable_narrowing_expression_pushdown",
                     "runtime override for computing narrowing expressions below inner joins",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_narrowing_expression_pushdown),
                     SetEnableNarrowingExpressionPushdown);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "enable_late_dimension_join",
                     "runtime override for joining lookup tables after the aggregation",
                     LogicalType::BOOLEAN,

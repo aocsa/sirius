@@ -486,6 +486,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     if (plan_optimization_enabled(context,
                                   &sirius::operator_params::enable_narrowing_expression_pushdown)) {
       push_narrowing_expressions(*copy, input.optimizer.binder);
+    }
     if (plan_optimization_enabled(context, &sirius::operator_params::enable_late_dimension_join)) {
       // Lookup columns that fit in one GPU do not make a join spill. With the GPU memory
       // unknown, nothing moves.
