@@ -11,6 +11,8 @@
 #   SECONDS_PER_PHASE  default 1.5
 #   SIRIUS_EXCHANGE_MNNVL, SIRIUS_EXCHANGE_FRAME_BYTES, SIRIUS_EXCHANGE_SEND_FRAMES,
 #   SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER   passed to every rank (defaults: require, 16 MiB, 32, 16)
+#   SIRIUS_EXCHANGE_TCP_LANES   lanes per rank where lanes carry the writes (default: 16 shared
+#                    by the ranks of a host, at least 2)
 #   UCX_TLS, UCX_NET_DEVICES  default: scripts/launcher_env.sh's, as a gateway's ranks: tcp for
 #                    notifications on bond0. SIRIUS_UCX_RAILS=1: UCX_TLS=all on the node's GPU
 #                    rail NICs.
