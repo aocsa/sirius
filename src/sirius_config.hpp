@@ -394,6 +394,9 @@ struct operator_params {
   /// Compute a projection's expression below the inner join under it when that narrows the rows.
   /// See `push_narrowing_expressions`.
   bool enable_narrowing_expression_pushdown = true;
+  /// Join a lookup table whose columns are only GROUP BY keys after the aggregation. See
+  /// `join_dimensions_after_aggregate`.
+  bool enable_late_dimension_join = false;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.

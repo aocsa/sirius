@@ -3218,6 +3218,12 @@ static void SetEnableNarrowingExpressionPushdown(ClientContext& context,
   params->enable_narrowing_expression_pushdown = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_NARROWING_EXPRESSION_PUSHDOWN to {}",
                    params->enable_narrowing_expression_pushdown);
+static void SetEnableLateDimensionJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->enable_late_dimension_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_LATE_DIMENSION_JOIN to {}",
+                   params->enable_late_dimension_join);
 }
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -3863,6 +3869,11 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_narrowing_expression_pushdown),
                     SetEnableNarrowingExpressionPushdown);
+                    "enable_late_dimension_join",
+                    "runtime override for joining lookup tables after the aggregation",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_late_dimension_join),
+                    SetEnableLateDimensionJoin);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

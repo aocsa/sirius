@@ -25,6 +25,7 @@
 #include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/join_dimension_after_aggregate.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/push_narrowing_expressions.hpp"
 
@@ -485,6 +486,12 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     if (plan_optimization_enabled(context,
                                   &sirius::operator_params::enable_narrowing_expression_pushdown)) {
       push_narrowing_expressions(*copy, input.optimizer.binder);
+    if (plan_optimization_enabled(context, &sirius::operator_params::enable_late_dimension_join)) {
+      // Lookup columns that fit in one GPU do not make a join spill. With the GPU memory
+      // unknown, nothing moves.
+      if (auto const budget = gpu_memory_budget(context); budget > 0) {
+        join_dimensions_after_aggregate(context, copy, input.optimizer.binder, budget);
+      }
     }
     // Recorded once the plan is final, so the counts describe the plan that is captured.
     ctx->record_exists_minmax_rewrites(exists_rewrites);
