@@ -5,6 +5,7 @@ target_sources(
           replay_admission.cpp
           connection_provenance.cpp
           join_dimension_after_aggregate.cpp
+          narrow_outer_join_counts.cpp
           physical_sirius_execution.cpp
           parquet_footer_statistics.cpp
           push_narrowing_expressions.cpp

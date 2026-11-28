@@ -26,6 +26,7 @@
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/join_dimension_after_aggregate.hpp"
+#include "transparent/narrow_outer_join_counts.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/push_narrowing_expressions.hpp"
 
@@ -483,6 +484,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
         exists_rewrites = rewrite_subqueries(copy);
       }
     }
+    narrow_outer_join_counts(*copy, input.optimizer.binder);
     if (plan_optimization_enabled(context,
                                   &sirius::operator_params::enable_narrowing_expression_pushdown)) {
       push_narrowing_expressions(*copy, input.optimizer.binder);
