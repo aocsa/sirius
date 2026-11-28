@@ -326,6 +326,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_push_narrowing_expressions.cpp
     test/cpp/planner/test_join_dimension_after_aggregate.cpp
     test/cpp/planner/test_narrow_outer_join_counts.cpp
+    test/cpp/planner/test_build_side_choice.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_duckdb_host_reference_symbols.cpp
